@@ -7,8 +7,12 @@
 // already resolve to the correct real Tab5 SD pins, so no explicit
 // setPins() call -- and no macro use -- is needed (see caveat (c) below).
 
-// SD/C6 SDIO-host-sharing research (Task 10), sourced from three independent
-// places, cross-checked against each other rather than assumed:
+// SD/C6 SDIO-host-sharing research (Task 10), sourced from four independent
+// places, cross-checked against each other rather than assumed. (Fix report,
+// review round 2: point 1's espp citation is clarified below -- it is NOT
+// itself evidence of slot 0 -- and point 4 was added to close the citation
+// gap between "these #defines exist" and "these #defines are what actually
+// select the runtime hardware slot".)
 //
 // 1. espp/m5stack-tab5 BSP source (esp-cpp/espp, `main` branch, fetched
 //    2026-08-07 via raw.githubusercontent.com):
@@ -21,10 +25,23 @@
 //        clk=GPIO12, cmd=GPIO13, d0=GPIO11, d1=GPIO10, d2=GPIO9, d3=GPIO8,
 //        reset=GPIO15.
 //    These two pin sets are entirely disjoint -- no shared wire between them.
+//    CLARIFICATION (this pin evidence is all espp's sdcard.cpp corroborates
+//    -- NOT the slot number): espp's own `initialize_sdcard()` calls
+//    `SDMMC_HOST_DEFAULT()` unmodified, which sets `.slot = SDMMC_HOST_SLOT_1`
+//    (confirmed: esp_driver_sdmmc/include/driver/sdmmc_default_configs.h,
+//    `SDMMC_HOST_DEFAULT()` macro). So if espp's own reference code ran
+//    as-is, its SD card would land on slot 1 -- the SAME slot esp-hosted
+//    uses for the C6 (see point 3) -- reproducing exactly the conflict this
+//    task is ruling out. espp's file is NOT itself evidence of "SD on slot
+//    0"; only its pin numbers (which do match the fixed slot-0 IOMUX pins,
+//    see point 2) corroborate the physical wiring. It's THIS PROJECT's
+//    `SD_MMC.begin()` (via `BOARD_SDMMC_SLOT=0`, see point 4) that actually
+//    avoids the conflict by explicitly overriding to slot 0 -- not anything
+//    in espp's sdcard.cpp.
 //
-// 2. ESP-IDF's own ESP32-P4 headers confirm *why* that's not a coincidence:
-//    the P4's single physical SDMMC host peripheral exposes two independent
-//    hardware slots (soc/esp32p4/include/soc/sdmmc_pins.h,
+// 2. ESP-IDF's own ESP32-P4 headers confirm *why* pin-disjointness isn't a
+//    coincidence: the P4's single physical SDMMC host peripheral exposes two
+//    independent hardware slots (soc/esp32p4/include/soc/sdmmc_pins.h,
 //    esp_driver_sdmmc/include/driver/sdmmc_host.h):
 //      - Slot 0: fixed IOMUX pins, SDMMC_SLOT0_IOMUX_PIN_NUM_{CLK,CMD,D0..D3}
 //        = 43/44/39/40/41/42 -- an EXACT match to the BSP's real SD pins
@@ -45,6 +62,26 @@
 //    Combined with #2, this places the C6 link on slot 1 and confirms the SD
 //    card (slot 0, via BOARD_SDMMC_SLOT=0 below) is on the *other* hardware
 //    slot, not a shared one.
+//
+// 4. The missing link: what actually turns the #defines in points 1/3 into
+//    a real runtime hardware-slot assignment, not just documentation:
+//      - SD_MMC.cpp (framework-arduinoespressif32/libraries/SD_MMC/src/SD_MMC.cpp,
+//        SDMMCFS::begin(), ~line 230): under
+//        `#if defined(CONFIG_IDF_TARGET_ESP32P4) && defined(BOARD_SDMMC_SLOT)
+//        && (BOARD_SDMMC_SLOT == 0)`, sets `host.slot = SDMMC_HOST_SLOT_0;`
+//        (and reconfigures slot_config to use the fixed IOMUX pins instead
+//        of GPIO-matrix pins). This is the exact line that makes this
+//        project's `SD_MMC.begin()` call (below) actually request slot 0 at
+//        runtime, not merely define a constant that says so.
+//      - port_esp_hosted_host_config.h line 218
+//        (framework-arduinoespressif32-libs/esp32p4/include/espressif__esp_hosted/host/port/esp/freertos/include/port_esp_hosted_host_config.h):
+//        `#define H_SDMMC_HOST_SLOT CONFIG_ESP_HOSTED_SDIO_SLOT` -- this is
+//        the line that makes esp-hosted's SDIO transport driver actually
+//        consume `CONFIG_ESP_HOSTED_SDIO_SLOT` (=1, from point 3) as its
+//        real slot number at init time, not just a config value sitting
+//        unused in sdkconfig.h.
+//    Both confirmed present in the actual installed toolchain used to build
+//    this project (not just plausible-sounding header names).
 //
 // CONCLUSION: the SD card and the C6 co-processor are on two separate
 // hardware SDIO slots of the ESP32-P4 (slot 0 vs slot 1), with zero
