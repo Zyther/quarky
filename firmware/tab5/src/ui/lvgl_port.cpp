@@ -51,6 +51,22 @@ void lvgl_port_init(IDisplay &display, ITouch &touch) {
 
     size_t buf_size = static_cast<size_t>(display.width()) * kDrawBufLines * sizeof(uint16_t);
     s_draw_buf = static_cast<uint16_t *>(heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM));
+    if (s_draw_buf == nullptr) {
+        // Without this check, a failed allocation feeds a null buffer into
+        // lv_display_set_buffers() and the first draw hits lv_conf.h's
+        // LV_USE_ASSERT_NULL (1). With LV_USE_LOG left at 0 (its shipped
+        // default -- see include/lv_conf.h), LV_ASSERT_HANDLER's `while(1);`
+        // fires with zero serial output: a silent hang right before real
+        // hardware bring-up starts, with nothing for whoever's debugging a
+        // hung boot to go on. Log the requested size and halt predictably
+        // instead.
+        Serial.printf(
+            "quarky-tab5: FATAL - failed to allocate %u bytes for LVGL draw buffer (PSRAM)\n",
+            static_cast<unsigned>(buf_size));
+        while (true) {
+            delay(1000);
+        }
+    }
     lv_display_set_buffers(s_lv_display, s_draw_buf, nullptr, buf_size,
                             LV_DISPLAY_RENDER_MODE_PARTIAL);
 
