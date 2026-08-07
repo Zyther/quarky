@@ -143,27 +143,33 @@ Both firmware targets adopt UniGeek's interface-based `Device` HAL pattern — t
 
 ### 4.5 Cross-Device Control Protocol (`shared/c2proto`)
 
-**Two channels, split by traffic shape** (directly informed by Poseidon's documented pain point: ESP-NOW's ~230-byte payload ceiling made bulk data like full EAPOL handshakes impractical over that link alone):
+**Amendment (2026-08-07, discovered during Task 11 implementation):** the original design below used ESP-NOW as the control channel. This turned out to be impossible on the Tab5: the ESP32-P4 has no native WiFi/BT radio of its own, and the esp-hosted/`esp_wifi_remote` RPC bridge that proxies WiFi to the onboard ESP32-C6 (see §4.1's `IRadio`) does **not** proxy the ESP-NOW API surface at all — confirmed by the complete absence of `libespnow.a` for the `esp32p4` target in the installed Arduino-ESP32 framework (every other Espressif target ships it), and zero ESP-NOW entries among the ~89 functions `esp_wifi_remote_api.h` actually proxies. `esp_now.h` exists only as a source-compatibility stub with nothing linkable behind it. This is a confirmed, verifiable platform gap, not a configuration issue — see `docs/superpowers/plans/2026-08-06-tab5-foundation-plan.md`'s ledger for the full verification trail. The design below is the corrected one; the redesign was directed by the project owner.
 
-**Control channel — ESP-NOW.**
-- Small framed messages: magic + version + message-type + sequence number + payload (shape modeled on Poseidon's `posei_msg_t`).
-- Used for: `CMD_START_FEATURE`, `CMD_STOP_FEATURE`, `CMD_GET_STATUS`, `RESP_STATUS`, `RESP_TELEMETRY`, `RESP_BULK_READY`.
-- Connectionless, ~1–2ms latency, no association required — doesn't interfere with whatever WiFi mode either device's radio is currently in for an attack.
-- Encrypted using ESP-NOW's native PMK/LMK (AES-128-CCM, hardware-accelerated on both the C6 and the S3).
+**Two transports, selected by which radio is free — not split by traffic shape.** The original ESP-NOW/WiFi-socket split was motivated by wanting the control channel to never interfere with whatever radio mode a feature has active. With ESP-NOW off the table, that same goal is met differently: Tab5 carries C2 traffic over **whichever of WiFi or BLE isn't the radio the active feature needs** — a WiFi attack in progress routes C2 over BLE, a BLE attack in progress routes C2 over WiFi. This is buildable today: unlike ESP-NOW, BLE (via NimBLE) **is** confirmed working on the Tab5 — `libbt.a` ships for `esp32p4` and contains a linkable `ble_hs_init`, verified directly against the installed framework.
 
-**Bulk channel — WiFi TCP socket, opened on demand.**
-- Used for: pcap/handshake file transfer, `.sub` capture files, firmware-update pushes.
-- Authenticated per-frame via HMAC-SHA256 using the same provisioned key.
-- Opened only when `RESP_BULK_READY` signals data is waiting, and torn down immediately after — deliberately not held open, so it doesn't consume a STA/AP radio slot during active attacks.
+**WiFi transport — TCP socket.**
+- Used for both control (`CMD_START_FEATURE`, `CMD_STOP_FEATURE`, `CMD_GET_STATUS`, `RESP_STATUS`, `RESP_TELEMETRY`, `RESP_BULK_READY`) and bulk data (pcap/handshake files, `.sub` captures, firmware-update pushes) over the same connection — with ESP-NOW's payload ceiling no longer a factor, there's no longer a reason to split control and bulk framing on this transport the way the original Poseidon-inspired design did.
+- Every frame (small or large) is `c2proto::Frame`-framed and HMAC-SHA256-authenticated using the provisioned key, same as before.
+- Requires Tab5 and Cardputer-ADV to be WiFi-associated (one hosts an AP the other joins, or both join a shared network) — a real tradeoff against ESP-NOW's association-free operation, accepted as the cost of this platform gap.
 
-**Pairing/provisioning (static pre-shared key, one-time):**
+**BLE transport — GATT service (Nordic-UART-style write/notify characteristics).**
+- Carries the same `c2proto::Frame` framing and HMAC authentication, sized to fit within a negotiated extended ATT MTU (matching `c2proto::kMaxPayload = 200` bytes plus header, distinct from `shared/c2proto`'s original ESP-NOW-sized ceiling but still deliberately small).
+- Control-message use only in this phase (`CMD_*`/`RESP_STATUS`/`RESP_TELEMETRY`) — if a bulk transfer is needed while BLE is the active C2 transport, it waits for the WiFi radio to free up rather than chunking large payloads over BLE; that's a Phase 2+ concern once real concurrent-feature scheduling exists, not a foundation-phase problem.
+- Cardputer-ADV's ESP32-S3 has native BLE with no remoting involved, so this side of the link is unaffected by the P4-specific gap.
+
+**Transport selection, this phase vs. later:** the foundation phase implements both transports as concrete `IC2Link` implementations and proves each works (demonstrated via Task 20's ping feature), with selection between them exposed as an explicit choice rather than automatic. Automatic radio-aware switching — "use BLE because a WiFi feature is currently running" — needs live state from `FeatureRegistry` about which radio a running feature holds, which doesn't exist until Phase 2+ features are real; building that scheduling logic against a foundation phase with no real features to schedule around would be speculative. This is documented explicitly as deferred, not silently dropped.
+
+**Pairing/provisioning (static pre-shared key, one-time) — unaffected by the transport redesign:**
 1. Tab5 generates a random 128-bit key and displays it as an on-screen QR code.
 2. Cardputer-ADV has no camera, so the key is entered via its physical keyboard (as a short base32/hex string) or transferred via a file dropped on its SD card.
 3. Both devices persist the key in NVS.
 4. Re-pairing = wipe NVS on both sides, repeat from step 1.
 5. No per-session pairing ceremony required after initial setup — chosen over interactive per-session pairing as the right tradeoff for a personal 2–3-device kit rather than a fleet.
+6. The same key authenticates both transports (WiFi HMAC frames and BLE GATT frames) — one pairing ceremony, not one per transport.
 
 **Command surface is deliberately minimal in v1** — the message types listed above and nothing feature-specific. Feature parameters and telemetry ride inside a generic payload blob defined per feature module (see below), so Phases 2–7 can add features without ever touching the core protocol.
+
+**Forward note for Phase 6 (ESP32-C5 sidecar):** the C5 has native WiFi and BLE (no P4-style remoting gap), so its link to the Tab5 is unaffected by this amendment — that design decision in the Phase 6 spec should be revisited only if it assumed ESP-NOW specifically; if so, apply the same WiFi/BLE dual-transport pattern there for consistency, since the Tab5 side of that link has the identical P4 constraint.
 
 ### 4.6 Feature Module Contract (`shared/feature_contract`)
 
