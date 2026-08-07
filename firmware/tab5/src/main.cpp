@@ -5,6 +5,7 @@
 #include "hal/radio_esp_hosted.h"
 #include "hal/storage_sd.h"
 #include "hal/c2link_wifi.h"
+#include "hal/c2link_ble.h"
 #include "ui/lvgl_port.h"
 #include "ui/shell.h"
 #include "ui/screen_stack.h"
@@ -15,6 +16,7 @@ TouchGT911 touch;
 RadioEspHosted radio;
 StorageSD storage;
 C2LinkWifi c2link_wifi;
+C2LinkBle c2link_ble;
 FeatureRegistry g_registry; // populated further in Task 15
 
 void setup() {
@@ -61,6 +63,21 @@ void setup() {
     uint8_t test_psk[16] = {0};
     bool c2_wifi_ok = c2link_wifi.init(test_psk, "Quarky-Tab5-Test", "quarkytest123", 7777);
     Serial.printf("quarky-tab5: c2link_wifi init %s\n", c2_wifi_ok ? "OK" : "FAILED");
+
+    // Task 13: C2LinkBle init-only smoke test -- the second C2 transport,
+    // used when the WiFi radio is busy with an active feature. Coexists
+    // with C2LinkWifi above (both transports are brought up here; feature
+    // code picks which one to actually use at runtime, per the foundation
+    // spec). Same placeholder PSK as the WiFi transport until Task 12's
+    // pairing flow wires the real one. A known, already-flagged, deferred
+    // concern from Task 11 is that WiFi.mode(WIFI_AP) (above) and BLE
+    // together touch the same C6 co-processor radio at runtime -- not
+    // re-litigated here, and nothing NEW at compile/link time was found
+    // (see task-13-report.md). Full advertise/connect verification needs
+    // a real BLE central (a scanner app, or Cardputer-ADV's future BLE
+    // client from Task 17) -- DEFERRED, software-only pass here.
+    bool c2_ble_ok = c2link_ble.init(test_psk, "Quarky-Tab5");
+    Serial.printf("quarky-tab5: c2link_ble init %s\n", c2_ble_ok ? "OK" : "FAILED");
 
     display.init();
     touch.init();
