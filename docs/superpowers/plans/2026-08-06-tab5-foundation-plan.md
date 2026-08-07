@@ -4,18 +4,17 @@
 
 **Goal:** Build the HAL, LVGL touch UI shell, multi-target build system, and Tab5↔Cardputer-ADV control protocol that every later feature phase (2–7) plugs into.
 
-**Architecture:** Two independent PlatformIO firmware projects (`firmware/tab5`, `firmware/cardputer-adv`) sharing two host-testable pure-logic libraries (`shared/c2proto`, `shared/feature_contract`). Tab5 renders an LVGL touch UI and drives its C6 co-processor's radio via esp-hosted WiFiRemote; Cardputer-ADV keeps its existing standalone keyboard/menu operation and layers a remote-command dispatcher on top. The two talk over ESP-NOW (control) and an on-demand WiFi TCP socket (bulk transfer), authenticated with a pre-shared key established during a one-time pairing flow.
+**Architecture:** Two independent PlatformIO firmware projects (`firmware/tab5`, `firmware/cardputer-adv`) sharing two host-testable pure-logic libraries (`shared/c2proto`, `shared/feature_contract`). Tab5 renders an LVGL touch UI and drives its C6 co-processor's radio via esp-hosted WiFiRemote; Cardputer-ADV keeps its existing standalone keyboard/menu operation and layers a remote-command dispatcher on top. The two talk over two HMAC-authenticated transports selected by which radio is free — a WiFi TCP socket (Tab5 hosts an AP; carries both control and bulk data) and a BLE GATT link (NimBLE, Nordic-UART-Service-shaped) — authenticated with a single pre-shared key established during a one-time pairing flow. **(Amended 2026-08-07: originally ESP-NOW for control; found to have no implementation for ESP32-P4 in the installed framework during Task 11, redesigned per project owner's direction — see Task 11/13's amendment notes and the foundation spec's §4.5.)**
 
-**Tech Stack:** PlatformIO, Arduino-ESP32 v3.x, esp-hosted WiFiRemote, LVGL 9.x, Unity (native host tests), mbedtls (on-device crypto) / vendored portable SHA-256 (host tests), ESP-NOW, `esp_wifi`.
+**Tech Stack:** PlatformIO, Arduino-ESP32 v3.x, esp-hosted WiFiRemote, LVGL 9.x, Unity (native host tests), mbedtls (on-device crypto) / vendored portable SHA-256 (host tests), NimBLE-Arduino, `WiFi`/`esp_wifi`.
 
 ## Global Constraints
 
 - Framework: Arduino-ESP32 v3.x on both targets; Tab5 additionally uses esp-hosted's WiFiRemote component to reach the C6 co-processor over SDIO.
 - UI: LVGL only, no custom canvas UI. All text entry goes through `lv_keyboard` bound to `lv_textarea`.
 - HAL: interface-based (`IDisplay`, `ITouch`, `IRadio`, `INFC`, `IRF433`, `IC2Link`, `IPower` on Tab5; `Device`-pattern extension on Cardputer-ADV), never raw `#ifdef` feature coupling.
-- C2 control channel: ESP-NOW, framed as magic+version+type+seq+payload, encrypted via ESP-NOW's native PMK/LMK (AES-128-CCM).
-- C2 bulk channel: on-demand WiFi TCP socket, HMAC-SHA256 frame authentication, opened only after `RESP_BULK_READY` and torn down immediately after use.
-- Pairing: Tab5 generates a 128-bit PSK, shown as an on-screen QR; Cardputer-ADV has no camera, so it's entered via its physical keyboard or an SD-card file. Both sides persist the key in NVS.
+- C2 transports: WiFi TCP socket (Tab5 hosts an AP, carries both control and bulk data over one persistent connection) and BLE GATT (NimBLE, control-message-sized frames only) — selected by which radio is free, WiFi preferred when both are available. Both HMAC-SHA256 frame-authenticated with the same provisioned key. ESP-NOW is not usable on the Tab5 (no implementation for ESP32-P4 via esp-hosted) and is not part of this design.
+- Pairing: Tab5 generates a 128-bit PSK, shown as an on-screen QR; Cardputer-ADV has no camera, so it's entered via its physical keyboard or an SD-card file. Both sides persist the key in NVS. The same PSK authenticates both transports and doubles as the WiFi AP's password.
 - Feature modules: static compile-time registration into a `FeatureRegistry`, no dynamic loading. Remote-affinity modules split into a Tab5-side descriptor and a satellite-side executor.
 - Capability negotiation: satellites report supported feature IDs/versions on connect; Tab5 UI reflects what's actually available.
 - Cardputer-ADV's existing standalone local-menu operation must remain fully functional — remote control is additive, never a replacement.
@@ -1421,17 +1420,22 @@ git commit -m "Bring up Tab5 SD storage and verify no SDIO bus conflict with C6 
 
 ---
 
-## Task 11: Tab5 `IC2Link` — ESP-NOW Control Channel
+## Task 11: Tab5 `IC2Link` — WiFi Socket Transport (control + bulk)
+
+> **Amendment (2026-08-07):** this task originally targeted ESP-NOW. Implementation confirmed ESP-NOW has no linkable implementation for the ESP32-P4 in the installed Arduino-ESP32 framework (esp-hosted's WiFi remoting to the C6 doesn't proxy the ESP-NOW API surface — no `libespnow.a` ships for `esp32p4`, unlike every other Espressif target; verified via `nm` across every `.a` under `esp32p4/lib/`). Per the project owner's direction, Tab5's C2 now uses two radio-selected transports instead: this task builds the WiFi one, Task 13 builds the BLE one. See the foundation spec's §4.5 amendment for the full design rationale (use whichever radio isn't busy with the active feature).
 
 **Files:**
 - Create: `firmware/tab5/src/hal/ic2link.h`
-- Create: `firmware/tab5/src/hal/c2link_espnow.h`
-- Create: `firmware/tab5/src/hal/c2link_espnow.cpp`
+- Create: `firmware/tab5/src/hal/c2link_wifi.h`
+- Create: `firmware/tab5/src/hal/c2link_wifi.cpp`
 - Modify: `firmware/tab5/src/main.cpp`
 
 **Interfaces:**
-- Consumes: `c2proto::Frame`/`encode`/`decode` from Task 2, `crypto::hmac_sha256` from Task 3.
-- Produces: `IC2Link` (`init(const uint8_t psk[16], const uint8_t peer_mac[6])`, `send(const c2proto::Frame&) -> bool`, `set_receive_handler(void(*)(const c2proto::Frame&))`), `C2LinkEspNow : public IC2Link`. This is what Task 15's ping feature and every Phase 2+ remote-affinity feature send commands through.
+- Consumes: `c2proto::Frame`/`encode`/`decode` from Task 2, `crypto::hmac_sha256`/`hmac_verify` from Task 3.
+- Produces: `IC2Link` (`send(const c2proto::Frame&) -> bool`, `set_receive_handler(void(*)(const c2proto::Frame&))`, `is_connected() -> bool`) — the common interface Task 15's dispatcher and every Phase 2+ remote-affinity feature send commands through, regardless of which transport is active. `C2LinkWifi : public IC2Link`, with its own `init(psk, ap_ssid, ap_password, port)` and `poll()` (call every `loop()` iteration) that aren't part of the shared interface since each transport's setup/servicing is transport-specific.
+- With ESP-NOW's payload ceiling no longer a factor, this transport carries both control messages AND bulk data (pcap/handshake files, `.sub` captures) over the same connection — Task 13 (bulk WiFi socket) from the original plan is folded into this task; there is no longer a separate bulk-channel task.
+
+Tab5 hosts a WiFi AP (self-contained, no external network required — matches the "personal kit" pairing design) that Cardputer-ADV joins as a station once paired. A single persistent TCP connection carries all C2 traffic once the Cardputer-ADV connects.
 
 - [ ] **Step 1: Write the interface**
 
@@ -1446,98 +1450,137 @@ using C2LinkReceiveHandler = void (*)(const c2proto::Frame &);
 class IC2Link {
 public:
     virtual ~IC2Link() = default;
-    virtual bool init(const uint8_t psk[16], const uint8_t peer_mac[6]) = 0;
     virtual bool send(const c2proto::Frame &frame) = 0;
     virtual void set_receive_handler(C2LinkReceiveHandler handler) = 0;
+    virtual bool is_connected() = 0;
 };
 ```
 
-- [ ] **Step 2: Implement `C2LinkEspNow`**
+- [ ] **Step 2: Implement `C2LinkWifi`**
 
 ```cpp
-// firmware/tab5/src/hal/c2link_espnow.h
+// firmware/tab5/src/hal/c2link_wifi.h
 #pragma once
 #include "ic2link.h"
 
-class C2LinkEspNow : public IC2Link {
+class C2LinkWifi : public IC2Link {
 public:
-    bool init(const uint8_t psk[16], const uint8_t peer_mac[6]) override;
+    bool init(const uint8_t psk[16], const char *ap_ssid, const char *ap_password, uint16_t port);
     bool send(const c2proto::Frame &frame) override;
     void set_receive_handler(C2LinkReceiveHandler handler) override;
+    bool is_connected() override;
+    void poll(); // call every loop() iteration -- accepts a client, reads/dispatches incoming frames
 };
 ```
 
 ```cpp
-// firmware/tab5/src/hal/c2link_espnow.cpp
-#include "c2link_espnow.h"
-#include <esp_now.h>
+// firmware/tab5/src/hal/c2link_wifi.cpp
+#include "c2link_wifi.h"
 #include <WiFi.h>
+#include <crypto.h>
 #include <cstring>
 
-static C2LinkReceiveHandler s_handler = nullptr;
-static uint8_t s_peer_mac[6];
+// Wire format on this transport: [c2proto WireHeader+payload bytes][32-byte HMAC over those bytes].
+// Unlike ESP-NOW there's no hard payload ceiling here, but frames still respect
+// c2proto::kMaxPayload -- this transport doesn't need larger frames, it needs
+// an always-open connection, which a TCP socket already gives it.
 
-static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+static WiFiServer *s_server = nullptr;
+static WiFiClient s_client;
+static uint8_t s_psk[16];
+static C2LinkReceiveHandler s_handler = nullptr;
+
+bool C2LinkWifi::init(const uint8_t psk[16], const char *ap_ssid, const char *ap_password, uint16_t port) {
+    memcpy(s_psk, psk, 16);
+    WiFi.mode(WIFI_AP);
+    if (!WiFi.softAP(ap_ssid, ap_password)) return false;
+    s_server = new WiFiServer(port);
+    s_server->begin();
+    return true;
+}
+
+void C2LinkWifi::poll() {
+    if (!s_client || !s_client.connected()) {
+        WiFiClient incoming = s_server->accept();
+        if (incoming) s_client = incoming;
+        return;
+    }
+
+    if (s_client.available() < (int)sizeof(c2proto::WireHeader)) return;
+
+    uint8_t hdr_buf[sizeof(c2proto::WireHeader)];
+    if (s_client.peekBytes(hdr_buf, sizeof(hdr_buf)) != sizeof(hdr_buf)) return;
+
+    c2proto::WireHeader hdr{};
+    memcpy(&hdr, hdr_buf, sizeof(hdr));
+    if (hdr.payload_len > c2proto::kMaxPayload) { s_client.stop(); return; } // malformed, drop connection
+
+    size_t frame_len = sizeof(c2proto::WireHeader) + hdr.payload_len;
+    size_t total_len = frame_len + 32; // + HMAC trailer
+    if ((size_t)s_client.available() < total_len) return; // wait for the rest to arrive
+
+    uint8_t buf[sizeof(c2proto::WireHeader) + c2proto::kMaxPayload + 32];
+    s_client.readBytes(buf, total_len);
+
+    if (!c2proto::hmac_verify(s_psk, 16, buf, frame_len, buf + frame_len)) return; // drop silently, bad auth
+
     c2proto::Frame frame{};
-    if (c2proto::decode(data, (size_t)len, frame) && s_handler) {
+    if (c2proto::decode(buf, frame_len, frame) && s_handler) {
         s_handler(frame);
     }
 }
 
-bool C2LinkEspNow::init(const uint8_t psk[16], const uint8_t peer_mac[6]) {
-    memcpy(s_peer_mac, peer_mac, 6);
-    WiFi.mode(WIFI_STA); // ESP-NOW rides on the STA interface without associating
-    if (esp_now_init() != ESP_OK) return false;
-
-    esp_now_peer_info_t peer{};
-    memcpy(peer.peer_addr, peer_mac, 6);
-    peer.channel = 0;
-    peer.encrypt = true;
-    memcpy(peer.lmk, psk, 16); // PSK doubles as the ESP-NOW LMK for this link
-    if (esp_now_add_peer(&peer) != ESP_OK) return false;
-
-    esp_now_register_recv_cb(on_recv);
+bool C2LinkWifi::send(const c2proto::Frame &frame) {
+    if (!s_client || !s_client.connected()) return false;
+    uint8_t buf[sizeof(c2proto::WireHeader) + c2proto::kMaxPayload];
+    int n = c2proto::encode(frame, buf, sizeof(buf));
+    if (n < 0) return false;
+    uint8_t mac[32];
+    c2proto::hmac_sha256(s_psk, 16, buf, (size_t)n, mac);
+    s_client.write(buf, n);
+    s_client.write(mac, 32);
     return true;
 }
 
-bool C2LinkEspNow::send(const c2proto::Frame &frame) {
-    uint8_t buf[300];
-    int n = c2proto::encode(frame, buf, sizeof(buf));
-    if (n < 0) return false;
-    return esp_now_send(s_peer_mac, buf, (size_t)n) == ESP_OK;
+void C2LinkWifi::set_receive_handler(C2LinkReceiveHandler handler) {
+    s_handler = handler;
 }
 
-void C2LinkEspNow::set_receive_handler(C2LinkReceiveHandler handler) {
-    s_handler = handler;
+bool C2LinkWifi::is_connected() {
+    return s_client && s_client.connected();
 }
 ```
 
-- [ ] **Step 3: Wire a local loopback smoke test into `main.cpp`**
+- [ ] **Step 3: Wire into `main.cpp`**
 
-Full send/receive can only be verified with the Cardputer-ADV side present (Task 15), but the interface itself should compile and initialize cleanly in isolation first.
+Full send/receive can only be verified with the Cardputer-ADV side present (Task 15), but the interface itself should compile and initialize (start the AP) cleanly in isolation first.
 
 ```cpp
 // firmware/tab5/src/main.cpp — add after the Task 10 SD block
-#include "hal/c2link_espnow.h"
+#include "hal/c2link_wifi.h"
 
-C2LinkEspNow c2link;
+C2LinkWifi c2link_wifi;
 uint8_t test_psk[16] = {0}; // real key comes from Task 12's pairing flow
-uint8_t placeholder_peer_mac[6] = {0x24, 0x0A, 0xC4, 0x00, 0x00, 0x00}; // replace with real Cardputer-ADV MAC during Task 15 bring-up
-bool c2_ok = c2link.init(test_psk, placeholder_peer_mac);
-Serial.printf("quarky-tab5: c2link init %s\n", c2_ok ? "OK" : "FAILED");
+bool c2_wifi_ok = c2link_wifi.init(test_psk, "Quarky-Tab5-Test", "quarkytest123", 7777); // placeholder AP creds -- real derivation from PSK happens in Task 12
+Serial.printf("quarky-tab5: c2link_wifi init %s\n", c2_wifi_ok ? "OK" : "FAILED");
+```
+
+```cpp
+// firmware/tab5/src/main.cpp -- in loop()
+c2link_wifi.poll();
 ```
 
 - [ ] **Step 4: Flash and verify initialization succeeds**
 
 Run: `cd firmware/tab5 && pio run -t upload -t monitor`
-Expected: serial log shows `c2link init OK`. Actual message delivery is verified end-to-end in Task 15 once Cardputer-ADV's matching side exists.
+Expected: serial log shows `c2link_wifi init OK`. Actual message delivery is verified end-to-end in Task 15/20 once Cardputer-ADV's matching side exists.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add firmware/tab5/src/hal/ic2link.h firmware/tab5/src/hal/c2link_espnow.h \
-        firmware/tab5/src/hal/c2link_espnow.cpp firmware/tab5/src/main.cpp
-git commit -m "Add Tab5 ESP-NOW C2 control channel (IC2Link)"
+git add firmware/tab5/src/hal/ic2link.h firmware/tab5/src/hal/c2link_wifi.h \
+        firmware/tab5/src/hal/c2link_wifi.cpp firmware/tab5/src/main.cpp
+git commit -m "Add Tab5 WiFi socket C2 transport (IC2Link), replacing ESP-NOW"
 ```
 
 ---
@@ -1554,7 +1597,7 @@ git commit -m "Add Tab5 ESP-NOW C2 control channel (IC2Link)"
 
 **Interfaces:**
 - Consumes: `crypto::generate_psk` from Task 3, `ScreenStack` from Task 7.
-- Produces: `PskStore::load(uint8_t out[16]) -> bool`, `PskStore::save(const uint8_t psk[16])` (NVS-backed via Arduino `Preferences`). Task 15's `C2LinkEspNow::init` call in `main.cpp` is updated to use this instead of the Task 11 placeholder key.
+- Produces: `PskStore::load(uint8_t out[16]) -> bool`, `PskStore::save(const uint8_t psk[16])` (NVS-backed via Arduino `Preferences`). Task 11's `C2LinkWifi::init` and Task 13's `C2LinkBle::init` calls in `main.cpp` are updated to use this instead of their placeholder keys. One PSK authenticates both transports — no separate pairing ceremony per transport. The WiFi transport's AP password (Task 11) is the same 32-character hex string as the QR/display value, so no separate credential needs deriving or entering.
 
 - [ ] **Step 1: Write the NVS-backed PSK store**
 
@@ -1705,87 +1748,160 @@ git commit -m "Add Tab5 pairing screen: PSK generation, QR display, NVS persiste
 
 ---
 
-## Task 13: Tab5 Bulk WiFi Socket Channel
+## Task 13: Tab5 `IC2Link` — BLE GATT Transport
+
+> **Amendment (2026-08-07):** replaces the original "Bulk WiFi Socket Channel" task. With Task 11 folding bulk transfer into the WiFi transport (ESP-NOW's payload limit no longer forces a split), this task slot is repurposed for the second C2 transport the redesigned architecture needs: BLE, used when the WiFi radio is busy with an active feature. See Task 11's amendment note and the foundation spec's §4.5 amendment for the full rationale.
 
 **Files:**
-- Create: `firmware/tab5/src/hal/bulk_transfer.h`
-- Create: `firmware/tab5/src/hal/bulk_transfer.cpp`
+- Create: `firmware/tab5/src/hal/c2link_ble.h`
+- Create: `firmware/tab5/src/hal/c2link_ble.cpp`
+- Modify: `firmware/tab5/platformio.ini`
+- Modify: `firmware/tab5/src/main.cpp`
 
 **Interfaces:**
-- Consumes: `crypto::hmac_sha256`/`hmac_verify` from Task 3, `IRadio` from Task 9.
-- Produces: `BulkTransfer::receive_file(const char* save_path, uint16_t port, const uint8_t psk[16], uint32_t timeout_ms) -> bool` — opens a listening socket, accepts one connection, verifies an HMAC-signed length-prefixed frame, writes payload to `save_path`, and closes the socket. Full round-trip verification (with a real sender) happens in Task 15/17 once Cardputer-ADV exists; this task proves the receiver side compiles and opens/closes cleanly in isolation.
+- Consumes: `IC2Link` from Task 11, `c2proto::Frame`/`encode`/`decode` from Task 2, `crypto::hmac_sha256`/`hmac_verify` from Task 3.
+- Produces: `C2LinkBle : public IC2Link`, with its own `init(psk, device_name)`. Control-message use only in this phase (`CMD_*`/`RESP_STATUS`/`RESP_TELEMETRY`) — bulk transfers wait for the WiFi transport, per the spec amendment.
 
-- [ ] **Step 1: Write the bulk transfer receiver**
+Uses a Nordic-UART-Service-shaped GATT service (a well-known, widely-reused pattern for "bidirectional byte pipe over BLE" — one write characteristic for inbound frames, one notify characteristic for outbound) rather than inventing a custom service shape. Verified prerequisite: NimBLE (`ble_hs_init`) links successfully against the `esp32p4` target's `libbt.a` in the installed framework — confirmed during Task 11's investigation, unlike ESP-NOW.
+
+- [ ] **Step 1: Add the NimBLE-Arduino dependency**
+
+```ini
+; add to firmware/tab5/platformio.ini [env:tab5] lib_deps
+lib_deps =
+    lvgl/lvgl@^9.2.0
+    h2zero/NimBLE-Arduino@^2.2.1
+```
+
+- [ ] **Step 2: Implement `C2LinkBle`**
 
 ```cpp
-// firmware/tab5/src/hal/bulk_transfer.h
+// firmware/tab5/src/hal/c2link_ble.h
 #pragma once
-#include <cstdint>
-#include <cstddef>
+#include "ic2link.h"
 
-namespace BulkTransfer {
-bool receive_file(const char *save_path, uint16_t port, const uint8_t psk[16], uint32_t timeout_ms);
-}
+class C2LinkBle : public IC2Link {
+public:
+    bool init(const uint8_t psk[16], const char *device_name);
+    bool send(const c2proto::Frame &frame) override;
+    void set_receive_handler(C2LinkReceiveHandler handler) override;
+    bool is_connected() override;
+};
 ```
 
 ```cpp
-// firmware/tab5/src/hal/bulk_transfer.cpp
-#include "bulk_transfer.h"
+// firmware/tab5/src/hal/c2link_ble.cpp
+#include "c2link_ble.h"
+#include <NimBLEDevice.h>
 #include <crypto.h>
-#include <WiFi.h>
-#include <SD_MMC.h>
+#include <cstring>
 
-bool BulkTransfer::receive_file(const char *save_path, uint16_t port, const uint8_t psk[16], uint32_t timeout_ms) {
-    WiFiServer server(port);
-    server.begin();
+// Nordic UART Service UUIDs -- a de facto standard for exactly this
+// "bidirectional byte pipe over GATT" shape, reused rather than inventing
+// a custom service so any BLE debugging tool that already knows NUS works
+// against this link for free.
+static const char *kServiceUUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+static const char *kRxCharUUID  = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"; // write: peer -> Tab5
+static const char *kTxCharUUID  = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"; // notify: Tab5 -> peer
 
-    uint32_t start = millis();
-    WiFiClient client;
-    while (millis() - start < timeout_ms) {
-        client = server.accept();
-        if (client) break;
-        delay(50);
+static NimBLECharacteristic *s_txChar = nullptr;
+static uint8_t s_psk[16];
+static C2LinkReceiveHandler s_handler = nullptr;
+static volatile bool s_connected = false;
+
+class RxCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *chr, NimBLEConnInfo &) override {
+        std::string data = chr->getValue();
+        if (data.size() < 32) return; // must at least hold a HMAC trailer
+        size_t frame_len = data.size() - 32;
+        const uint8_t *bytes = reinterpret_cast<const uint8_t *>(data.data());
+
+        if (!c2proto::hmac_verify(s_psk, 16, bytes, frame_len, bytes + frame_len)) return;
+
+        c2proto::Frame frame{};
+        if (c2proto::decode(bytes, frame_len, frame) && s_handler) {
+            s_handler(frame);
+        }
     }
-    if (!client) {
-        server.end();
-        return false;
+};
+
+class ServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer *, NimBLEConnInfo &) override { s_connected = true; }
+    void onDisconnect(NimBLEServer *, NimBLEConnInfo &, int) override {
+        s_connected = false;
+        NimBLEDevice::startAdvertising(); // resume advertising so a dropped link can reconnect
     }
+};
 
-    // Wire format: [4-byte payload length][payload][32-byte HMAC over payload]
-    uint8_t len_buf[4];
-    if (client.readBytes(len_buf, 4) != 4) { client.stop(); server.end(); return false; }
-    uint32_t payload_len = (len_buf[0] << 24) | (len_buf[1] << 16) | (len_buf[2] << 8) | len_buf[3];
+bool C2LinkBle::init(const uint8_t psk[16], const char *device_name) {
+    memcpy(s_psk, psk, 16);
 
-    static uint8_t payload[4096];
-    if (payload_len > sizeof(payload)) { client.stop(); server.end(); return false; }
-    if (client.readBytes(payload, payload_len) != payload_len) { client.stop(); server.end(); return false; }
+    NimBLEDevice::init(device_name);
+    NimBLEServer *server = NimBLEDevice::createServer();
+    server->setCallbacks(new ServerCallbacks());
 
-    uint8_t mac[32];
-    if (client.readBytes(mac, 32) != 32) { client.stop(); server.end(); return false; }
+    NimBLEService *service = server->createService(kServiceUUID);
+    NimBLECharacteristic *rxChar = service->createCharacteristic(kRxCharUUID, NIMBLE_PROPERTY::WRITE);
+    rxChar->setCallbacks(new RxCallbacks());
+    s_txChar = service->createCharacteristic(kTxCharUUID, NIMBLE_PROPERTY::NOTIFY);
+    service->start();
 
-    bool auth_ok = c2proto::hmac_verify(psk, 16, payload, payload_len, mac);
-    client.stop();
-    server.end();
-    if (!auth_ok) return false;
+    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+    adv->addServiceUUID(kServiceUUID);
+    adv->start();
 
-    File f = SD_MMC.open(save_path, FILE_WRITE);
-    if (!f) return false;
-    f.write(payload, payload_len);
-    f.close();
     return true;
 }
+
+bool C2LinkBle::send(const c2proto::Frame &frame) {
+    if (!s_connected || s_txChar == nullptr) return false;
+
+    uint8_t frame_buf[sizeof(c2proto::WireHeader) + c2proto::kMaxPayload];
+    int n = c2proto::encode(frame, frame_buf, sizeof(frame_buf));
+    if (n < 0) return false;
+
+    uint8_t mac[32];
+    c2proto::hmac_sha256(s_psk, 16, frame_buf, (size_t)n, mac);
+
+    uint8_t out[sizeof(frame_buf) + 32];
+    memcpy(out, frame_buf, n);
+    memcpy(out + n, mac, 32);
+
+    s_txChar->setValue(out, n + 32);
+    return s_txChar->notify();
+}
+
+void C2LinkBle::set_receive_handler(C2LinkReceiveHandler handler) {
+    s_handler = handler;
+}
+
+bool C2LinkBle::is_connected() {
+    return s_connected;
+}
 ```
 
-- [ ] **Step 2: Verify it compiles and opens/closes cleanly with no client**
+- [ ] **Step 3: Wire into `main.cpp`**
 
-Run: `cd firmware/tab5 && pio run` (compile check), then manually call `BulkTransfer::receive_file("/test.bin", 9000, test_psk, 2000)` from `main.cpp` temporarily and flash.
-Expected: after 2 seconds with nothing connecting, the function returns `false` and the serial log (add a print around the call) confirms it didn't hang or crash. Remove the temporary call before committing — this task only proves the receiver logic in isolation; the real send-side counterpart is built in Task 17.
+```cpp
+// firmware/tab5/src/main.cpp — add alongside the Task 11 WiFi transport block
+#include "hal/c2link_ble.h"
 
-- [ ] **Step 3: Commit**
+C2LinkBle c2link_ble;
+bool c2_ble_ok = c2link_ble.init(test_psk, "Quarky-Tab5"); // same placeholder PSK as Task 11 until Task 12 wires the real one
+Serial.printf("quarky-tab5: c2link_ble init %s\n", c2_ble_ok ? "OK" : "FAILED");
+```
+
+- [ ] **Step 4: Flash and verify initialization succeeds**
+
+Run: `cd firmware/tab5 && pio run -t upload -t monitor`
+Expected: serial log shows `c2link_ble init OK`. A generic BLE scanner app (e.g. nRF Connect) run against the device should show it advertising as "Quarky-Tab5" with the Nordic UART Service UUID present — this is a real, cheap way to sanity-check advertising even without the Cardputer-ADV side existing yet, though it's not required for this task's own pass/fail (full round-trip verification happens once Cardputer-ADV's BLE client side exists, Task 15/20).
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add firmware/tab5/src/hal/bulk_transfer.h firmware/tab5/src/hal/bulk_transfer.cpp
-git commit -m "Add Tab5 bulk WiFi socket receiver with HMAC frame authentication"
+git add firmware/tab5/src/hal/c2link_ble.h firmware/tab5/src/hal/c2link_ble.cpp \
+        firmware/tab5/src/main.cpp firmware/tab5/platformio.ini
+git commit -m "Add Tab5 BLE GATT C2 transport (IC2Link second transport)"
 ```
 
 ---
@@ -1905,21 +2021,23 @@ git commit -m "Bring up Cardputer-ADV Device HAL skeleton (display + TCA8418 key
 
 ---
 
-## Task 15: Cardputer-ADV `IC2Link`, Command Dispatcher, and Capability Negotiation
+## Task 15: Cardputer-ADV `IC2Link` (WiFi Client), Command Dispatcher, and Capability Negotiation
+
+> **Amendment (2026-08-07):** originally targeted ESP-NOW, mirroring Tab5's Task 11. ESP-NOW is symmetric — both ends must speak it — so with Tab5 unable to (see Task 11's amendment), Cardputer-ADV can't reach Tab5 via ESP-NOW either, even though its own ESP32-S3 supports ESP-NOW natively. This task now implements the WiFi client side of Task 11's transport instead: Cardputer-ADV joins Tab5's AP and connects to its TCP socket. `IC2Link`'s shape also simplifies — no more per-message peer MAC addressing (that was ESP-NOW-specific), since a single persistent client connection to one known server doesn't need it. Task 17 becomes the BLE client counterpart (mirroring Task 13), replacing the original bulk-sender task for the same reason Task 13 replaced Tab5's bulk-receiver task.
 
 **Files:**
 - Create: `firmware/cardputer-adv/src/hal/ic2link.h`
-- Create: `firmware/cardputer-adv/src/hal/c2link_espnow.h`
-- Create: `firmware/cardputer-adv/src/hal/c2link_espnow.cpp`
+- Create: `firmware/cardputer-adv/src/hal/c2link_wifi.h`
+- Create: `firmware/cardputer-adv/src/hal/c2link_wifi.cpp`
 - Create: `firmware/cardputer-adv/src/remote/command_dispatcher.h`
 - Create: `firmware/cardputer-adv/src/remote/command_dispatcher.cpp`
 - Modify: `firmware/cardputer-adv/src/main.cpp`
 
 **Interfaces:**
-- Consumes: `c2proto` from Task 2, `FeatureRegistry` from Task 4. Mirrors Tab5's `IC2Link` (Task 11) but as the responding side.
+- Consumes: `c2proto` from Task 2, `FeatureRegistry` from Task 4. Mirrors Tab5's `IC2Link`/`C2LinkWifi` (Task 11) but as the connecting side.
 - Produces: `CommandDispatcher::handle(const c2proto::Frame&, IC2Link&, FeatureRegistry&)` — routes `CMD_GET_STATUS` to a capability report built from the local registry, and `CMD_START_FEATURE`/`CMD_STOP_FEATURE` to the matching registered module's start/stop callback.
 
-- [ ] **Step 1: Implement the Cardputer-ADV side of `IC2Link`** (identical shape to Task 11's Tab5 implementation, receiving side is now this device's role)
+- [ ] **Step 1: Write the interface (same shape as Tab5's, no peer-addressing needed)**
 
 ```cpp
 // firmware/cardputer-adv/src/hal/ic2link.h
@@ -1927,77 +2045,110 @@ git commit -m "Bring up Cardputer-ADV Device HAL skeleton (display + TCA8418 key
 #include <cstdint>
 #include <proto.h>
 
-using C2LinkReceiveHandler = void (*)(const c2proto::Frame &, const uint8_t sender_mac[6]);
+using C2LinkReceiveHandler = void (*)(const c2proto::Frame &);
 
 class IC2Link {
 public:
     virtual ~IC2Link() = default;
-    virtual bool init(const uint8_t psk[16]) = 0; // accepts any paired sender, unlike Tab5's fixed single peer
-    virtual bool send(const uint8_t dest_mac[6], const c2proto::Frame &frame) = 0;
+    virtual bool send(const c2proto::Frame &frame) = 0;
     virtual void set_receive_handler(C2LinkReceiveHandler handler) = 0;
+    virtual bool is_connected() = 0;
 };
 ```
 
+- [ ] **Step 2: Implement `C2LinkWifi` as a client connecting to Tab5's AP+socket**
+
 ```cpp
-// firmware/cardputer-adv/src/hal/c2link_espnow.h
+// firmware/cardputer-adv/src/hal/c2link_wifi.h
 #pragma once
 #include "ic2link.h"
 
-class C2LinkEspNow : public IC2Link {
+class C2LinkWifi : public IC2Link {
 public:
-    bool init(const uint8_t psk[16]) override;
-    bool send(const uint8_t dest_mac[6], const c2proto::Frame &frame) override;
+    bool init(const uint8_t psk[16], const char *ap_ssid, const char *ap_password,
+              const char *server_ip, uint16_t port);
+    bool send(const c2proto::Frame &frame) override;
     void set_receive_handler(C2LinkReceiveHandler handler) override;
+    bool is_connected() override;
+    void poll(); // call every loop() -- maintains the WiFi/socket connection, reads incoming frames
 };
 ```
 
 ```cpp
-// firmware/cardputer-adv/src/hal/c2link_espnow.cpp
-#include "c2link_espnow.h"
-#include <esp_now.h>
+// firmware/cardputer-adv/src/hal/c2link_wifi.cpp
+#include "c2link_wifi.h"
 #include <WiFi.h>
+#include <crypto.h>
 #include <cstring>
 
-static C2LinkReceiveHandler s_handler = nullptr;
+static WiFiClient s_client;
 static uint8_t s_psk[16];
+static char s_server_ip[16];
+static uint16_t s_port;
+static C2LinkReceiveHandler s_handler = nullptr;
 
-static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+bool C2LinkWifi::init(const uint8_t psk[16], const char *ap_ssid, const char *ap_password,
+                       const char *server_ip, uint16_t port) {
+    memcpy(s_psk, psk, 16);
+    strncpy(s_server_ip, server_ip, sizeof(s_server_ip) - 1);
+    s_port = port;
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ap_ssid, ap_password);
+    return true; // actual association + socket connect happens in poll()
+}
+
+void C2LinkWifi::poll() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    if (!s_client.connected()) {
+        s_client.connect(s_server_ip, s_port);
+        return;
+    }
+
+    if (s_client.available() < (int)sizeof(c2proto::WireHeader)) return;
+
+    uint8_t hdr_buf[sizeof(c2proto::WireHeader)];
+    if (s_client.peekBytes(hdr_buf, sizeof(hdr_buf)) != sizeof(hdr_buf)) return;
+    c2proto::WireHeader hdr{};
+    memcpy(&hdr, hdr_buf, sizeof(hdr));
+    if (hdr.payload_len > c2proto::kMaxPayload) { s_client.stop(); return; }
+
+    size_t frame_len = sizeof(c2proto::WireHeader) + hdr.payload_len;
+    size_t total_len = frame_len + 32;
+    if ((size_t)s_client.available() < total_len) return;
+
+    uint8_t buf[sizeof(c2proto::WireHeader) + c2proto::kMaxPayload + 32];
+    s_client.readBytes(buf, total_len);
+    if (!c2proto::hmac_verify(s_psk, 16, buf, frame_len, buf + frame_len)) return;
+
     c2proto::Frame frame{};
-    if (c2proto::decode(data, (size_t)len, frame) && s_handler) {
-        s_handler(frame, info->src_addr);
+    if (c2proto::decode(buf, frame_len, frame) && s_handler) {
+        s_handler(frame);
     }
 }
 
-bool C2LinkEspNow::init(const uint8_t psk[16]) {
-    memcpy(s_psk, psk, 16);
-    WiFi.mode(WIFI_STA);
-    if (esp_now_init() != ESP_OK) return false;
-    esp_now_register_recv_cb(on_recv);
+bool C2LinkWifi::send(const c2proto::Frame &frame) {
+    if (!s_client.connected()) return false;
+    uint8_t buf[sizeof(c2proto::WireHeader) + c2proto::kMaxPayload];
+    int n = c2proto::encode(frame, buf, sizeof(buf));
+    if (n < 0) return false;
+    uint8_t mac[32];
+    c2proto::hmac_sha256(s_psk, 16, buf, (size_t)n, mac);
+    s_client.write(buf, n);
+    s_client.write(mac, 32);
     return true;
 }
 
-bool C2LinkEspNow::send(const uint8_t dest_mac[6], const c2proto::Frame &frame) {
-    // Add as peer on first send to this MAC if not already known.
-    if (!esp_now_is_peer_exist(dest_mac)) {
-        esp_now_peer_info_t peer{};
-        memcpy(peer.peer_addr, dest_mac, 6);
-        peer.channel = 0;
-        peer.encrypt = true;
-        memcpy(peer.lmk, s_psk, 16);
-        esp_now_add_peer(&peer);
-    }
-    uint8_t buf[300];
-    int n = c2proto::encode(frame, buf, sizeof(buf));
-    if (n < 0) return false;
-    return esp_now_send(dest_mac, buf, (size_t)n) == ESP_OK;
+void C2LinkWifi::set_receive_handler(C2LinkReceiveHandler handler) {
+    s_handler = handler;
 }
 
-void C2LinkEspNow::set_receive_handler(C2LinkReceiveHandler handler) {
-    s_handler = handler;
+bool C2LinkWifi::is_connected() {
+    return s_client.connected();
 }
 ```
 
-- [ ] **Step 2: Write the command dispatcher with capability negotiation**
+- [ ] **Step 3: Write the command dispatcher with capability negotiation**
 
 ```cpp
 // firmware/cardputer-adv/src/remote/command_dispatcher.h
@@ -2006,7 +2157,7 @@ void C2LinkEspNow::set_receive_handler(C2LinkReceiveHandler handler) {
 #include <feature_registry.h>
 
 namespace CommandDispatcher {
-void handle(const c2proto::Frame &frame, const uint8_t sender_mac[6], IC2Link &link, FeatureRegistry &registry);
+void handle(const c2proto::Frame &frame, IC2Link &link, FeatureRegistry &registry);
 }
 ```
 
@@ -2017,7 +2168,7 @@ void handle(const c2proto::Frame &frame, const uint8_t sender_mac[6], IC2Link &l
 
 namespace CommandDispatcher {
 
-void handle(const c2proto::Frame &frame, const uint8_t sender_mac[6], IC2Link &link, FeatureRegistry &registry) {
+void handle(const c2proto::Frame &frame, IC2Link &link, FeatureRegistry &registry) {
     if (frame.type == c2proto::MsgType::CMD_GET_STATUS) {
         // Capability report: comma-joined list of registered feature ids,
         // truncated to fit kMaxPayload -- Phase 2+ features register here
@@ -2035,7 +2186,7 @@ void handle(const c2proto::Frame &frame, const uint8_t sender_mac[6], IC2Link &l
         }
         strncpy((char *)resp.payload, ids, c2proto::kMaxPayload);
         resp.payload_len = (uint16_t)strlen(ids);
-        link.send(sender_mac, resp);
+        link.send(resp);
         return;
     }
 
@@ -2055,29 +2206,34 @@ void handle(const c2proto::Frame &frame, const uint8_t sender_mac[6], IC2Link &l
 } // namespace CommandDispatcher
 ```
 
-Note for the implementer: Step 2's capability-report loop and the start-callback invocation are intentionally left as structural stubs here because `FeatureRegistry` (Task 4) doesn't yet expose a raw iteration-by-index accessor or callback function pointers on `FeatureModule` — Task 20 (Ping feature) is where `FeatureModule` gains real `start`/`stop`/`telemetry` function pointers and this dispatcher is completed against them. Do not treat this task's dispatcher as feature-complete; it establishes the routing skeleton only.
+Note for the implementer: Step 3's capability-report loop and the start-callback invocation are intentionally left as structural stubs here because `FeatureRegistry` (Task 4) doesn't yet expose a raw iteration-by-index accessor or callback function pointers on `FeatureModule` — Task 20 (Ping feature) is where `FeatureModule` gains real `start`/`stop`/`telemetry` function pointers and this dispatcher is completed against them. Do not treat this task's dispatcher as feature-complete; it establishes the routing skeleton only.
 
-- [ ] **Step 3: Wire into `main.cpp`**
+- [ ] **Step 4: Wire into `main.cpp`**
 
 ```cpp
 // firmware/cardputer-adv/src/main.cpp — add after Device::instance().init()
-#include "hal/c2link_espnow.h"
+#include "hal/c2link_wifi.h"
 #include "remote/command_dispatcher.h"
 #include <feature_registry.h>
 
-C2LinkEspNow c2link;
+C2LinkWifi c2link_wifi;
 FeatureRegistry g_registry; // populated in Task 20
 
 uint8_t test_psk[16] = {0}; // real key comes from Task 12's Tab5-side QR/typed provisioning
-bool c2_ok = c2link.init(test_psk);
-Serial.printf("quarky-cardputer-adv: c2link init %s\n", c2_ok ? "OK" : "FAILED");
+bool c2_ok = c2link_wifi.init(test_psk, "Quarky-Tab5-Test", "quarkytest123", "192.168.4.1", 7777); // matches Task 11's placeholder AP/port
+Serial.printf("quarky-cardputer-adv: c2link_wifi init %s\n", c2_ok ? "OK" : "FAILED");
 
-c2link.set_receive_handler([](const c2proto::Frame &frame, const uint8_t sender_mac[6]) {
-    CommandDispatcher::handle(frame, sender_mac, c2link, g_registry);
+c2link_wifi.set_receive_handler([](const c2proto::Frame &frame) {
+    CommandDispatcher::handle(frame, c2link_wifi, g_registry);
 });
 ```
 
-- [ ] **Step 4: Wire `shared/c2proto` and `shared/feature_contract` into the Cardputer-ADV build**
+```cpp
+// firmware/cardputer-adv/src/main.cpp -- in loop()
+c2link_wifi.poll();
+```
+
+- [ ] **Step 5: Wire `shared/c2proto` and `shared/feature_contract` into the Cardputer-ADV build**
 
 This is the first Cardputer-ADV code that includes `shared/` headers (`<proto.h>`, `<feature_registry.h>` above). Same fix as Task 7 applied to the other firmware target:
 
@@ -2089,18 +2245,18 @@ lib_extra_dirs = ../../shared
 Run: `cd firmware/cardputer-adv && pio run` (compile check)
 Expected: builds clean — both shared libraries resolve via `lib_extra_dirs` with no relative-path includes needed.
 
-- [ ] **Step 5: Flash and verify initialization succeeds**
+- [ ] **Step 6: Flash and verify initialization succeeds**
 
 Run: `cd firmware/cardputer-adv && pio run -t upload -t monitor`
-Expected: serial log shows `c2link init OK`. Full command round-trip verified in Task 20 once both sides share a real PSK and the ping feature module exists.
+Expected: serial log shows `c2link_wifi init OK`. Full command round-trip verified in Task 20 once both sides share a real PSK and the ping feature module exists.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add firmware/cardputer-adv/src/hal/ic2link.h firmware/cardputer-adv/src/hal/c2link_espnow.h \
-        firmware/cardputer-adv/src/hal/c2link_espnow.cpp firmware/cardputer-adv/src/remote/ \
+git add firmware/cardputer-adv/src/hal/ic2link.h firmware/cardputer-adv/src/hal/c2link_wifi.h \
+        firmware/cardputer-adv/src/hal/c2link_wifi.cpp firmware/cardputer-adv/src/remote/ \
         firmware/cardputer-adv/src/main.cpp firmware/cardputer-adv/platformio.ini
-git commit -m "Add Cardputer-ADV ESP-NOW C2 link and command dispatcher skeleton"
+git commit -m "Add Cardputer-ADV WiFi C2 client and command dispatcher, replacing ESP-NOW"
 ```
 
 ---
@@ -2182,75 +2338,141 @@ git commit -m "Add Cardputer-ADV standalone local menu baseline"
 
 ---
 
-## Task 17: Cardputer-ADV Bulk WiFi Socket Sender (counterpart to Task 13)
+## Task 17: Cardputer-ADV `IC2Link` — BLE GATT Client (counterpart to Task 13)
+
+> **Amendment (2026-08-07):** replaces the original "Bulk WiFi Socket Sender" task, for the same reason Task 13 replaced Tab5's bulk-receiver task — bulk transfer folded into the WiFi transport (Task 15), freeing this slot for the second transport. This task is Cardputer-ADV's BLE client, connecting to Tab5's Task 13 GATT server. Cardputer-ADV's ESP32-S3 has fully native BLE (no P4-style remoting involved), so this side is the simpler half of the pair.
 
 **Files:**
-- Create: `firmware/cardputer-adv/src/hal/bulk_transfer.h`
-- Create: `firmware/cardputer-adv/src/hal/bulk_transfer.cpp`
+- Create: `firmware/cardputer-adv/src/hal/c2link_ble.h`
+- Create: `firmware/cardputer-adv/src/hal/c2link_ble.cpp`
+- Modify: `firmware/cardputer-adv/platformio.ini`
 
 **Interfaces:**
-- Consumes: `crypto::hmac_sha256` from Task 3.
-- Produces: `BulkTransfer::send_file(const char* path, const char* dest_ip, uint16_t port, const uint8_t psk[16]) -> bool` — connects to the Tab5's listening socket (Task 13), sends the length-prefixed HMAC-signed frame, closes the connection.
+- Consumes: `IC2Link` from Task 15, `c2proto::Frame`/`encode`/`decode` from Task 2, `crypto::hmac_sha256`/`hmac_verify` from Task 3.
+- Produces: `C2LinkBle : public IC2Link` — a NimBLE client that scans for and connects to Tab5's Nordic-UART-Service GATT server (Task 13), writing outbound frames to its Rx characteristic and subscribing to notifications on its Tx characteristic.
 
-- [ ] **Step 1: Write the sender**
+- [ ] **Step 1: Add the NimBLE-Arduino dependency**
+
+```ini
+; add to firmware/cardputer-adv/platformio.ini [env:cardputer-adv] lib_deps
+lib_deps =
+    h2zero/NimBLE-Arduino@^2.2.1
+```
+
+- [ ] **Step 2: Implement `C2LinkBle` as a client**
 
 ```cpp
-// firmware/cardputer-adv/src/hal/bulk_transfer.h
+// firmware/cardputer-adv/src/hal/c2link_ble.h
 #pragma once
-#include <cstdint>
+#include "ic2link.h"
 
-namespace BulkTransfer {
-bool send_file(const char *path, const char *dest_ip, uint16_t port, const uint8_t psk[16]);
-}
+class C2LinkBle : public IC2Link {
+public:
+    bool init(const uint8_t psk[16], const char *target_device_name);
+    bool send(const c2proto::Frame &frame) override;
+    void set_receive_handler(C2LinkReceiveHandler handler) override;
+    bool is_connected() override;
+    void poll(); // call every loop() -- scans for and (re)connects to the target if not connected
+};
 ```
 
 ```cpp
-// firmware/cardputer-adv/src/hal/bulk_transfer.cpp
-#include "bulk_transfer.h"
+// firmware/cardputer-adv/src/hal/c2link_ble.cpp
+#include "c2link_ble.h"
+#include <NimBLEDevice.h>
 #include <crypto.h>
-#include <WiFi.h>
-#include <SD.h>
+#include <cstring>
 
-bool BulkTransfer::send_file(const char *path, const char *dest_ip, uint16_t port, const uint8_t psk[16]) {
-    File f = SD.open(path);
-    if (!f) return false;
+static const char *kServiceUUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+static const char *kRxCharUUID  = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"; // write: Cardputer-ADV -> Tab5
+static const char *kTxCharUUID  = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"; // notify: Tab5 -> Cardputer-ADV
 
-    static uint8_t payload[4096];
-    size_t payload_len = f.read(payload, sizeof(payload));
-    f.close();
-    if (payload_len == 0) return false;
+static uint8_t s_psk[16];
+static char s_target_name[32];
+static C2LinkReceiveHandler s_handler = nullptr;
+static NimBLEClient *s_client = nullptr;
+static NimBLERemoteCharacteristic *s_rxChar = nullptr; // write end (this device's outbound)
 
-    WiFiClient client;
-    if (!client.connect(dest_ip, port)) return false;
+static void on_notify(NimBLERemoteCharacteristic *, uint8_t *data, size_t len, bool) {
+    if (len < 32) return;
+    size_t frame_len = len - 32;
+    if (!c2proto::hmac_verify(s_psk, 16, data, frame_len, data + frame_len)) return;
 
-    uint8_t len_buf[4] = {
-        (uint8_t)(payload_len >> 24), (uint8_t)(payload_len >> 16),
-        (uint8_t)(payload_len >> 8), (uint8_t)payload_len
-    };
-    client.write(len_buf, 4);
-    client.write(payload, payload_len);
+    c2proto::Frame frame{};
+    if (c2proto::decode(data, frame_len, frame) && s_handler) {
+        s_handler(frame);
+    }
+}
+
+bool C2LinkBle::init(const uint8_t psk[16], const char *target_device_name) {
+    memcpy(s_psk, psk, 16);
+    strncpy(s_target_name, target_device_name, sizeof(s_target_name) - 1);
+    NimBLEDevice::init("");
+    return true; // actual scan/connect happens in poll()
+}
+
+void C2LinkBle::poll() {
+    if (s_client != nullptr && s_client->isConnected()) return;
+
+    NimBLEScan *scan = NimBLEDevice::getScan();
+    NimBLEScanResults results = scan->getResults(2000, false); // 2s scan window
+    for (const NimBLEAdvertisedDevice &dev : results) {
+        if (!dev.haveName() || dev.getName() != s_target_name) continue;
+
+        if (s_client == nullptr) s_client = NimBLEDevice::createClient();
+        if (!s_client->connect(&dev)) continue;
+
+        NimBLERemoteService *svc = s_client->getService(kServiceUUID);
+        if (svc == nullptr) { s_client->disconnect(); continue; }
+
+        s_rxChar = svc->getCharacteristic(kRxCharUUID);
+        NimBLERemoteCharacteristic *txChar = svc->getCharacteristic(kTxCharUUID);
+        if (s_rxChar == nullptr || txChar == nullptr) { s_client->disconnect(); continue; }
+
+        txChar->subscribe(true, on_notify);
+        break;
+    }
+}
+
+bool C2LinkBle::send(const c2proto::Frame &frame) {
+    if (s_client == nullptr || !s_client->isConnected() || s_rxChar == nullptr) return false;
+
+    uint8_t frame_buf[sizeof(c2proto::WireHeader) + c2proto::kMaxPayload];
+    int n = c2proto::encode(frame, frame_buf, sizeof(frame_buf));
+    if (n < 0) return false;
 
     uint8_t mac[32];
-    c2proto::hmac_sha256(psk, 16, payload, payload_len, mac);
-    client.write(mac, 32);
+    c2proto::hmac_sha256(s_psk, 16, frame_buf, (size_t)n, mac);
 
-    client.stop();
-    return true;
+    uint8_t out[sizeof(frame_buf) + 32];
+    memcpy(out, frame_buf, n);
+    memcpy(out + n, mac, 32);
+
+    return s_rxChar->writeValue(out, n + 32, false);
+}
+
+void C2LinkBle::set_receive_handler(C2LinkReceiveHandler handler) {
+    s_handler = handler;
+}
+
+bool C2LinkBle::is_connected() {
+    return s_client != nullptr && s_client->isConnected();
 }
 ```
 
-- [ ] **Step 2: End-to-end verify against Task 13's receiver on real hardware**
+- [ ] **Step 3: End-to-end verify against Task 13's server on real hardware**
 
-Create a small test file on the Cardputer-ADV's SD card (e.g. `/test.bin` containing a few bytes), point `dest_ip` at the Tab5's WiFi IP (from Task 9's connect test — both devices must be on the same test network for this manual check, distinct from the ESP-NOW link which doesn't need association), and call `BulkTransfer::send_file` from a temporary block in `main.cpp` with the same PSK the Tab5 side is using.
+Point `target_device_name` at `"Quarky-Tab5"` (Task 13's advertised name) and call `C2LinkBle::init`/`poll` from a temporary block in `main.cpp` with the same PSK the Tab5 side is using.
 
-Run: flash both devices, trigger the send from Cardputer-ADV, watch Tab5's serial log (with a temporary call to `BulkTransfer::receive_file` on that side, per Task 13 Step 2).
-Expected: Tab5 log shows the receive succeeding and the file appearing on its SD card via `SD_MMC` with matching contents to the source file on Cardputer-ADV's SD card. Remove both temporary test-trigger blocks before committing.
+Run: flash both devices, watch Cardputer-ADV's serial log for a connect event, then trigger a send from either side.
+Expected: the notify/write round trip succeeds and both sides log the received frame's contents matching what was sent. Remove any temporary test-trigger code before committing (Task 20 builds the real, permanent end-to-end demonstration).
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add firmware/cardputer-adv/src/hal/bulk_transfer.h firmware/cardputer-adv/src/hal/bulk_transfer.cpp
-git commit -m "Add Cardputer-ADV bulk WiFi socket sender, verified against Tab5 receiver"
+git add firmware/cardputer-adv/src/hal/c2link_ble.h firmware/cardputer-adv/src/hal/c2link_ble.cpp \
+        firmware/cardputer-adv/platformio.ini
+git commit -m "Add Cardputer-ADV BLE GATT C2 client (second transport)"
 ```
 
 ---
@@ -2394,32 +2616,51 @@ git commit -m "Bring up Tab5 NFC, RFID2, and RF433R/T peripheral detection"
 
 ## Task 19: Devices Panel — Live Link Status in the Shell UI
 
+> **Amendment (2026-08-07):** updated for the dual-transport redesign (Tasks 11/13) — the status label now reports which transport is active (WiFi or BLE) rather than assuming a single ESP-NOW link.
+
 **Files:**
 - Create: `firmware/tab5/src/ui/devices_panel.h`
 - Create: `firmware/tab5/src/ui/devices_panel.cpp`
 - Modify: `firmware/tab5/src/ui/shell.cpp`
-- Modify: `firmware/tab5/src/hal/c2link_espnow.cpp` (expose last-seen timestamp)
+- Modify: `firmware/tab5/src/hal/c2link_wifi.h`/`.cpp` (expose last-seen timestamp)
+- Modify: `firmware/tab5/src/hal/c2link_ble.h`/`.cpp` (expose last-seen timestamp)
 
 **Interfaces:**
-- Consumes: `C2LinkEspNow` from Task 11.
-- Produces: `DevicesPanel::update(bool cardputer_connected, int32_t last_rtt_ms)`, called whenever a `RESP_STATUS`/`RESP_TELEMETRY` arrives, updating the persistent status-bar link label built in Task 7 rather than a separate always-open panel (kept simple for the foundation phase; a full slide-out panel is a reasonable Phase 2+ UI polish item, not required here).
+- Consumes: `C2LinkWifi` from Task 11, `C2LinkBle` from Task 13.
+- Produces: `DevicesPanel::update(bool wifi_connected, bool ble_connected, int32_t last_rtt_ms)`, called periodically, updating the persistent status-bar link label built in Task 7 rather than a separate always-open panel (kept simple for the foundation phase; a full slide-out panel showing both transports independently is a reasonable Phase 2+ UI polish item, not required here).
 
-- [ ] **Step 1: Track last-seen state in the ESP-NOW link**
+- [ ] **Step 1: Track last-seen state in both links**
 
 ```cpp
-// firmware/tab5/src/hal/c2link_espnow.cpp — add
+// firmware/tab5/src/hal/c2link_wifi.cpp — add
 static uint32_t s_last_recv_ms = 0;
 
-// inside on_recv, after successful decode:
+// inside poll(), after a successful decode + handler dispatch:
 s_last_recv_ms = millis();
 
-// add a new free function, declared in c2link_espnow.h:
-uint32_t c2link_last_recv_ms() { return s_last_recv_ms; }
+// add a new free function, declared in c2link_wifi.h:
+uint32_t c2link_wifi_last_recv_ms() { return s_last_recv_ms; }
 ```
 
 ```cpp
-// firmware/tab5/src/hal/c2link_espnow.h — add
-uint32_t c2link_last_recv_ms();
+// firmware/tab5/src/hal/c2link_wifi.h — add
+uint32_t c2link_wifi_last_recv_ms();
+```
+
+```cpp
+// firmware/tab5/src/hal/c2link_ble.cpp — add
+static uint32_t s_last_recv_ms = 0;
+
+// inside on_notify, after successful decode + handler dispatch:
+s_last_recv_ms = millis();
+
+// add a new free function, declared in c2link_ble.h:
+uint32_t c2link_ble_last_recv_ms() { return s_last_recv_ms; }
+```
+
+```cpp
+// firmware/tab5/src/hal/c2link_ble.h — add
+uint32_t c2link_ble_last_recv_ms();
 ```
 
 - [ ] **Step 2: Write `DevicesPanel`**
@@ -2430,7 +2671,7 @@ uint32_t c2link_last_recv_ms();
 #include <cstdint>
 
 namespace DevicesPanel {
-void update(bool cardputer_connected, int32_t last_rtt_ms);
+void update(bool wifi_connected, bool ble_connected, int32_t last_rtt_ms);
 }
 ```
 
@@ -2443,15 +2684,17 @@ void update(bool cardputer_connected, int32_t last_rtt_ms);
 
 namespace DevicesPanel {
 
-void update(bool cardputer_connected, int32_t last_rtt_ms) {
+void update(bool wifi_connected, bool ble_connected, int32_t last_rtt_ms) {
     lv_obj_t *status_bar = Shell::status_bar();
     if (!status_bar) return;
     lv_obj_t *link_label = lv_obj_get_child(status_bar, 1); // the link label added in Task 7
     if (!link_label) return;
 
     char buf[64];
-    if (cardputer_connected) {
-        snprintf(buf, sizeof(buf), "Cardputer-ADV: connected (%dms)", last_rtt_ms);
+    if (wifi_connected) {
+        snprintf(buf, sizeof(buf), "Cardputer-ADV: connected via WiFi (%dms)", last_rtt_ms);
+    } else if (ble_connected) {
+        snprintf(buf, sizeof(buf), "Cardputer-ADV: connected via BLE (%dms)", last_rtt_ms);
     } else {
         snprintf(buf, sizeof(buf), "Cardputer-ADV: disconnected");
     }
@@ -2466,14 +2709,18 @@ void update(bool cardputer_connected, int32_t last_rtt_ms) {
 ```cpp
 // firmware/tab5/src/main.cpp — in loop(), alongside lvgl_port_tick()
 #include "ui/devices_panel.h"
-#include "hal/c2link_espnow.h"
+#include "hal/c2link_wifi.h"
+#include "hal/c2link_ble.h"
 
 static uint32_t last_poll = 0;
 if (millis() - last_poll > 500) {
     last_poll = millis();
-    uint32_t age = millis() - c2link_last_recv_ms();
-    bool connected = age < 5000; // consider disconnected if nothing heard in 5s
-    DevicesPanel::update(connected, (int32_t)age);
+    uint32_t wifi_age = millis() - c2link_wifi_last_recv_ms();
+    uint32_t ble_age = millis() - c2link_ble_last_recv_ms();
+    bool wifi_connected = wifi_age < 5000;
+    bool ble_connected = ble_age < 5000;
+    int32_t freshest_age = wifi_connected ? (int32_t)wifi_age : (int32_t)ble_age;
+    DevicesPanel::update(wifi_connected, ble_connected, freshest_age);
 }
 ```
 
@@ -2485,14 +2732,17 @@ This task's UI wiring is verified together with Task 20's end-to-end ping test �
 
 ```bash
 git add firmware/tab5/src/ui/devices_panel.h firmware/tab5/src/ui/devices_panel.cpp \
-        firmware/tab5/src/ui/shell.cpp firmware/tab5/src/hal/c2link_espnow.h \
-        firmware/tab5/src/hal/c2link_espnow.cpp firmware/tab5/src/main.cpp
-git commit -m "Add live Cardputer-ADV link status to Tab5 shell status bar"
+        firmware/tab5/src/ui/shell.cpp firmware/tab5/src/hal/c2link_wifi.h \
+        firmware/tab5/src/hal/c2link_wifi.cpp firmware/tab5/src/hal/c2link_ble.h \
+        firmware/tab5/src/hal/c2link_ble.cpp firmware/tab5/src/main.cpp
+git commit -m "Add live Cardputer-ADV link status (WiFi/BLE) to Tab5 shell status bar"
 ```
 
 ---
 
 ## Task 20: End-to-End Ping Feature (Tab5 Descriptor + Cardputer-ADV Executor)
+
+> **Amendment (2026-08-07):** updated for the dual-transport redesign. The Tab5 descriptor now sends over whichever of `C2LinkWifi`/`C2LinkBle` reports `is_connected()` (preferring WiFi, falling back to BLE) rather than a single ESP-NOW link, demonstrating the "use whichever radio is free" pattern end-to-end even though real automatic radio-aware scheduling is Phase 2+ scope. `sender_mac`/`peer_mac` plumbing is gone throughout, matching Tasks 11/13/15/17's simplified `IC2Link` shape (single connection, no per-message peer addressing).
 
 **Files:**
 - Modify: `shared/feature_contract/src/feature_module.h` (add callback function pointers)
@@ -2506,8 +2756,8 @@ git commit -m "Add live Cardputer-ADV link status to Tab5 shell status bar"
 - Modify: `firmware/cardputer-adv/src/remote/command_dispatcher.cpp` (complete the stub from Task 15)
 
 **Interfaces:**
-- Consumes: everything from Tasks 2, 4, 7, 11, 12, 15.
-- Produces: the first fully working feature module, proving the entire foundation contract end-to-end. Every Phase 2+ feature follows this exact same descriptor/executor/registration pattern.
+- Consumes: everything from Tasks 2, 4, 7, 11, 12, 13, 15, 17.
+- Produces: the first fully working feature module, proving the entire foundation contract end-to-end over both transports. Every Phase 2+ feature follows this exact same descriptor/executor/registration pattern.
 
 - [ ] **Step 1: Extend `FeatureModule` with callback function pointers**
 
@@ -2552,7 +2802,7 @@ Expected: PASS, 3/3 (unchanged — defaulted members don't break existing constr
 
 namespace PingFeature {
 void register_module();
-void handle_start(IC2Link &link, const uint8_t requester_mac[6], uint16_t seq);
+void handle_start(IC2Link &link, uint16_t seq);
 }
 ```
 
@@ -2571,7 +2821,7 @@ void register_module() {
     g_registry.register_module({"ping", "Ping Satellite", Category::UTILITY, Affinity::CARDPUTER_ADV});
 }
 
-void handle_start(IC2Link &link, const uint8_t requester_mac[6], uint16_t seq) {
+void handle_start(IC2Link &link, uint16_t seq) {
     c2proto::Frame resp{};
     resp.version = 1;
     resp.type = c2proto::MsgType::RESP_TELEMETRY;
@@ -2583,7 +2833,8 @@ void handle_start(IC2Link &link, const uint8_t requester_mac[6], uint16_t seq) {
     memcpy(resp.payload, msg, n);
     resp.payload_len = (uint16_t)n;
 
-    link.send(requester_mac, resp);
+    link.send(resp); // replies over whichever link (WiFi or BLE) delivered the command --
+                      // CommandDispatcher::handle already passes in the right IC2Link&
     Serial.printf("quarky-cardputer-adv: ping handled, replied '%s'\n", msg);
 }
 
@@ -2601,7 +2852,7 @@ if (frame.type == c2proto::MsgType::CMD_START_FEATURE) {
     memcpy(feature_id, frame.payload, frame.payload_len);
 
     if (strcmp(feature_id, "ping") == 0) {
-        PingFeature::handle_start(link, sender_mac, frame.seq);
+        PingFeature::handle_start(link, frame.seq);
         return;
     }
     // Unknown/unsupported feature id -- silently ignored; Tab5's capability
@@ -2609,13 +2860,34 @@ if (frame.type == c2proto::MsgType::CMD_START_FEATURE) {
 }
 ```
 
-- [ ] **Step 5: Register the ping module on Cardputer-ADV boot**
+Note: this dispatcher is registered as the receive handler for BOTH `c2link_wifi` and `c2link_ble` on the Cardputer-ADV side (Step 5 below wires both), so `CommandDispatcher::handle`'s `IC2Link &link` parameter is whichever concrete transport actually delivered the frame — the reply naturally goes back out the same transport the command arrived on.
+
+- [ ] **Step 5: Register the ping module and wire both transports' receive handlers on Cardputer-ADV boot**
 
 ```cpp
 // firmware/cardputer-adv/src/main.cpp — add after FeatureRegistry g_registry; declaration
 #include "features/ping_feature.h"
-// in setup(), after c2link init:
+#include "hal/c2link_ble.h" // Task 17's class -- permanently instantiated and wired here for the first time
+
+C2LinkBle c2link_ble;
+
+// in setup(), after c2link_wifi init (Task 15):
 PingFeature::register_module();
+
+bool c2_ble_ok = c2link_ble.init(test_psk, "Quarky-Tab5"); // matches Task 13's advertised name
+Serial.printf("quarky-cardputer-adv: c2link_ble init %s\n", c2_ble_ok ? "OK" : "FAILED");
+
+c2link_wifi.set_receive_handler([](const c2proto::Frame &frame) {
+    CommandDispatcher::handle(frame, c2link_wifi, g_registry);
+});
+c2link_ble.set_receive_handler([](const c2proto::Frame &frame) {
+    CommandDispatcher::handle(frame, c2link_ble, g_registry);
+});
+```
+
+```cpp
+// firmware/cardputer-adv/src/main.cpp -- in loop(), alongside c2link_wifi.poll()
+c2link_ble.poll();
 ```
 
 - [ ] **Step 6: Write the Tab5 descriptor and wire a launcher tile**
@@ -2633,13 +2905,15 @@ void send_ping();
 ```cpp
 // firmware/tab5/src/features/ping_feature.cpp
 #include "ping_feature.h"
-#include "../hal/c2link_espnow.h"
+#include "../hal/c2link_wifi.h"
+#include "../hal/c2link_ble.h"
 #include <feature_registry.h>
 #include <Arduino.h>
 #include <cstring>
 
 extern FeatureRegistry g_registry;   // defined in main.cpp
-extern C2LinkEspNow c2link;          // defined in main.cpp
+extern C2LinkWifi c2link_wifi;       // defined in main.cpp
+extern C2LinkBle c2link_ble;         // defined in main.cpp
 
 static uint16_t s_seq = 0;
 
@@ -2657,8 +2931,22 @@ void send_ping() {
     const char *id = "ping";
     memcpy(frame.payload, id, strlen(id));
     frame.payload_len = (uint16_t)strlen(id);
-    bool ok = c2link.send(frame);
-    Serial.printf("quarky-tab5: ping sent, %s\n", ok ? "OK" : "FAILED");
+
+    // Send over whichever transport is actually connected, preferring WiFi --
+    // this is the foundation-phase stand-in for real radio-aware selection
+    // (deferred to Phase 2+ per the spec's §4.5 amendment, since that needs
+    // live FeatureRegistry state about which radio a running feature holds,
+    // which doesn't exist until Phase 2+ features are real).
+    bool ok = false;
+    if (c2link_wifi.is_connected()) {
+        ok = c2link_wifi.send(frame);
+        Serial.printf("quarky-tab5: ping sent via WiFi, %s\n", ok ? "OK" : "FAILED");
+    } else if (c2link_ble.is_connected()) {
+        ok = c2link_ble.send(frame);
+        Serial.printf("quarky-tab5: ping sent via BLE, %s\n", ok ? "OK" : "FAILED");
+    } else {
+        Serial.println("quarky-tab5: ping not sent, no transport connected");
+    }
 }
 
 } // namespace PingFeature
@@ -2674,7 +2962,7 @@ PingFeature::register_module(); // makes the "Ping Satellite" tile appear in She
 - [ ] **Step 7: Handle `RESP_TELEMETRY` on the Tab5 side and update the Devices panel**
 
 ```cpp
-// firmware/tab5/src/main.cpp — extend the receive handler set up on c2link (declare before setup(), define after DevicesPanel include)
+// firmware/tab5/src/main.cpp — extend the receive handler set up on both links (declare before setup(), define after DevicesPanel include)
 #include "ui/devices_panel.h"
 
 void on_c2_receive(const c2proto::Frame &frame) {
@@ -2684,8 +2972,9 @@ void on_c2_receive(const c2proto::Frame &frame) {
         Serial.printf("quarky-tab5: telemetry received: %s\n", msg);
     }
 }
-// in setup(), after c2link.init(...):
-c2link.set_receive_handler(on_c2_receive);
+// in setup(), after both c2link_wifi.init(...) and c2link_ble.init(...):
+c2link_wifi.set_receive_handler(on_c2_receive);
+c2link_ble.set_receive_handler(on_c2_receive);
 ```
 
 The launcher tile for "Ping Satellite" (auto-generated by Task 7's `Shell::build` loop over registered `UTILITY` modules) needs its click handler wired to call `PingFeature::send_ping()` — add this in `shell.cpp`'s tile-creation loop:
@@ -2699,13 +2988,17 @@ lv_obj_add_event_cb(tile, [](lv_event_t *e) {
 }, LV_EVENT_CLICKED, nullptr);
 ```
 
-- [ ] **Step 8: Flash both devices with the real provisioned PSK and verify end-to-end on real hardware**
+- [ ] **Step 8: Flash both devices with the real provisioned PSK and verify end-to-end on real hardware, over both transports**
 
-Complete real pairing first: on Tab5, open "Pair Satellite" (Task 12), read the displayed hex key. On Cardputer-ADV, hardcode that same 16-byte key into the `test_psk` array in `main.cpp` (Task 15) in place of the all-zero placeholder, and set Tab5's `main.cpp` `placeholder_peer_mac` (Task 11) to the Cardputer-ADV's actual WiFi MAC (printed via `Serial.println(WiFi.macAddress())` added temporarily to its `setup()`).
+Complete real pairing first: on Tab5, open "Pair Satellite" (Task 12), read the displayed hex key. On Cardputer-ADV, hardcode that same 16-byte key into the `test_psk` array in `main.cpp` (Task 15) in place of the all-zero placeholder. No MAC address exchange is needed (unlike the original ESP-NOW design) — the WiFi transport connects by AP SSID/IP, and the BLE transport connects by advertised device name, both already hardcoded to matching values in Tasks 11/13/15/17.
 
 Run: `cd firmware/tab5 && pio run -t upload`, then `cd firmware/cardputer-adv && pio run -t upload`, then monitor both.
 
-Expected: tapping "Ping Satellite" on the Tab5 UI logs `ping sent, OK` on Tab5's serial; Cardputer-ADV's serial logs `ping handled, replied 'uptime=Ns'`; Tab5's serial then logs `telemetry received: uptime=Ns`; and the Tab5's status bar link label updates to `Cardputer-ADV: connected (Nms)` within half a second. This satisfies the foundation spec's Definition of Done items 6 and 8 in full.
+**WiFi path**: with Cardputer-ADV associated to Tab5's AP, tapping "Ping Satellite" on the Tab5 UI logs `ping sent via WiFi, OK`; Cardputer-ADV's serial logs `ping handled, replied 'uptime=Ns'`; Tab5's serial then logs `telemetry received: uptime=Ns`; the status bar updates to `Cardputer-ADV: connected via WiFi (Nms)`.
+
+**BLE path**: with Tab5's WiFi AP disabled/out of range (or Cardputer-ADV not associated) but BLE in range, the same tap logs `ping sent via BLE, OK` instead, and the status bar shows `Cardputer-ADV: connected via BLE (Nms)`.
+
+Verifying both paths (not just one) is what satisfies the foundation spec's Definition of Done items 6 and 8 in full, since both transports are load-bearing parts of the redesigned C2 architecture.
 
 - [ ] **Step 9: Commit**
 
@@ -2714,7 +3007,7 @@ git add shared/feature_contract/src/feature_module.h shared/feature_contract/tes
         firmware/tab5/src/features/ firmware/cardputer-adv/src/features/ \
         firmware/tab5/src/main.cpp firmware/cardputer-adv/src/main.cpp \
         firmware/cardputer-adv/src/remote/command_dispatcher.cpp firmware/tab5/src/ui/shell.cpp
-git commit -m "Wire end-to-end ping feature: Tab5 descriptor, ESP-NOW round trip, Cardputer-ADV executor"
+git commit -m "Wire end-to-end ping feature: Tab5 descriptor, dual WiFi/BLE round trip, Cardputer-ADV executor"
 ```
 
 ---
@@ -2741,7 +3034,7 @@ Date completed: <fill in>
 | 3 | esp-hosted WiFiRemote confirmed live | Task 9 | |
 | 4 | SD + C6 SDIO bus-sharing resolved | Task 10 | |
 | 5 | PSK provisioning flow completed on real hardware | Task 12 | |
-| 6 | ESP-NOW + bulk WiFi socket both verified | Tasks 11, 13, 17, 20 | |
+| 6 | WiFi socket + BLE GATT transports both verified | Tasks 11, 13, 15, 17, 20 | |
 | 7 | Cardputer-ADV standalone operation unmodified | Task 16 | |
 | 8 | End-to-end ping feature demonstrated live | Task 20 | |
 | 9 | Tab5 NFC/RFID2/RF433 HAL drivers detect hardware | Task 18 | |
@@ -2769,3 +3062,4 @@ git commit -m "Record foundation phase bring-up verification against Definition 
 - **Scope check:** this plan covers Phase 1 only, as scoped. Phases 2–7 are separate specs/plans per the program roadmap.
 - **Amendment (2026-08-07):** Tasks 2–4 corrected to place `shared/c2proto` and `shared/feature_contract` sources under `src/` (not the package root), and Tasks 7 and 15 gained a `lib_extra_dirs = ../../shared` step — discovered during Task 2's execution that the original root-level layout both failed PlatformIO's native test auto-compilation and, more seriously, was never actually wired into either firmware's build at all (Tasks 11/13/15/17/20 would have failed to link). All firmware-side includes changed from relative `../../../shared/...` paths to plain `<proto.h>`/`<crypto.h>`/`<feature_registry.h>`, resolved via PlatformIO's Library Dependency Finder.
 - **Amendment (2026-08-07, Task 3 execution):** `shared/c2proto/test/` actually ended up as per-suite subdirectories (`test/test_proto/test_proto.cpp`, `test/test_crypto/test_crypto.cpp`) rather than flat files as Tasks 2/3's text above shows — PlatformIO's native platform links every flat `test/*.cpp` file into one binary, so a second flat test file collided with the first over a duplicate `main()`. Tasks 2/3's code blocks above are left as originally written (the content is unchanged, only the containing directory), and this note is the record of the actual final layout. No other task's file paths were affected — `shared/feature_contract` (Task 4) is a separate PlatformIO project with only one test file, so it doesn't hit this.
+- **Amendment (2026-08-07, Task 11 execution — major):** ESP-NOW, the originally-designed C2 control-channel transport (Tasks 11/15), has no implementation for the ESP32-P4 in the installed Arduino-ESP32 framework — esp-hosted's WiFi remoting to the C6 co-processor doesn't proxy the ESP-NOW API surface at all (verified: no `libespnow.a` for `esp32p4`, unlike every other Espressif target; zero ESP-NOW entries among the ~89 functions `esp_wifi_remote_api.h` actually proxies). Per the project owner's direction, redesigned Tasks 11/13/15/17/19/20 around two transports selected by which radio is free: WiFi TCP socket (folding in what was Task 13's separate bulk channel, since ESP-NOW's payload ceiling that motivated the split no longer applies) and BLE GATT via NimBLE (confirmed working on the P4 — `libbt.a` links `ble_hs_init`, unlike ESP-NOW). `IC2Link`'s shape simplified in the process (no more per-message MAC/peer addressing, since both transports are single persistent connections rather than ESP-NOW's connectionless peer model) — this simplification applies retroactively to Tasks 11/13/15/17/20's text above, all already written against the corrected shape. See the foundation spec's §4.5 for the full design rationale, and the SDD ledger for the verification trail (independently re-confirmed by the controller before the redesign was approved).
