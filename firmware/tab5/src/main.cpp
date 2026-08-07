@@ -4,7 +4,7 @@
 #include "hal/touch_gt911.h"
 #include "hal/radio_esp_hosted.h"
 #include "hal/storage_sd.h"
-#include "hal/c2link_espnow.h"
+#include "hal/c2link_wifi.h"
 #include "ui/lvgl_port.h"
 #include "ui/shell.h"
 #include "ui/screen_stack.h"
@@ -14,7 +14,7 @@ DisplayTab5 display;
 TouchGT911 touch;
 RadioEspHosted radio;
 StorageSD storage;
-C2LinkEspNow c2link;
+C2LinkWifi c2link_wifi;
 FeatureRegistry g_registry; // populated further in Task 15
 
 void setup() {
@@ -49,16 +49,18 @@ void setup() {
     Serial.printf("quarky-tab5: sd mount+write while wifi active: %s\n", sd_ok ? "OK" : "FAILED");
     Serial.printf("quarky-tab5: wifi still connected after sd write: %s\n", radio.is_connected() ? "YES" : "NO");
 
-    // Task 11: C2LinkEspNow init-only smoke test. This is a placeholder PSK
-    // (all-zero) and a placeholder peer MAC -- neither is a real credential.
-    // The real PSK comes from Task 12's pairing flow; the real Cardputer-ADV
-    // MAC address comes from Task 15's bring-up. Full send/receive can only
-    // be verified once that satellite device exists and with real hardware
-    // (DEFERRED here, software-only pass) -- see task-11-report.md.
+    // Task 11 (amended 2026-08-07, was ESP-NOW -- see task-11-report.md for
+    // why that was replaced): C2LinkWifi init-only smoke test. Starts the
+    // Tab5's self-contained WiFi AP + TCP server; joining as a station and
+    // opening a connection is Cardputer-ADV's side, which doesn't exist yet.
+    // This is a placeholder PSK (all-zero) and placeholder AP credentials --
+    // none of this is a real credential. The real PSK and AP-credential
+    // derivation come from Task 12's pairing flow. Full send/receive can
+    // only be verified once Cardputer-ADV's matching side exists and with
+    // real hardware (DEFERRED here, software-only pass).
     uint8_t test_psk[16] = {0};
-    uint8_t placeholder_peer_mac[6] = {0x24, 0x0A, 0xC4, 0x00, 0x00, 0x00};
-    bool c2_ok = c2link.init(test_psk, placeholder_peer_mac);
-    Serial.printf("quarky-tab5: c2link init %s\n", c2_ok ? "OK" : "FAILED");
+    bool c2_wifi_ok = c2link_wifi.init(test_psk, "Quarky-Tab5-Test", "quarkytest123", 7777);
+    Serial.printf("quarky-tab5: c2link_wifi init %s\n", c2_wifi_ok ? "OK" : "FAILED");
 
     display.init();
     touch.init();
@@ -72,5 +74,6 @@ void setup() {
 
 void loop() {
     lvgl_port_tick();
+    c2link_wifi.poll();
     delay(5);
 }
