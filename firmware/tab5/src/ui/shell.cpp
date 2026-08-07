@@ -1,6 +1,7 @@
 #include "shell.h"
 #include "screen_stack.h"
 #include "keyboard_test_screen.h"
+#include "pairing_screen.h"
 #include <lvgl.h>
 
 lv_obj_t *Shell::status_bar_ = nullptr;
@@ -38,6 +39,18 @@ lv_obj_t *Shell::build(FeatureRegistry &registry) {
     lv_label_set_text(kb_test_label, "[debug] Keyboard Test");
     lv_obj_add_event_cb(kb_test_tile, [](lv_event_t *e) {
         ScreenStack::push(build_keyboard_test_screen());
+    }, LV_EVENT_CLICKED, nullptr);
+
+    // Launcher tile for Task 12's pairing screen: generates/loads the PSK
+    // that authenticates both C2 transports (WiFi Task 11, BLE Task 13) and
+    // displays it as a QR code + hex string for Cardputer-ADV to be paired
+    // with.
+    lv_obj_t *pairing_tile = lv_button_create(launcher);
+    lv_obj_set_size(pairing_tile, 200, 100);
+    lv_obj_t *pairing_label = lv_label_create(pairing_tile);
+    lv_label_set_text(pairing_label, "Pair Satellite");
+    lv_obj_add_event_cb(pairing_tile, [](lv_event_t *e) {
+        ScreenStack::push(build_pairing_screen());
     }, LV_EVENT_CLICKED, nullptr);
 
     return root;
