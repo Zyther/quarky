@@ -169,3 +169,82 @@
 #define TAB5_TOUCH_REG_STATUS   0x814E
 #define TAB5_TOUCH_REG_POINT_1  0x814F
 #define TAB5_TOUCH_CONTACT_SIZE 8 // bytes per touch point record
+
+// ---------------------------------------------------------------------------
+// microSD (SDIO) and ESP32-C6 SDIO-host-sharing research (Task 10)
+//
+// SOURCE: espp/m5stack-tab5 BSP (esp-cpp/espp repo, `main` branch), fetched
+// 2026-08-07 via `curl raw.githubusercontent.com`:
+//   https://github.com/esp-cpp/espp/blob/main/components/m5stack-tab5/include/m5stack-tab5.hpp
+//   https://github.com/esp-cpp/espp/blob/main/components/m5stack-tab5/src/sdcard.cpp
+// Cross-checked against ESP-IDF ESP32-P4 headers installed by this project's
+// pioarduino toolchain:
+//   framework-arduinoespressif32-libs/esp32p4/include/soc/esp32p4/include/soc/sdmmc_pins.h
+//   framework-arduinoespressif32-libs/esp32p4/include/esp_driver_sdmmc/include/driver/sdmmc_host.h
+//   framework-arduinoespressif32-libs/esp32p4/qio_qspi/include/sdkconfig.h
+// and against the Arduino core variant actually selected by this project's
+// platformio.ini (`board = esp32-p4-evboard` -> variant `esp32p4`):
+//   framework-arduinoespressif32/variants/esp32p4/pins_arduino.h
+//   framework-arduinoespressif32/cores/esp32/esp32-hal-hosted.c
+//
+// FINDING: the microSD card and the ESP32-C6 co-processor are on two
+// separate hardware SDMMC/SDIO slots of the ESP32-P4 (slot 0 vs slot 1),
+// with disjoint GPIO pins on real Tab5 hardware -- no shared bus wire, no
+// electrical contention. This resolves the foundation spec's flagged risk
+// from source. Residual caveats (indirect DMA/interrupt-level resource
+// sharing under heavy concurrent load; a real pins_arduino.h mismatch
+// between this project's generic EV-board pin config and Tab5's actual C6
+// pins) are documented in storage_sd.cpp and task-10-report.md.
+
+// microSD, real Tab5 pins, on SDMMC host SLOT 0 (fixed IOMUX -- these exact
+// GPIOs are hardwired in silicon for slot 0 on the ESP32-P4, confirmed
+// identical to SDMMC_SLOT0_IOMUX_PIN_NUM_* in soc/sdmmc_pins.h, which is why
+// they match this project's generic EV-board pins_arduino.h defaults too).
+#define TAB5_SD_CLK_GPIO   43
+#define TAB5_SD_CMD_GPIO   44
+#define TAB5_SD_D0_GPIO    39
+#define TAB5_SD_D1_GPIO    40
+#define TAB5_SD_D2_GPIO    41
+#define TAB5_SD_D3_GPIO    42
+#define TAB5_SD_SDMMC_SLOT 0
+
+// ESP32-C6 co-processor link, real Tab5 pins, on SDMMC host SLOT 1
+// (GPIO-matrix-routed -- confirmed disjoint from the SD pins above).
+// Source: m5stack-tab5.hpp, comments label these net names "SDIO2_*".
+// NOTE: this project's currently-selected PlatformIO board
+// (`esp32-p4-evboard`) does NOT use these values -- its pins_arduino.h
+// hardcodes the *generic* ESP32-P4-Function-EV-Board's C6 pins instead
+// (18/19/14/15/16/17/54, see BOARD_SDIO_ESP_HOSTED_* below), consumed by
+// cores/esp32/esp32-hal-hosted.c at compile time. That is a real,
+// unresolved pin mismatch against real Tab5 hardware, flagged forward in
+// task-10-report.md -- not fixed here (board-config decision, affects
+// Task 9's radio too, out of this task's scope).
+#define TAB5_C6_SDIO_CLK_GPIO   12
+#define TAB5_C6_SDIO_CMD_GPIO   13
+#define TAB5_C6_SDIO_D0_GPIO    11
+#define TAB5_C6_SDIO_D1_GPIO    10
+#define TAB5_C6_SDIO_D2_GPIO    9
+#define TAB5_C6_SDIO_D3_GPIO    8
+#define TAB5_C6_RESET_GPIO      15
+#define TAB5_C6_SDIO_SDMMC_SLOT 1
+
+// Generic ESP32-P4-Function-EV-Board's C6 pins, for reference -- these are
+// what's ACTUALLY baked into this project's build today via
+// framework-arduinoespressif32/variants/esp32p4/pins_arduino.h
+// (BOARD_HAS_SDIO_ESP_HOSTED / BOARD_SDIO_ESP_HOSTED_*), not the Tab5
+// values above. See caveat (b) in storage_sd.cpp.
+#define TAB5_EVBOARD_C6_SDIO_CLK_GPIO   18
+#define TAB5_EVBOARD_C6_SDIO_CMD_GPIO   19
+#define TAB5_EVBOARD_C6_SDIO_D0_GPIO    14
+#define TAB5_EVBOARD_C6_SDIO_D1_GPIO    15
+#define TAB5_EVBOARD_C6_SDIO_D2_GPIO    16
+#define TAB5_EVBOARD_C6_SDIO_D3_GPIO    17
+#define TAB5_EVBOARD_C6_RESET_GPIO      54
+
+// SD card power-enable: the generic EV-board's pins_arduino.h also defines
+// BOARD_SDMMC_POWER_CHANNEL=4 / BOARD_SDMMC_POWER_PIN=45 (active LOW),
+// which SD_MMC.begin() will toggle by default. The Tab5 BSP source does not
+// document an equivalent dedicated SD power-switch GPIO -- genuinely
+// unconfirmed whether Tab5's SD socket needs/has one. TODO: verify against
+// Tab5's actual schematic before relying on this in production; left as the
+// EV-board default for this bring-up pass rather than fabricated.
