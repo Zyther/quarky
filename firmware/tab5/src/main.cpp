@@ -1,21 +1,35 @@
 #include <Arduino.h>
+#include <lvgl.h>
 #include "hal/display_tab5.h"
+#include "hal/touch_gt911.h"
+#include "ui/lvgl_port.h"
 
 DisplayTab5 display;
+TouchGT911 touch;
 
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("quarky-tab5: display init");
     display.init();
+    touch.init();
+    lvgl_port_init(display, touch);
 
-    // Fill the screen red as a bring-up smoke test.
-    static uint16_t red_row[1280];
-    for (int i = 0; i < 1280; i++) red_row[i] = 0xF800; // RGB565 red
-    for (int y = 0; y < display.height(); y++) {
-        display.flush(0, y, display.width() - 1, y, red_row);
-    }
-    Serial.println("quarky-tab5: display filled red");
+    lv_obj_t *label = lv_label_create(lv_screen_active());
+    lv_label_set_text(label, "Touch anywhere");
+    lv_obj_center(label);
+
+    lv_obj_t *btn = lv_button_create(lv_screen_active());
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_obj_t *btn_label = lv_label_create(btn);
+    lv_label_set_text(btn_label, "Tap me");
+    lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+        Serial.println("quarky-tab5: button tapped");
+    }, LV_EVENT_CLICKED, nullptr);
+
+    Serial.println("quarky-tab5: lvgl ready");
 }
 
-void loop() { delay(1000); }
+void loop() {
+    lvgl_port_tick();
+    delay(5);
+}
