@@ -1,0 +1,35 @@
+# PlatformIO build artifacts
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# SDD execution scratch workspace (briefs, reports, review packages)
+.superpowers/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Secrets and credentials -- never commit these
+.env
+.env.*
+*.pem
+*.key
+*_secrets.*
+secrets.*
+credentials.*
+*credentials.h
+*credentials.ini
+.netrc
+id_rsa*
+id_ed25519*
+
+# Local hardware-test overrides (e.g. a temporary secrets.h holding a real
+# WiFi SSID/password or a provisioned PSK for on-device testing)
+**/local_secrets.h
+**/wifi_creds.h
