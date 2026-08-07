@@ -4,6 +4,7 @@
 #include "hal/touch_gt911.h"
 #include "hal/radio_esp_hosted.h"
 #include "hal/storage_sd.h"
+#include "hal/c2link_espnow.h"
 #include "ui/lvgl_port.h"
 #include "ui/shell.h"
 #include "ui/screen_stack.h"
@@ -13,6 +14,7 @@ DisplayTab5 display;
 TouchGT911 touch;
 RadioEspHosted radio;
 StorageSD storage;
+C2LinkEspNow c2link;
 FeatureRegistry g_registry; // populated further in Task 15
 
 void setup() {
@@ -46,6 +48,17 @@ void setup() {
     bool sd_ok = storage.mount() && storage.write_test_file();
     Serial.printf("quarky-tab5: sd mount+write while wifi active: %s\n", sd_ok ? "OK" : "FAILED");
     Serial.printf("quarky-tab5: wifi still connected after sd write: %s\n", radio.is_connected() ? "YES" : "NO");
+
+    // Task 11: C2LinkEspNow init-only smoke test. This is a placeholder PSK
+    // (all-zero) and a placeholder peer MAC -- neither is a real credential.
+    // The real PSK comes from Task 12's pairing flow; the real Cardputer-ADV
+    // MAC address comes from Task 15's bring-up. Full send/receive can only
+    // be verified once that satellite device exists and with real hardware
+    // (DEFERRED here, software-only pass) -- see task-11-report.md.
+    uint8_t test_psk[16] = {0};
+    uint8_t placeholder_peer_mac[6] = {0x24, 0x0A, 0xC4, 0x00, 0x00, 0x00};
+    bool c2_ok = c2link.init(test_psk, placeholder_peer_mac);
+    Serial.printf("quarky-tab5: c2link init %s\n", c2_ok ? "OK" : "FAILED");
 
     display.init();
     touch.init();
