@@ -138,10 +138,12 @@ git commit -m "Scaffold tab5 and cardputer-adv PlatformIO projects with top-leve
 ## Task 2: `shared/c2proto` Message Framing
 
 **Files:**
-- Create: `shared/c2proto/proto.h`
-- Create: `shared/c2proto/proto.cpp`
+- Create: `shared/c2proto/src/proto.h`
+- Create: `shared/c2proto/src/proto.cpp`
 - Create: `shared/c2proto/test/test_proto.cpp`
 - Create: `shared/c2proto/platformio.ini`
+
+**PlatformIO layout note:** library sources live in `src/` (PlatformIO's default `src_dir`), not the package root — this is what makes `pio test -e native` auto-compile them alongside `test/`, and what lets consuming firmware projects auto-link this library via `lib_extra_dirs` (see Task 7) using a plain `#include <proto.h>` rather than a relative path. Putting sources at the package root (no `src/`) silently fails both of these; do not deviate from this even though it costs an extra directory level.
 
 **Interfaces:**
 - Produces: `c2proto::Frame` struct, `c2proto::encode(const Frame&, uint8_t* out, size_t out_cap) -> int` (returns bytes written or -1 on overflow), `c2proto::decode(const uint8_t* in, size_t in_len, Frame& out) -> bool` (false on bad magic/length/version). `MsgType` enum: `CMD_START_FEATURE`, `CMD_STOP_FEATURE`, `CMD_GET_STATUS`, `RESP_STATUS`, `RESP_TELEMETRY`, `RESP_BULK_READY`.
@@ -206,19 +208,20 @@ int main(int argc, char **argv) {
 ; shared/c2proto/platformio.ini
 [env:native]
 platform = native
-build_flags = -std=gnu++17 -I.
+build_flags = -std=gnu++17 -Isrc
+test_build_src = yes
 test_framework = unity
 ```
 
 - [ ] **Step 3: Run test to verify it fails**
 
 Run: `cd shared/c2proto && pio test -e native`
-Expected: FAIL to compile — `proto.h` does not exist yet.
+Expected: FAIL to compile — `src/proto.h` does not exist yet.
 
 - [ ] **Step 4: Write the header**
 
 ```cpp
-// shared/c2proto/proto.h
+// shared/c2proto/src/proto.h
 #pragma once
 #include <cstdint>
 #include <cstddef>
@@ -265,7 +268,7 @@ bool decode(const uint8_t *in, size_t in_len, Frame &out);
 - [ ] **Step 5: Write the implementation**
 
 ```cpp
-// shared/c2proto/proto.cpp
+// shared/c2proto/src/proto.cpp
 #include "proto.h"
 
 namespace c2proto {
@@ -315,7 +318,7 @@ Expected: PASS, 3/3 tests.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add shared/c2proto/proto.h shared/c2proto/proto.cpp \
+git add shared/c2proto/src/proto.h shared/c2proto/src/proto.cpp \
         shared/c2proto/test/test_proto.cpp shared/c2proto/platformio.ini
 git commit -m "Add c2proto frame encode/decode with native unit tests"
 ```
@@ -325,10 +328,12 @@ git commit -m "Add c2proto frame encode/decode with native unit tests"
 ## Task 3: `shared/c2proto` PSK Generation and HMAC Authentication
 
 **Files:**
-- Create: `shared/c2proto/crypto.h`
-- Create: `shared/c2proto/crypto.cpp`
-- Create: `shared/c2proto/sha256_portable.h` (vendored, header-only, public-domain-style SHA-256 so both native host tests and on-device builds compile identically without pulling in mbedtls for the test env)
+- Create: `shared/c2proto/src/crypto.h`
+- Create: `shared/c2proto/src/crypto.cpp`
+- Create: `shared/c2proto/src/sha256_portable.h` (vendored, header-only, public-domain-style SHA-256 so both native host tests and on-device builds compile identically without pulling in mbedtls for the test env)
 - Create: `shared/c2proto/test/test_crypto.cpp`
+
+Same `src/` placement rule as Task 2 — these live alongside `proto.h`/`proto.cpp` in `shared/c2proto/src/`, not the package root.
 
 **Interfaces:**
 - Consumes: nothing new.
@@ -382,14 +387,14 @@ int main(int argc, char **argv) {
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cd shared/c2proto && pio test -e native -f test_crypto`
-Expected: FAIL to compile — `crypto.h` does not exist yet.
+Expected: FAIL to compile — `src/crypto.h` does not exist yet.
 
 - [ ] **Step 3: Vendor a portable SHA-256 and write crypto.h/.cpp**
 
-Use a standard public-domain single-header SHA-256 implementation (e.g. the widely-used `sha256.h`/`sha256.c` pairing by Brad Conte, public domain) placed at `shared/c2proto/sha256_portable.h` — this compiles identically under `pio test -e native` (host gcc) and under the ESP32 Arduino toolchain, so the same crypto.cpp is used in both native tests and on-device firmware.
+Use a standard public-domain single-header SHA-256 implementation (e.g. the widely-used `sha256.h`/`sha256.c` pairing by Brad Conte, public domain) placed at `shared/c2proto/src/sha256_portable.h` — this compiles identically under `pio test -e native` (host gcc) and under the ESP32 Arduino toolchain, so the same crypto.cpp is used in both native tests and on-device firmware.
 
 ```cpp
-// shared/c2proto/crypto.h
+// shared/c2proto/src/crypto.h
 #pragma once
 #include <cstdint>
 #include <cstddef>
@@ -408,7 +413,7 @@ bool hmac_verify(const uint8_t *key, size_t key_len,
 ```
 
 ```cpp
-// shared/c2proto/crypto.cpp
+// shared/c2proto/src/crypto.cpp
 #include "crypto.h"
 #include "sha256_portable.h"
 #include <cstring>
@@ -492,8 +497,8 @@ Expected: PASS, 3/3 tests.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add shared/c2proto/crypto.h shared/c2proto/crypto.cpp \
-        shared/c2proto/sha256_portable.h shared/c2proto/test/test_crypto.cpp
+git add shared/c2proto/src/crypto.h shared/c2proto/src/crypto.cpp \
+        shared/c2proto/src/sha256_portable.h shared/c2proto/test/test_crypto.cpp
 git commit -m "Add PSK generation and HMAC-SHA256 auth to c2proto with native tests"
 ```
 
@@ -502,11 +507,13 @@ git commit -m "Add PSK generation and HMAC-SHA256 auth to c2proto with native te
 ## Task 4: `shared/feature_contract` FeatureModule and FeatureRegistry
 
 **Files:**
-- Create: `shared/feature_contract/feature_module.h`
-- Create: `shared/feature_contract/feature_registry.h`
-- Create: `shared/feature_contract/feature_registry.cpp`
+- Create: `shared/feature_contract/src/feature_module.h`
+- Create: `shared/feature_contract/src/feature_registry.h`
+- Create: `shared/feature_contract/src/feature_registry.cpp`
 - Create: `shared/feature_contract/test/test_registry.cpp`
 - Create: `shared/feature_contract/platformio.ini`
+
+Same `src/` placement rule as `shared/c2proto` (Tasks 2-3) — sources live in `src/`, not the package root, so `pio test -e native` auto-compiles them and consuming firmware can auto-link this library via `lib_extra_dirs` (see Task 7) using a plain `#include <feature_registry.h>`.
 
 **Interfaces:**
 - Consumes: nothing new (pure logic, no dependency on `c2proto`).
@@ -561,7 +568,8 @@ int main(int argc, char **argv) {
 ; shared/feature_contract/platformio.ini
 [env:native]
 platform = native
-build_flags = -std=gnu++17 -I.
+build_flags = -std=gnu++17 -Isrc
+test_build_src = yes
 test_framework = unity
 ```
 
@@ -573,7 +581,7 @@ Expected: FAIL to compile — headers don't exist yet.
 - [ ] **Step 4: Write `feature_module.h`**
 
 ```cpp
-// shared/feature_contract/feature_module.h
+// shared/feature_contract/src/feature_module.h
 #pragma once
 
 enum class Category { WIFI, BLE, SUBGHZ, NRF24, LORA, NFC, RF433, IR, UTILITY };
@@ -590,7 +598,7 @@ struct FeatureModule {
 - [ ] **Step 5: Write `feature_registry.h` and `.cpp`**
 
 ```cpp
-// shared/feature_contract/feature_registry.h
+// shared/feature_contract/src/feature_registry.h
 #pragma once
 #include "feature_module.h"
 #include <cstring>
@@ -612,7 +620,7 @@ private:
 ```
 
 ```cpp
-// shared/feature_contract/feature_registry.cpp
+// shared/feature_contract/src/feature_registry.cpp
 #include "feature_registry.h"
 
 bool FeatureRegistry::register_module(const FeatureModule &m) {
@@ -1041,7 +1049,7 @@ void ScreenStack::pop() {
 ```cpp
 // firmware/tab5/src/ui/shell.h
 #pragma once
-#include "../../../shared/feature_contract/feature_registry.h"
+#include <feature_registry.h>
 
 class Shell {
 public:
@@ -1097,7 +1105,7 @@ lv_obj_t *Shell::build(FeatureRegistry &registry) {
 // firmware/tab5/src/main.cpp — add after lvgl_port_init(display, touch);
 #include "ui/shell.h"
 #include "ui/screen_stack.h"
-#include "../../shared/feature_contract/feature_registry.h"
+#include <feature_registry.h>
 
 FeatureRegistry g_registry; // populated further in Task 15
 
@@ -1106,17 +1114,29 @@ lv_obj_t *root = Shell::build(g_registry);
 ScreenStack::push(root);
 ```
 
-- [ ] **Step 4: Flash and manually verify**
+- [ ] **Step 4: Wire `shared/feature_contract` into the Tab5 build**
+
+This is the first Tab5 code that includes a `shared/` header (`<feature_registry.h>` in `shell.h`/`main.cpp` above). Add `lib_extra_dirs` so PlatformIO's Library Dependency Finder discovers and compiles `shared/feature_contract` (and, once Task 11 adds `shared/c2proto` usage, that too — the same line covers both):
+
+```ini
+; add to firmware/tab5/platformio.ini [env:tab5]
+lib_extra_dirs = ../../shared
+```
+
+Run: `cd firmware/tab5 && pio run` (compile check)
+Expected: builds clean — `feature_registry.h`/`feature_registry.cpp` resolve via `lib_extra_dirs` with no relative-path includes needed. If PlatformIO reports it can't find `feature_registry.h`, confirm `shared/feature_contract/src/feature_registry.h` exists (Task 4) and that `shared/feature_contract`'s directory name matches what LDF expects (no `library.json` is required for this — PlatformIO auto-treats any directory under an `lib_extra_dirs` path containing a `src/` folder as a library named after the directory).
+
+- [ ] **Step 5: Flash and manually verify**
 
 Run: `cd firmware/tab5 && pio run -t upload -t monitor`
 Expected: screen shows a status bar reading "Battery: --%" and "Cardputer-ADV: disconnected", with an empty launcher grid below (no tiles yet, since no feature module is registered until Task 15). No crash, no blank screen.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add firmware/tab5/src/ui/shell.h firmware/tab5/src/ui/shell.cpp \
         firmware/tab5/src/ui/screen_stack.h firmware/tab5/src/ui/screen_stack.cpp \
-        firmware/tab5/src/main.cpp
+        firmware/tab5/src/main.cpp firmware/tab5/platformio.ini
 git commit -m "Add Tab5 shell UI: status bar, launcher grid, and screen stack"
 ```
 
@@ -1419,7 +1439,7 @@ git commit -m "Bring up Tab5 SD storage and verify no SDIO bus conflict with C6 
 // firmware/tab5/src/hal/ic2link.h
 #pragma once
 #include <cstdint>
-#include "../../../shared/c2proto/proto.h"
+#include <proto.h>
 
 using C2LinkReceiveHandler = void (*)(const c2proto::Frame &);
 
@@ -1596,7 +1616,7 @@ lv_obj_t *build_pairing_screen();
 #include "pairing_screen.h"
 #include "screen_stack.h"
 #include "../hal/psk_store.h"
-#include "../../../shared/c2proto/crypto.h"
+#include <crypto.h>
 #include <qrcode.h>
 #include <Arduino.h>
 
@@ -1711,7 +1731,7 @@ bool receive_file(const char *save_path, uint16_t port, const uint8_t psk[16], u
 ```cpp
 // firmware/tab5/src/hal/bulk_transfer.cpp
 #include "bulk_transfer.h"
-#include "../../../shared/c2proto/crypto.h"
+#include <crypto.h>
 #include <WiFi.h>
 #include <SD_MMC.h>
 
@@ -1905,7 +1925,7 @@ git commit -m "Bring up Cardputer-ADV Device HAL skeleton (display + TCA8418 key
 // firmware/cardputer-adv/src/hal/ic2link.h
 #pragma once
 #include <cstdint>
-#include "../../../shared/c2proto/proto.h"
+#include <proto.h>
 
 using C2LinkReceiveHandler = void (*)(const c2proto::Frame &, const uint8_t sender_mac[6]);
 
@@ -1983,7 +2003,7 @@ void C2LinkEspNow::set_receive_handler(C2LinkReceiveHandler handler) {
 // firmware/cardputer-adv/src/remote/command_dispatcher.h
 #pragma once
 #include "../hal/ic2link.h"
-#include "../../../shared/feature_contract/feature_registry.h"
+#include <feature_registry.h>
 
 namespace CommandDispatcher {
 void handle(const c2proto::Frame &frame, const uint8_t sender_mac[6], IC2Link &link, FeatureRegistry &registry);
@@ -2043,7 +2063,7 @@ Note for the implementer: Step 2's capability-report loop and the start-callback
 // firmware/cardputer-adv/src/main.cpp — add after Device::instance().init()
 #include "hal/c2link_espnow.h"
 #include "remote/command_dispatcher.h"
-#include "../../shared/feature_contract/feature_registry.h"
+#include <feature_registry.h>
 
 C2LinkEspNow c2link;
 FeatureRegistry g_registry; // populated in Task 20
@@ -2057,17 +2077,29 @@ c2link.set_receive_handler([](const c2proto::Frame &frame, const uint8_t sender_
 });
 ```
 
-- [ ] **Step 4: Flash and verify initialization succeeds**
+- [ ] **Step 4: Wire `shared/c2proto` and `shared/feature_contract` into the Cardputer-ADV build**
+
+This is the first Cardputer-ADV code that includes `shared/` headers (`<proto.h>`, `<feature_registry.h>` above). Same fix as Task 7 applied to the other firmware target:
+
+```ini
+; add to firmware/cardputer-adv/platformio.ini [env:cardputer-adv]
+lib_extra_dirs = ../../shared
+```
+
+Run: `cd firmware/cardputer-adv && pio run` (compile check)
+Expected: builds clean — both shared libraries resolve via `lib_extra_dirs` with no relative-path includes needed.
+
+- [ ] **Step 5: Flash and verify initialization succeeds**
 
 Run: `cd firmware/cardputer-adv && pio run -t upload -t monitor`
 Expected: serial log shows `c2link init OK`. Full command round-trip verified in Task 20 once both sides share a real PSK and the ping feature module exists.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add firmware/cardputer-adv/src/hal/ic2link.h firmware/cardputer-adv/src/hal/c2link_espnow.h \
         firmware/cardputer-adv/src/hal/c2link_espnow.cpp firmware/cardputer-adv/src/remote/ \
-        firmware/cardputer-adv/src/main.cpp
+        firmware/cardputer-adv/src/main.cpp firmware/cardputer-adv/platformio.ini
 git commit -m "Add Cardputer-ADV ESP-NOW C2 link and command dispatcher skeleton"
 ```
 
@@ -2175,7 +2207,7 @@ bool send_file(const char *path, const char *dest_ip, uint16_t port, const uint8
 ```cpp
 // firmware/cardputer-adv/src/hal/bulk_transfer.cpp
 #include "bulk_transfer.h"
-#include "../../../shared/c2proto/crypto.h"
+#include <crypto.h>
 #include <WiFi.h>
 #include <SD.h>
 
@@ -2463,7 +2495,7 @@ git commit -m "Add live Cardputer-ADV link status to Tab5 shell status bar"
 ## Task 20: End-to-End Ping Feature (Tab5 Descriptor + Cardputer-ADV Executor)
 
 **Files:**
-- Modify: `shared/feature_contract/feature_module.h` (add callback function pointers)
+- Modify: `shared/feature_contract/src/feature_module.h` (add callback function pointers)
 - Modify: `shared/feature_contract/test/test_registry.cpp` (update for new fields)
 - Create: `firmware/tab5/src/features/ping_feature.h`
 - Create: `firmware/tab5/src/features/ping_feature.cpp`
@@ -2480,7 +2512,7 @@ git commit -m "Add live Cardputer-ADV link status to Tab5 shell status bar"
 - [ ] **Step 1: Extend `FeatureModule` with callback function pointers**
 
 ```cpp
-// shared/feature_contract/feature_module.h
+// shared/feature_contract/src/feature_module.h
 #pragma once
 
 enum class Category { WIFI, BLE, SUBGHZ, NRF24, LORA, NFC, RF433, IR, UTILITY };
@@ -2515,7 +2547,7 @@ Expected: PASS, 3/3 (unchanged — defaulted members don't break existing constr
 ```cpp
 // firmware/cardputer-adv/src/features/ping_feature.h
 #pragma once
-#include "../../../shared/c2proto/proto.h"
+#include <proto.h>
 #include "../hal/ic2link.h"
 
 namespace PingFeature {
@@ -2527,7 +2559,7 @@ void handle_start(IC2Link &link, const uint8_t requester_mac[6], uint16_t seq);
 ```cpp
 // firmware/cardputer-adv/src/features/ping_feature.cpp
 #include "ping_feature.h"
-#include "../../../shared/feature_contract/feature_registry.h"
+#include <feature_registry.h>
 #include <Arduino.h>
 #include <cstring>
 
@@ -2602,7 +2634,7 @@ void send_ping();
 // firmware/tab5/src/features/ping_feature.cpp
 #include "ping_feature.h"
 #include "../hal/c2link_espnow.h"
-#include "../../../shared/feature_contract/feature_registry.h"
+#include <feature_registry.h>
 #include <Arduino.h>
 #include <cstring>
 
@@ -2678,7 +2710,7 @@ Expected: tapping "Ping Satellite" on the Tab5 UI logs `ping sent, OK` on Tab5's
 - [ ] **Step 9: Commit**
 
 ```bash
-git add shared/feature_contract/feature_module.h shared/feature_contract/test/test_registry.cpp \
+git add shared/feature_contract/src/feature_module.h shared/feature_contract/test/test_registry.cpp \
         firmware/tab5/src/features/ firmware/cardputer-adv/src/features/ \
         firmware/tab5/src/main.cpp firmware/cardputer-adv/src/main.cpp \
         firmware/cardputer-adv/src/remote/command_dispatcher.cpp firmware/tab5/src/ui/shell.cpp
@@ -2735,3 +2767,4 @@ git commit -m "Record foundation phase bring-up verification against Definition 
 - **Placeholder scan:** GPIO pin values that genuinely cannot be sourced from this research pass (Tab5 backlight/reset GPIOs, GT911 exact pins, Cardputer-ADV keyboard interrupt pin, HY2.0 port assignment for RF433) are explicitly marked with `-1 // TODO` and a named authoritative source to consult, rather than silently invented — this is a deliberate, flagged exception to "no placeholders," since fabricating hardware register values as if verified would be worse than marking them honestly unverified.
 - **Type consistency:** `c2proto::Frame`/`MsgType` used identically across Tasks 2, 11, 13, 15, 17, 20. `FeatureModule`/`FeatureRegistry` signatures from Task 4 are extended (not renamed) in Task 20 — `for_each_in_category`, `find_by_id`, `register_module` keep the same names/signatures throughout.
 - **Scope check:** this plan covers Phase 1 only, as scoped. Phases 2–7 are separate specs/plans per the program roadmap.
+- **Amendment (2026-08-07):** Tasks 2–4 corrected to place `shared/c2proto` and `shared/feature_contract` sources under `src/` (not the package root), and Tasks 7 and 15 gained a `lib_extra_dirs = ../../shared` step — discovered during Task 2's execution that the original root-level layout both failed PlatformIO's native test auto-compilation and, more seriously, was never actually wired into either firmware's build at all (Tasks 11/13/15/17/20 would have failed to link). All firmware-side includes changed from relative `../../../shared/...` paths to plain `<proto.h>`/`<crypto.h>`/`<feature_registry.h>`, resolved via PlatformIO's Library Dependency Finder.
