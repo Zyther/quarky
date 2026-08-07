@@ -1,4 +1,5 @@
 #include "c2link_ble.h"
+#include <Arduino.h> // Serial (boot-path logging) + FreeRTOS portMUX
 #include <crypto.h>
 #include <cstring>
 
@@ -39,6 +40,7 @@ extern "C" {
 #include "host/ble_uuid.h"
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
+#include "host/ble_att.h"
 #include "host/ble_hs_mbuf.h"
 #include "host/ble_hs_adv.h"
 #include "host/ble_hs_id.h"
@@ -68,9 +70,27 @@ static uint8_t s_psk[16];
 static char s_device_name[32];
 static C2LinkReceiveHandler s_handler = nullptr;
 static volatile bool s_connected = false;
+// The central has to enable notifications on the Tx CCCD before
+// ble_gatts_notify_custom actually delivers anything -- frames sent in the
+// connect->subscribe window are silently dropped by the stack. Track that here
+// (set from BLE_GAP_EVENT_SUBSCRIBE) so send()/is_connected() only report ready
+// once notifications are actually flowing.
+static volatile bool s_subscribed = false;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_tx_val_handle = 0;
 static uint8_t s_own_addr_type = 0;
+
+// Inbound frames are decoded on NimBLE's host task (in rx_access_cb) and handed
+// to the main task via this single-producer/single-consumer ring, drained by
+// poll(). This matches C2LinkWifi's contract: the receive handler runs on the
+// main task, not a radio-stack task. The portMUX guards the head/tail indices
+// against the concurrent host-task producer and main-task consumer (they run on
+// different cores: NimBLE is pinned to core 0, Arduino loop to the other).
+static constexpr size_t kRxQueueDepth = 4;
+static c2proto::Frame s_rx_queue[kRxQueueDepth];
+static volatile size_t s_rx_head = 0; // producer writes here (host task)
+static volatile size_t s_rx_tail = 0; // consumer reads here (main task)
+static portMUX_TYPE s_rx_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void start_advertising();
 
@@ -92,9 +112,22 @@ static int rx_access_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, v
     size_t frame_len = (size_t)len - 32;
     if (!c2proto::hmac_verify(s_psk, 16, buf, frame_len, buf + frame_len)) return 0;
 
+    // HMAC + decode happen here on the host task (both are pure functions), but
+    // the decoded frame is queued for the main task rather than dispatched
+    // directly -- the handler must run on the main task (see poll()).
     c2proto::Frame frame{};
-    if (c2proto::decode(buf, frame_len, frame) && s_handler) {
-        s_handler(frame);
+    if (!c2proto::decode(buf, frame_len, frame)) return 0;
+
+    portENTER_CRITICAL(&s_rx_mux);
+    size_t next = (s_rx_head + 1) % kRxQueueDepth;
+    bool full = (next == s_rx_tail);
+    if (!full) {
+        s_rx_queue[s_rx_head] = frame;
+        s_rx_head = next;
+    }
+    portEXIT_CRITICAL(&s_rx_mux);
+    if (full) {
+        Serial.println("quarky-tab5: c2link_ble rx queue full, frame dropped");
     }
     return 0;
 }
@@ -135,14 +168,31 @@ static int gap_event_cb(struct ble_gap_event *event, void *) {
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
             s_connected = true;
+            s_subscribed = false; // central hasn't enabled the Tx CCCD yet
+            Serial.printf("quarky-tab5: c2link_ble connected (handle=%u)\n",
+                          event->connect.conn_handle);
         } else {
+            Serial.printf("quarky-tab5: c2link_ble connect failed (status=%d)\n",
+                          event->connect.status);
             start_advertising(); // failed connection attempt -- keep advertising
         }
         return 0;
     case BLE_GAP_EVENT_DISCONNECT:
+        Serial.printf("quarky-tab5: c2link_ble disconnected (reason=%d)\n",
+                      event->disconnect.reason);
         s_connected = false;
+        s_subscribed = false;
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         start_advertising(); // resume so a dropped link can reconnect
+        return 0;
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        // Fires when the central writes the Tx characteristic's CCCD. Only the
+        // Tx characteristic's notify subscription gates our send readiness.
+        if (event->subscribe.attr_handle == s_tx_val_handle) {
+            s_subscribed = event->subscribe.cur_notify;
+            Serial.printf("quarky-tab5: c2link_ble notify %s\n",
+                          s_subscribed ? "subscribed" : "unsubscribed");
+        }
         return 0;
     case BLE_GAP_EVENT_ADV_COMPLETE:
         start_advertising();
@@ -162,27 +212,46 @@ static void start_advertising() {
     adv_fields.uuids128 = &kServiceUUID;
     adv_fields.num_uuids128 = 1;
     adv_fields.uuids128_is_complete = 1;
-    if (ble_gap_adv_set_fields(&adv_fields) != 0) return;
+    int rc = ble_gap_adv_set_fields(&adv_fields);
+    if (rc != 0) {
+        Serial.printf("quarky-tab5: c2link_ble adv_set_fields failed (rc=%d)\n", rc);
+        return;
+    }
 
     struct ble_hs_adv_fields rsp_fields;
     memset(&rsp_fields, 0, sizeof(rsp_fields));
     rsp_fields.name = (const uint8_t *)s_device_name;
     rsp_fields.name_len = (uint8_t)strlen(s_device_name);
     rsp_fields.name_is_complete = 1;
-    ble_gap_adv_rsp_set_fields(&rsp_fields);
+    rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
+    if (rc != 0) {
+        Serial.printf("quarky-tab5: c2link_ble adv_rsp_set_fields failed (rc=%d)\n", rc);
+        return;
+    }
 
     struct ble_gap_adv_params adv_params;
     memset(&adv_params, 0, sizeof(adv_params));
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
-    ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER,
-                      &adv_params, gap_event_cb, NULL);
+    rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER,
+                           &adv_params, gap_event_cb, NULL);
+    if (rc != 0) {
+        Serial.printf("quarky-tab5: c2link_ble adv_start failed (rc=%d)\n", rc);
+        return;
+    }
+    Serial.printf("quarky-tab5: c2link_ble advertising as \"%s\"\n", s_device_name);
 }
 
-// Fires once the host and (remote C6) controller are synced and ready.
+// Fires once the host and (remote C6) controller are synced and ready. This is
+// the real "BLE came up" signal -- init() returns before this runs, so the
+// serial log here is what the deferred hardware-verification step looks for.
 static void on_sync() {
-    if (ble_hs_id_infer_auto(0, &s_own_addr_type) != 0) return;
+    int rc = ble_hs_id_infer_auto(0, &s_own_addr_type);
+    if (rc != 0) {
+        Serial.printf("quarky-tab5: c2link_ble id_infer_auto failed (rc=%d)\n", rc);
+        return;
+    }
     start_advertising();
 }
 
@@ -196,27 +265,61 @@ bool C2LinkBle::init(const uint8_t psk[16], const char *device_name) {
     strncpy(s_device_name, device_name, sizeof(s_device_name) - 1);
     s_device_name[sizeof(s_device_name) - 1] = '\0';
 
-    if (nimble_port_init() != ESP_OK) return false;
+    esp_err_t err = nimble_port_init();
+    if (err != ESP_OK) {
+        Serial.printf("quarky-tab5: c2link_ble nimble_port_init failed (err=0x%x)\n", err);
+        return false;
+    }
 
     ble_svc_gap_init();
     ble_svc_gatt_init();
-    if (ble_svc_gap_device_name_set(s_device_name) != 0) return false;
+    int rc = ble_svc_gap_device_name_set(s_device_name);
+    if (rc != 0) {
+        Serial.printf("quarky-tab5: c2link_ble device_name_set failed (rc=%d)\n", rc);
+        return false;
+    }
 
-    if (ble_gatts_count_cfg(s_svcs) != 0) return false;
-    if (ble_gatts_add_svcs(s_svcs) != 0) return false;
+    rc = ble_gatts_count_cfg(s_svcs);
+    if (rc != 0) {
+        Serial.printf("quarky-tab5: c2link_ble gatts_count_cfg failed (rc=%d)\n", rc);
+        return false;
+    }
+    rc = ble_gatts_add_svcs(s_svcs);
+    if (rc != 0) {
+        Serial.printf("quarky-tab5: c2link_ble gatts_add_svcs failed (rc=%d)\n", rc);
+        return false;
+    }
 
     ble_hs_cfg.sync_cb = on_sync;
 
     nimble_port_freertos_init(host_task);
+    // NOTE: this returns as soon as the host task is created. Actual BLE
+    // bring-up (controller sync, advertising start) happens asynchronously in
+    // on_sync() -- watch the serial log for "advertising as ..." to confirm it,
+    // since a true return here only means the host task was started.
     return true;
 }
 
 bool C2LinkBle::send(const c2proto::Frame &frame) {
-    if (!s_connected || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return false;
+    if (!s_connected || !s_subscribed || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        return false;
+    }
 
     uint8_t frame_buf[sizeof(c2proto::WireHeader) + c2proto::kMaxPayload];
     int n = c2proto::encode(frame, frame_buf, sizeof(frame_buf));
     if (n < 0) return false;
+
+    // A single notification cannot exceed (ATT_MTU - 3) bytes; the stack
+    // silently truncates anything larger AND still returns success, so the peer
+    // would receive a mangled frame while we reported OK. Before MTU exchange
+    // the MTU is the 23-byte default (20 usable), which even a zero-payload
+    // frame (10B header + 32B HMAC) overruns. Refuse rather than lie.
+    uint16_t mtu = ble_att_mtu(s_conn_handle);
+    if (mtu == 0 || (size_t)(n + 32) > (size_t)(mtu - 3)) {
+        Serial.printf("quarky-tab5: c2link_ble send skipped, frame %d+32 > mtu %u-3\n",
+                      n, mtu);
+        return false;
+    }
 
     uint8_t mac[32];
     c2proto::hmac_sha256(s_psk, 16, frame_buf, (size_t)n, mac);
@@ -237,5 +340,23 @@ void C2LinkBle::set_receive_handler(C2LinkReceiveHandler handler) {
 }
 
 bool C2LinkBle::is_connected() {
-    return s_connected;
+    // "Ready to carry frames" means both connected AND the peer has enabled
+    // notifications -- otherwise send() can't actually deliver anything.
+    return s_connected && s_subscribed;
+}
+
+void C2LinkBle::poll() {
+    for (;;) {
+        c2proto::Frame frame;
+        bool have = false;
+        portENTER_CRITICAL(&s_rx_mux);
+        if (s_rx_tail != s_rx_head) {
+            frame = s_rx_queue[s_rx_tail];
+            s_rx_tail = (s_rx_tail + 1) % kRxQueueDepth;
+            have = true;
+        }
+        portEXIT_CRITICAL(&s_rx_mux);
+        if (!have) break;
+        if (s_handler) s_handler(frame);
+    }
 }

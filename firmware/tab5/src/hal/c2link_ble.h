@@ -21,4 +21,9 @@ public:
     bool send(const c2proto::Frame &frame) override;
     void set_receive_handler(C2LinkReceiveHandler handler) override;
     bool is_connected() override;
+    // Call every loop() iteration. Inbound frames are received on NimBLE's own
+    // host task (in the GATT write callback), queued, and dispatched to the
+    // receive handler from here -- so the handler runs on the main task, the
+    // same threading contract as C2LinkWifi::poll(). See c2link_ble.cpp.
+    void poll();
 };

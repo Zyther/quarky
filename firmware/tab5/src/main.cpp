@@ -92,5 +92,6 @@ void setup() {
 void loop() {
     lvgl_port_tick();
     c2link_wifi.poll();
+    c2link_ble.poll(); // drains BLE frames received on the NimBLE host task
     delay(5);
 }
