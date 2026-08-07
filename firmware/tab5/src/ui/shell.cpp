@@ -1,5 +1,6 @@
 #include "shell.h"
 #include "screen_stack.h"
+#include "keyboard_test_screen.h"
 #include <lvgl.h>
 
 lv_obj_t *Shell::status_bar_ = nullptr;
@@ -29,6 +30,15 @@ lv_obj_t *Shell::build(FeatureRegistry &registry) {
         lv_obj_t *label = lv_label_create(tile);
         lv_label_set_text(label, m.name);
     });
+
+    // Debug launcher tile for testing lv_keyboard
+    lv_obj_t *kb_test_tile = lv_button_create(launcher);
+    lv_obj_set_size(kb_test_tile, 200, 100);
+    lv_obj_t *kb_test_label = lv_label_create(kb_test_tile);
+    lv_label_set_text(kb_test_label, "[debug] Keyboard Test");
+    lv_obj_add_event_cb(kb_test_tile, [](lv_event_t *e) {
+        ScreenStack::push(build_keyboard_test_screen());
+    }, LV_EVENT_CLICKED, nullptr);
 
     return root;
 }
