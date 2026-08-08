@@ -524,3 +524,83 @@
 // unconfirmed whether Tab5's SD socket needs/has one. TODO: verify against
 // Tab5's actual schematic before relying on this in production; left as the
 // EV-board default for this bring-up pass rather than fabricated.
+
+// ---------------------------------------------------------------------------
+// HY2.0 peripheral units: NFC, RFID2, RF433R/T (Task 18)
+// ---------------------------------------------------------------------------
+//
+// EXTERNAL I2C bus, for the NFC and RFID2 units (both I2C devices).
+// CONFIRMED 2026-08-08 from M5Stack's own product page
+// (docs.m5stack.com/en/core/Tab5), whose pin table lists exactly one
+// physical HY2.0-4P connector, labelled PORT.A:
+//     HY2.0-4P (PORT.A): G53, G54
+// This is a DIFFERENT bus from the internal one Tasks 5/6/10 use
+// (TAB5_INTERNAL_I2C_SDA_GPIO/SCL_GPIO = 31/32, which carries the display/
+// touch/IMU/RTC/codec/IO-expanders and is NOT exposed on any external
+// connector). Driven via the second Arduino I2C peripheral, `Wire1`, in
+// nfc_pn532.cpp, to keep it electrically and in-code distinct from `Wire`.
+// Also cross-confirmed by this project's own variant file
+// (boards/variants/quarky_tab5_p4/pins_arduino.h), which already labels
+// GPIO 53/54 "Tab5's actual external I2C bus pins" (set there for the
+// unrelated reason of keeping Wire.begin()'s no-args fallback off the C6
+// SDIO bus, which happens to corroborate the same two pins independently).
+#define TAB5_EXTERNAL_I2C_SDA_GPIO 53
+#define TAB5_EXTERNAL_I2C_SCL_GPIO 54
+// Standard-mode 100 kHz, not the internal bus's 400 kHz: this bus and every
+// device on it (PN532 / WS1850S / ST25R3916 -- see below) are, unlike the
+// internal bus, entirely unverified on real hardware as of this task.
+// Conservative until proven otherwise, matching how the internal touch bus
+// itself started out (see the touch hotfix report) before being raised once
+// measured. Revisit if verified stable at 400 kHz.
+#define TAB5_EXTERNAL_I2C_FREQ_HZ  100000
+
+// NFC unit and RFID2 unit I2C addresses.
+//
+// RFID2: CONFIRMED. docs.m5stack.com/en/product_i2c_addr and
+// docs.m5stack.com/en/unit/rfid2 both state Unit RFID2 is a WS1850S chip at
+// I2C 0x28. NOTE: this directly corrects the task brief's assumption that
+// both the NFC and RFID2 units are PN532-based -- RFID2 is not. (The
+// brief's placeholder *address*, 0x28, was nonetheless right; only the
+// assumed chip identity was wrong.) See nfc_pn532.cpp's header comment for
+// why this does not affect detect()'s correctness -- it is a bare address
+// probe, not a PN532-specific protocol exchange.
+#define TAB5_RFID2_I2C_ADDR 0x28
+
+// NFC: UNRESOLVED BY DOCUMENTATION, resolved by real-hardware bus scan
+// instead (nfc_scan_external_i2c_bus(), called from main.cpp before the
+// detect() calls). Two candidates found in research, both real M5Stack/
+// PN532-ecosystem values, kept here for reference:
+//   0x24 -- PN532 datasheet default I2C address (also an older, likely-EOL
+//           M5Stack Grove NFC module referenced in M5Stack community
+//           threads as "NFC PN532 grove v1.1"; does not appear in M5Stack's
+//           CURRENT product/I2C-address documentation).
+//   0x50 -- M5Stack's current "Unit NFC" / "NFC Universal Unit" product,
+//           confirmed via docs.m5stack.com/en/unit/Unit_NFC: chip
+//           ST25R3916-AQWT, "I2C @0x50 (100K / 400K)".
+// main.cpp's NfcPN532 instance is constructed against whichever of these the
+// real bus scan on this specific physical unit showed present; see
+// task-18-report.md for that scan's actual output.
+#define TAB5_NFC_I2C_ADDR_CANDIDATE_PN532_DEFAULT 0x24
+#define TAB5_NFC_I2C_ADDR_CANDIDATE_ST25R3916      0x50
+
+// RF433R/T GPIO pins: GENUINELY UNKNOWN, left as an explicit TODO rather
+// than fabricated. Full research trail (what was checked and why nothing
+// resolved it) is in rf433_gpio.cpp's header comment -- short version: the
+// Tab5 has exactly one physical HY2.0 connector (PORT.A, GPIO 53/54 above),
+// already committed to the NFC/RFID2 I2C bus, and no vendor source
+// documents a second HY2.0-style GPIO pair for Tab5 specifically. Override
+// via build flag (-DTAB5_RF433R_PIN=<n> -DTAB5_RF433T_PIN=<n>) once the
+// physical wiring is known.
+#ifndef TAB5_RF433R_PIN
+#define TAB5_RF433R_PIN -1 // TODO: undetermined -- see rf433_gpio.cpp
+#endif
+#ifndef TAB5_RF433T_PIN
+#define TAB5_RF433T_PIN -1 // TODO: undetermined -- see rf433_gpio.cpp
+#endif
+
+// Free GPIOs on the Tab5's rear M5-Bus connector (per docs.m5stack.com/en/
+// core/Tab5's pin table, fetched 2026-08-08), recorded here as the most
+// likely place a future RF433R/T wiring would land, since PORT.A is already
+// spoken for: G16, G17, G18, G45, G19, G52, G7, G6, G3, G4, G2, G48, G47,
+// G35, G51, G38, G37, G5 (G31/G32 on that same connector are the internal
+// I2C bus, already in use -- exclude those two from consideration).
