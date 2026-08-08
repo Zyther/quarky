@@ -17,8 +17,51 @@
 // determined from source research alone; it must be probed at runtime.
 // See video.cpp: M5StackTab5::detect_display_controller().
 
-#define TAB5_DISP_WIDTH   1280
-#define TAB5_DISP_HEIGHT  720
+// PANEL GEOMETRY. The Tab5's DSI panel is NATIVELY PORTRAIT: 720 pixels wide by
+// 1280 tall. This is not a guess -- it is what the espp BSP configures the DPI
+// timing with (`dpi_cfg.video_timing.h_size = display_width_` /
+// `v_size = display_height_`, where m5stack-tab5.hpp declares
+// `display_width_ = 720; display_height_ = 1280;`), and it matches the ILI9881C
+// silicon, which is a 720 x 1280 driver. The DSI/DPI hardware and
+// esp_lcd_panel_draw_bitmap() therefore work in 720x1280 coordinates ALWAYS.
+#define TAB5_PANEL_NATIVE_WIDTH   720
+#define TAB5_PANEL_NATIVE_HEIGHT  1280
+
+// LOGICAL (LVGL-facing) ORIENTATION. The Tab5 is physically a landscape
+// device, so DisplayTab5 presents a 1280x720 landscape surface to LVGL and
+// rotates each flushed block into the panel's native portrait space itself
+// (hardware PPA, with a software fallback) -- see src/hal/display_tab5.cpp.
+//
+//   90  = rotate the logical landscape image 90 degrees counter-clockwise
+//         into native portrait (default)
+//   270 = rotate 90 degrees clockwise instead -- use this if the picture comes
+//         up upside down relative to what you expect
+//   0   = no rotation; LVGL gets the raw native 720x1280 portrait surface.
+//         This is exactly what the espp BSP does by default
+//         (`rotation = DisplayRotation::LANDSCAPE`, which is enum value 0 and
+//         is passed straight to lv_display_set_rotation as
+//         LV_DISPLAY_ROTATION_0). Set this to bisect a bad picture: if 0 shows
+//         a correct-but-sideways UI, the panel bring-up is fine and only the
+//         rotation constant is wrong.
+//
+// WHICH WAY IS "UP" COULD NOT BE VERIFIED FROM SOURCE. Nothing in the BSP
+// records how the panel is physically mounted in the Tab5's case, and the
+// espp default (rotation 0) sidesteps the question by presenting portrait. 90
+// vs 270 is therefore the one display value in this file that is a choice
+// rather than a citation; flipping it is a one-line change.
+#ifndef TAB5_DISPLAY_ROTATION
+#define TAB5_DISPLAY_ROTATION 90
+#endif
+
+#if TAB5_DISPLAY_ROTATION == 90 || TAB5_DISPLAY_ROTATION == 270
+#define TAB5_DISP_WIDTH   TAB5_PANEL_NATIVE_HEIGHT  // 1280
+#define TAB5_DISP_HEIGHT  TAB5_PANEL_NATIVE_WIDTH   // 720
+#elif TAB5_DISPLAY_ROTATION == 0
+#define TAB5_DISP_WIDTH   TAB5_PANEL_NATIVE_WIDTH   // 720
+#define TAB5_DISP_HEIGHT  TAB5_PANEL_NATIVE_HEIGHT  // 1280
+#else
+#error "TAB5_DISPLAY_ROTATION must be 0, 90 or 270"
+#endif
 
 // Backlight: real GPIO, confirmed. In the espp BSP this is driven via LEDC
 // PWM (5 kHz, 10-bit duty, channel 0/timer 0) for brightness control, not a
@@ -35,11 +78,14 @@
 // direct-GPIO reset line to assign here.
 // Source: m5stack-tab5.hpp lines ~623-624, ~638, ~628; m5stack-tab5.cpp
 // `M5StackTab5::lcd_reset()` (calls set_io_expander_output(0x43, 4, ...)).
-// TODO: this task's DisplayTab5 does not yet drive panel reset (the brief's
-// init() only toggles backlight), so no I2C IO-expander driver exists here
-// yet. When panel reset is implemented, it needs an I2C IO-expander client
-// (PI4IOE5V6408 protocol) targeting the address/bit below, not a GPIO write.
-#define TAB5_DISP_RST_GPIO  -1 // TODO: no raw reset GPIO exists; see comment above
+// IMPLEMENTED: src/hal/display_tab5.cpp drives this via hal/io_expander.h
+// (assert / 10 ms / release / 120 ms, per video.cpp initialize_lcd()).
+// This matters more than it looks: at power-on the PI4IOE5V6408 leaves every
+// pin high-impedance, so until something drives P4 the panel's reset line is
+// simply floating and the controller may never come out of reset -- which is
+// consistent with the pre-fix I2C scan finding NO touch controller at all
+// (neither 0x14 nor 0x55) on the physical unit.
+#define TAB5_DISP_RST_GPIO  -1 // no raw reset GPIO exists; see comment above
 #define TAB5_DISP_RST_IOEXP_I2C_ADDR 0x43
 #define TAB5_DISP_RST_IOEXP_BIT      4     // IO43_BIT_LCD_RST / PI4IOE5V6408 P4
 #define TAB5_INTERNAL_I2C_SDA_GPIO   31
@@ -58,29 +104,49 @@
 #define TAB5_DSI_PHY_PWR_LDO_CHANNEL      3
 #define TAB5_DSI_PHY_PWR_LDO_VOLTAGE_MV   2500
 
-// Panel IC init command list: genuinely NOT transcribed here. In the espp
-// BSP this lives inside separate `espp::Ili9881` / `espp::St7123` display
-// driver classes (their own components, not inlined in m5stack-tab5's
-// video.cpp), which construct the vendor init command tables internally and
-// expose only a high-level `initialize()` call
-// (see video.cpp calls to `std::make_shared<espp::Ili9881>(...)` and
-// `std::make_shared<espp::St7123>(...)`). Locating and transcribing those
-// per-controller command byte tables was out of scope for the research pass
-// backing this file (would require fetching two more component sources);
-// flagged here explicitly rather than fabricated.
-// TODO: fetch espp's `ili9881` and `st7123` display-driver components
-// (github.com/esp-cpp/espp, likely under components/display_drivers or a
-// dedicated ili9881/st7123 component) for the actual init command sequences
-// before implementing a real (non-smoke-test) panel bring-up.
+// Panel IC init command list: NOW TRANSCRIBED. Task 5's TODO here said these
+// lived in "separate espp components" and could not be found; they are not
+// top-level `ili9881`/`st7123` components (which is why that search failed) --
+// both classes live inside espp's shared `display_drivers` component:
+//   components/display_drivers/include/ili9881.hpp  (espp::Ili9881, 202 cmds)
+//   components/display_drivers/include/st7123.hpp   (espp::St7123,   28 cmds)
+// Mechanically transcribed into src/hal/tab5_panel_cmds.h; see that file's
+// header for the full citation and the round-trip verification method.
 
-// DPI (parallel-in, DSI-out) video timing, confirmed from video.cpp for
-// reference/documentation -- not yet consumed by DisplayTab5 in this task
-// (the brief's init()/flush() stubs don't construct a DPI panel):
-//   ILI9881: dpi_clock_freq_mhz=60, hsync bp/pw/fp=140/40/40,
-//            vsync bp/pw/fp=20/4/20
-//   ST7123:  dpi_clock_freq_mhz=70 (do not increase -- desyncs the ST7123's
-//            touch scan per video.cpp comment), hsync bp/pw/fp=40/2/40,
-//            vsync bp/pw/fp=8/2/220
+// Runtime panel-controller detection, transcribed from video.cpp
+// `M5StackTab5::detect_display_controller()`:
+//   1. probe I2C 0x14 -- a GT911 answering there means this is the ILI9881
+//      hardware revision (standalone touch IC + ILI9881 display driver)
+//   2. else probe I2C 0x55 -- the ST7123 revision (TDDI part, touch built in)
+//   3. else UNKNOWN (the BSP gives up; see display_tab5.cpp for what this
+//      project does instead, and why)
+// Both probes must happen AFTER the LCD reset pulse above, exactly as the BSP
+// orders them -- the ST7123 cannot answer on I2C while it is held in reset.
+#define TAB5_ILI9881_PROBE_I2C_ADDR  0x14  // GT911 presence => ILI9881 variant
+#define TAB5_ST7123_I2C_ADDR         0x55  // ST7123 TDDI controller, probed directly
+
+// DPI (parallel-in, DSI-out) video timing, confirmed from video.cpp. These are
+// consumed by src/hal/display_tab5.cpp when it builds the DPI panel. The
+// h_size/v_size that go with them are the NATIVE portrait 720x1280 above.
+#define TAB5_DPI_CLK_MHZ_ILI9881        60
+#define TAB5_DPI_HSYNC_BP_ILI9881       140
+#define TAB5_DPI_HSYNC_PW_ILI9881       40
+#define TAB5_DPI_HSYNC_FP_ILI9881       40
+#define TAB5_DPI_VSYNC_BP_ILI9881       20
+#define TAB5_DPI_VSYNC_PW_ILI9881       4
+#define TAB5_DPI_VSYNC_FP_ILI9881       20
+// DO NOT RAISE the ST7123 pixel clock above 70 MHz. Per video.cpp's own
+// comment: the ST7123 is a TDDI part whose touch engine scans during the
+// display blanking interval, timed against the pixel clock its vendor init
+// table was tuned for; running faster shrinks the blanking window and desyncs
+// the touch scan (panel shows, touch never reports).
+#define TAB5_DPI_CLK_MHZ_ST7123         70
+#define TAB5_DPI_HSYNC_BP_ST7123        40
+#define TAB5_DPI_HSYNC_PW_ST7123        2
+#define TAB5_DPI_HSYNC_FP_ST7123        40
+#define TAB5_DPI_VSYNC_BP_ST7123        8
+#define TAB5_DPI_VSYNC_PW_ST7123        2
+#define TAB5_DPI_VSYNC_FP_ST7123        220
 
 // ---------------------------------------------------------------------------
 // GT911 touch controller (Task 6)

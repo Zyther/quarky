@@ -50,7 +50,17 @@ void lvgl_port_init(IDisplay &display, ITouch &touch) {
     lv_display_set_flush_cb(s_lv_display, flush_cb);
 
     size_t buf_size = static_cast<size_t>(display.width()) * kDrawBufLines * sizeof(uint16_t);
-    s_draw_buf = static_cast<uint16_t *>(heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM));
+    // Cache-line aligned (ESP32-P4 L2 line = 128 bytes), and the size rounded up
+    // to a whole number of lines. DisplayTab5::flush() hands this buffer to the
+    // PPA (hardware rotation) and to the DSI DPI panel's DMA2D copy, both of
+    // which move data behind the CPU's cache; an unaligned PSRAM buffer makes
+    // the driver-side cache sync fail (ESP_ERR_INVALID_ARG) or, worse, share a
+    // cache line with an unrelated allocation. heap_caps_aligned_alloc requires
+    // the size to be a multiple of the alignment too.
+    constexpr size_t kCacheAlign = 128;
+    buf_size = (buf_size + kCacheAlign - 1) / kCacheAlign * kCacheAlign;
+    s_draw_buf = static_cast<uint16_t *>(
+        heap_caps_aligned_alloc(kCacheAlign, buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (s_draw_buf == nullptr) {
         // Without this check, a failed allocation feeds a null buffer into
         // lv_display_set_buffers() and the first draw hits lv_conf.h's
