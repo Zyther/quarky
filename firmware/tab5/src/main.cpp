@@ -7,9 +7,12 @@
 #include "hal/storage_sd.h"
 #include "hal/c2link_wifi.h"
 #include "hal/c2link_ble.h"
+#include "hal/nfc_pn532.h"
+#include "hal/rf433_gpio.h"
 #include "ui/lvgl_port.h"
 #include "ui/shell.h"
 #include "ui/screen_stack.h"
+#include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
 
 DisplayTab5 display;
@@ -19,6 +22,19 @@ StorageSD storage;
 C2LinkWifi c2link_wifi;
 C2LinkBle c2link_ble;
 FeatureRegistry g_registry; // populated further in Task 15
+
+// Task 18: HY2.0 peripheral detection (NFC, RFID2, RF433R/T). See
+// hal/nfc_pn532.cpp and boards/tab5/pins_config.h for the real-hardware
+// address/pin research behind these constructor arguments. Real-hardware
+// verification (task-18-report.md): the external bus census found NOTHING
+// at all on GPIO 53/54 on this boot -- neither of these two candidate
+// addresses, nor any other address in the full 0x08-0x77 sweep -- so there
+// was nothing to "correct" the NFC address against. See the report for the
+// analysis of why (most likely: units not physically connected/powered for
+// this test, not a wrong-address bug).
+NfcPN532 nfc_unit(TAB5_NFC_I2C_ADDR_CANDIDATE_PN532_DEFAULT); // 0x24 (PN532 default)
+NfcPN532 rfid2_unit(TAB5_RFID2_I2C_ADDR); // 0x28, confirmed (WS1850S)
+Rf433Gpio rf433;
 
 // Task 9's WiFi STA smoke test still ships with placeholder credentials.
 // Attempting them costs a guaranteed-to-fail 15s connect timeout on every
@@ -60,6 +76,18 @@ void setup() {
     Serial.println("quarky-tab5: mounting sd card...");
     bool sd_ok = storage.mount() && storage.write_test_file();
     Serial.printf("quarky-tab5: sd mount+write: %s\n", sd_ok ? "OK" : "FAILED");
+
+    // Task 18: HY2.0 peripheral detection (NFC, RFID2, RF433R/T). Detection
+    // only -- no read/write/clone/replay logic yet (Phase 3 scope). The NFC
+    // and RFID2 units are both I2C, on the EXTERNAL bus (HY2.0 PORT.A, GPIO
+    // 53/54) -- a different bus from the internal one display/touch/SD use.
+    // The census runs first and unconditionally so a wrong constructor
+    // address shows up as an actionable fact in the log, not just a bare
+    // "not found".
+    nfc_scan_external_i2c_bus();
+    nfc_unit.detect("NFC");
+    rfid2_unit.detect("RFID2");
+    rf433.init();
 
     // ---- ESP32-C6 radio co-processor ---------------------------------------
     // One bounded attempt at the shared esp-hosted SDIO link, with the result
