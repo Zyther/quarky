@@ -48,8 +48,16 @@
 static const uint8_t TX = 37;
 static const uint8_t RX = 38;
 
-static const uint8_t SDA = 7;
-static const uint8_t SCL = 8;
+// SDA/SCL moved off the eval-board defaults (7/8) to Tab5's actual external
+// I2C bus pins (matching the framework's own m5stack_tab5 variant) because
+// GPIO 8 is now BOARD_SDIO_ESP_HOSTED_D3 -- a bare Wire.begin() with no pins
+// falls back to these, and 7/8 would have handed the C6's live SDIO data
+// line to any future Wire/Wire1 caller that doesn't specify pins explicitly.
+// This project's own I2C code always calls Wire.begin() with explicit pins
+// (TAB5_INTERNAL_I2C_SDA_GPIO/SCL_GPIO = 31/32), so this default is a safety
+// net for third-party libraries, not something this project's own code relies on.
+static const uint8_t SDA = 53;
+static const uint8_t SCL = 54;
 
 // GPIO 36 and below: no extra on-chip LDO needed for the IO bank.
 // GPIO 39-48: LDO VO4 (channel 4). GPIO 37-38 (UART) are outside that VO4 range.
