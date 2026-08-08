@@ -14,6 +14,7 @@ static WiFiServer *s_server = nullptr;
 static WiFiClient s_client;
 static uint8_t s_psk[16];
 static C2LinkReceiveHandler s_handler = nullptr;
+static uint32_t s_last_recv_ms = 0; // Task 19: millis() of the last successfully-decoded frame
 
 // Incremental frame-reassembly state for poll(). NetworkClient (this
 // framework's WiFiClient, arduino-esp32 v3.3.11) has no peekBytes() --
@@ -104,8 +105,9 @@ void C2LinkWifi::poll() {
 
     if (c2proto::hmac_verify(s_psk, 16, s_rx_buf, s_rx_frame_len, s_rx_buf + s_rx_frame_len)) {
         c2proto::Frame frame{};
-        if (c2proto::decode(s_rx_buf, s_rx_frame_len, frame) && s_handler) {
-            s_handler(frame);
+        if (c2proto::decode(s_rx_buf, s_rx_frame_len, frame)) {
+            s_last_recv_ms = millis();
+            if (s_handler) s_handler(frame);
         }
     } // else: drop silently, bad auth
 
@@ -130,4 +132,8 @@ void C2LinkWifi::set_receive_handler(C2LinkReceiveHandler handler) {
 
 bool C2LinkWifi::is_connected() {
     return s_client && s_client.connected();
+}
+
+uint32_t c2link_wifi_last_recv_ms() {
+    return s_last_recv_ms;
 }

@@ -27,3 +27,9 @@ public:
     // same threading contract as C2LinkWifi::poll(). See c2link_ble.cpp.
     void poll();
 };
+
+// millis() timestamp of the last frame successfully dequeued and dispatched
+// by poll() (0 if none yet). Free function, mirroring
+// c2link_wifi_last_recv_ms() -- see Task 19 (devices_panel.cpp polls this to
+// derive link freshness for the shell's status bar).
+uint32_t c2link_ble_last_recv_ms();
