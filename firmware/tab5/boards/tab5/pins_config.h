@@ -233,6 +233,12 @@
 // address/driver entirely, `espp::St7123Touch` -- not a GT911, out of scope
 // for TouchGT911). Which variant a given unit has cannot be determined from
 // source research; must be probed at runtime (same caveat as the display).
+//
+// RESOLVED 2026-08-08 (touch hotfix): that caveat was correct and THIS UNIT IS
+// THE OTHER VARIANT. It is an ST7121, so it has no GT911 anywhere -- the
+// GT911 macros below are retained only for ILI9881-revision boards. The real
+// touch hardware for this unit is the TDDI block documented in the next
+// section. See hotfix-touch-report.md.
 
 // GT911 shares the same internal I2C bus as the display's IO-expander-routed
 // reset (TAB5_INTERNAL_I2C_SDA_GPIO / TAB5_INTERNAL_I2C_SCL_GPIO above,
@@ -269,14 +275,10 @@
 // `M5StackTab5::touch_reset()` (calls set_io_expander_output(0x43, 5, ...));
 // touchpad.cpp GT911 branch: reset sequence is assert, delay(10ms),
 // release, delay(50ms) before first touch read.
-// TODO: same situation as TAB5_DISP_RST_GPIO above -- this task's
-// TouchGT911 does not yet drive touch reset (the BSP's `IoExpander`/
-// PI4IOE5V6408 register protocol was not transcribed in this research pass,
-// same scope cut as the display's IO-expander reset). GT911 typically still
-// answers I2C without an explicit reset pulse in many bring-ups (power-on
-// reset default), but a implementer hitting "touch not responding" on real
-// hardware should implement this IO-expander reset pulse first before
-// suspecting the I2C address/registers.
+// IMPLEMENTED: src/hal/touch_tab5.cpp drives this via hal/io_expander.h, but
+// ONLY on the GT911 fallback path. It must NOT be pulsed for an ST7121/ST7123
+// TDDI panel -- see the "DO NOT PULSE TP_RST" note in the ST touch section
+// below. The old GT911-only driver pulsed it unconditionally.
 #define TAB5_TOUCH_RST_GPIO -1 // TODO: no raw reset GPIO exists; see comment above
 #define TAB5_TOUCH_RST_IOEXP_I2C_ADDR 0x43
 #define TAB5_TOUCH_RST_IOEXP_BIT      5     // IO43_BIT_TP_RST / PI4IOE5V6408 P5
@@ -301,6 +303,106 @@
 #define TAB5_TOUCH_REG_STATUS   0x814E
 #define TAB5_TOUCH_REG_POINT_1  0x814F
 #define TAB5_TOUCH_CONTACT_SIZE 8 // bytes per touch point record
+
+// ---------------------------------------------------------------------------
+// ST7121 / ST7123 INTEGRATED (TDDI) TOUCH -- the touch hardware on THIS unit
+//
+// These panels are TDDI parts: Touch and Display Driver Integration. There is
+// no separate touch IC. The capacitive touch engine is inside the same silicon
+// as the MIPI-DSI display controller and is read over I2C at the panel's own
+// address, 0x55 -- the exact address DisplayTab5 already uses to read the
+// firmware-version byte that identifies ST7121 vs ST7123.
+//
+// SOURCES (fetched 2026-08-08; two independent implementations that agree):
+//  1. m5stack/M5GFX (the vendor's own library for this board):
+//     src/lgfx/v1/platforms/esp32p4/Touch_ST7123.hpp
+//       `static constexpr const uint8_t default_addr = 0x55;`
+//     src/lgfx/v1/platforms/esp32p4/Touch_ST7123.cpp
+//       -- every register constant below, verbatim, plus getTouchRaw().
+//     src/M5GFX.cpp, board_M5Tab5 (L2778-2823): an ST7121 or ST7123 panel gets
+//       `new Touch_ST7123()`; only the ILI9881C revision gets `new Touch_GT911()`.
+//     src/M5GFX.cpp L2850-2861: touch cfg for Tab5 -- pin_rst = -1 (no touch
+//       reset), pin_sda 31, pin_scl 32, pin_int 23, freq 400000,
+//       x_max 719, y_max 1279, offset_rotation 0.
+//  2. esp-cpp/espp components/st7123touch/include/st7123touch.hpp -- an
+//     independent implementation of the same protocol. Agrees with M5GFX on
+//     every register number, the 7-byte report stride, the with_coord bit and
+//     the coordinate field packing.
+//  3. docs.m5stack.com/en/core/Tab5 -- vendor documentation listing 0x55 as
+//     "ST7123 or ST7121 (display/touch driver)" on the internal I2C bus, and
+//     noting that units before 2025-10-14 used a GT911 at 0x14 instead.
+//
+// IMPORTANT -- DO NOT PULSE TP_RST FOR THIS PART. espp's st7123touch.hpp class
+// documentation states: "The ST7123's touch engine is gated by the LCD reset
+// (LCD_RST) line, NOT the TP_RST line used by standalone touch controllers
+// such as the GT911. When used in a system that has a separate TP_RST signal
+// (e.g. M5Stack Tab5), do NOT toggle TP_RST for this chip - doing so may knock
+// the touch I2C endpoint offline." M5GFX agrees by setting pin_rst = -1.
+// LCD_RST is already pulsed by DisplayTab5::init(), which is what brings the
+// touch engine up.
+#define TAB5_TOUCH_ST_I2C_ADDR        0x55
+
+// Register map. 16-bit register pointer, big-endian, repeated-START read.
+#define TAB5_TOUCH_ST_REG_FW_VERSION  0x0000 // 1 byte; 1 => ST7121, 3 => ST7123
+#define TAB5_TOUCH_ST_REG_MAX_X_H     0x0005 // then _L 0x0006, Y_H 0x0007, Y_L 0x0008
+#define TAB5_TOUCH_ST_REG_MAX_TOUCHES 0x0009 // 1 byte, firmware-configured slot count
+#define TAB5_TOUCH_ST_REG_FW_REVISION 0x000C // 4 bytes
+#define TAB5_TOUCH_ST_REG_ADV_INFO    0x0010 // 1 byte; see bit definitions below
+#define TAB5_TOUCH_ST_REG_REPORT_0    0x0014 // max_touches x 7-byte reports
+
+// ADV_INFO (0x0010) bit layout, from M5GFX's `adv_info_t` bitfield
+// (reserved_0_1:2, with_prox:1, with_coord:1, prox_status:3, rst_chip:1 --
+// LSB-first on this little-endian target). Only with_coord is used; espp
+// spells the same bit as `ADV_INFO_WITH_COORD = (1 << 3)`.
+#define TAB5_TOUCH_ST_ADV_WITH_COORD  (1 << 3)
+
+// Touch report: 7 bytes per slot, from M5GFX's `touch_report_t`
+// (x_h:6, reserved_6:1, valid:1 | x_l | y_h | y_l | area | intensity |
+// reserved). So valid = byte[0] & 0x80,
+// x = ((byte[0] & 0x3F) << 8) | byte[1], y = (byte[2] << 8) | byte[3].
+#define TAB5_TOUCH_ST_REPORT_SIZE     7
+#define TAB5_TOUCH_ST_MAX_POINTS      10 // M5GFX `max_touch_points = 10`
+
+// Bus speed for touch reads. M5GFX uses 400 kHz for the Tab5 touch object.
+#define TAB5_TOUCH_I2C_FREQ_HZ        400000
+
+// Opt-in diagnostics, compiled out of normal builds.
+//   -DTAB5_TOUCH_TRACE=1       log every press/release/move edge over serial
+//   -DTAB5_TOUCH_I2C_CENSUS=1  print the labelled internal-I2C scan even on a
+//                              successful boot (it is printed on failure
+//                              regardless)
+#ifndef TAB5_TOUCH_TRACE
+#define TAB5_TOUCH_TRACE 0
+#endif
+#ifndef TAB5_TOUCH_I2C_CENSUS
+#define TAB5_TOUCH_I2C_CENSUS 0
+#endif
+
+// ---------------------------------------------------------------------------
+// Internal I2C bus census (GPIO 31/32), as observed on this unit and matched
+// against M5Stack's own Tab5 documentation. Recorded here because the display
+// hotfix turned an "unexplained address" into a root cause once, and the next
+// person should not have to re-derive the map.
+//
+//   0x10  ES8388 audio codec
+//   0x28  UNIDENTIFIED. Not in any vendor table. Appears and disappears in
+//         lockstep with 0x55: absent from the pre-display-fix scan (when
+//         LCD_RST was still floating) and present in every scan since
+//         LCD_RST began being pulsed. Strongly suggests a second endpoint of
+//         the panel/TDDI chip itself rather than a distinct device. Not
+//         touched by this firmware.
+//   0x32  RX8130CE RTC
+//   0x40  ES7210 microphone ADC / AEC front-end
+//   0x41  INA226 battery power monitor
+//   0x43  PI4IOE5V6408 IO-expander #1 (LCD_RST P4, TP_RST P5, CAM_RST P6,
+//         SPK_EN P1)
+//   0x44  PI4IOE5V6408 IO-expander #2 (WLAN_PWR_EN P0, USB 5V, charger)
+//   0x55  ST7121/ST7123 panel AND its integrated touch engine
+//   0x68  BMI270 6-axis IMU
+//
+// (0x14 / 0x5D would be a GT911 on an ILI9881-revision board; neither is
+// present here, which is correct and expected for an ST7121.)
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // microSD (SDIO) and ESP32-C6 SDIO-host-sharing research (Task 10)
@@ -390,7 +492,7 @@
 
 // PI4IOE5V6408 register map (both the 0x43 and 0x44 expanders are the same
 // part). Single-byte register addresses -- note this differs from the GT911's
-// 16-bit big-endian register addressing used in touch_gt911.cpp.
+// 16-bit big-endian register addressing used in touch_tab5.cpp.
 // Source: espp/components/pi4ioe5v/include/pi4ioe5v.hpp register enum.
 #define PI4IOE5V6408_REG_CHIP_ID_CTRL   0x01
 #define PI4IOE5V6408_REG_DIRECTION      0x03  // 1 = output, 0 = input
