@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <lvgl.h>
 #include "hal/display_tab5.h"
-#include "hal/touch_gt911.h"
+#include "hal/touch_tab5.h"
 #include "hal/hosted_link.h"
 #include "hal/radio_esp_hosted.h"
 #include "hal/storage_sd.h"
@@ -13,7 +13,7 @@
 #include <feature_registry.h>
 
 DisplayTab5 display;
-TouchGT911 touch;
+TouchTab5 touch;
 RadioEspHosted radio;
 StorageSD storage;
 C2LinkWifi c2link_wifi;

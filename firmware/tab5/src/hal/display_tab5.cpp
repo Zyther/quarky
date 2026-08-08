@@ -74,7 +74,7 @@ bool IRAM_ATTR onColorTransDone(esp_lcd_panel_handle_t, esp_lcd_dpi_panel_event_
     return higher_woken == pdTRUE;
 }
 
-// Read-only I2C presence check, same shape as touch_gt911.cpp's.
+// Read-only I2C presence check, same shape as touch_tab5.cpp's.
 bool i2cProbe(uint8_t addr) {
     Wire.beginTransmission(addr);
     return Wire.endTransmission() == 0;
@@ -452,7 +452,7 @@ void DisplayTab5::init() {
     // --- 3. Panel hardware reset via the 0x43 IO-expander -------------------
     // display.init() runs before touch.init() in main.cpp, so this is the first
     // user of the internal I2C bus; begin it here. Wire.begin() is idempotent,
-    // so touch_gt911.cpp calling it again later is harmless.
+    // so touch_tab5.cpp calling it again later is harmless.
     Wire.begin(TAB5_INTERNAL_I2C_SDA_GPIO, TAB5_INTERNAL_I2C_SCL_GPIO);
     bool reset_ok = tab5_ioexp::set_output(TAB5_DISP_RST_IOEXP_I2C_ADDR,
                                            TAB5_DISP_RST_IOEXP_BIT, false);

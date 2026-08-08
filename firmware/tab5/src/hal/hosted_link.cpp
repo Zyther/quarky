@@ -52,7 +52,7 @@ State s_state = State::kUntried;
 // Correct SDIO pins alone are NOT sufficient; that was the second half of the
 // crash-loop root cause. See pins_config.h TAB5_WLAN_PWR_EN_IOEXP_BIT.
 bool c6_power_on() {
-    // Idempotent w.r.t. TouchGT911::init(), which begins the same bus with the
+    // Idempotent w.r.t. TouchTab5::init(), which begins the same bus with the
     // same pins; repeated here so this module is self-contained and does not
     // silently depend on touch having been initialised first.
     Wire.begin(TAB5_INTERNAL_I2C_SDA_GPIO, TAB5_INTERNAL_I2C_SCL_GPIO);
