@@ -25,15 +25,20 @@ FeatureRegistry g_registry; // populated further in Task 15
 
 // Task 18: HY2.0 peripheral detection (NFC, RFID2, RF433R/T). See
 // hal/nfc_pn532.cpp and boards/tab5/pins_config.h for the real-hardware
-// address/pin research behind these constructor arguments. Real-hardware
-// verification (task-18-report.md): the external bus census found NOTHING
-// at all on GPIO 53/54 on this boot -- neither of these two candidate
-// addresses, nor any other address in the full 0x08-0x77 sweep -- so there
-// was nothing to "correct" the NFC address against. See the report for the
-// analysis of why (most likely: units not physically connected/powered for
-// this test, not a wrong-address bug).
-NfcPN532 nfc_unit(TAB5_NFC_I2C_ADDR_CANDIDATE_PN532_DEFAULT); // 0x24 (PN532 default)
-NfcPN532 rfid2_unit(TAB5_RFID2_I2C_ADDR); // 0x28, confirmed (WS1850S)
+// address/pin research behind these constructor arguments.
+//
+// Task 18's census found NOTHING at all on GPIO 53/54 with a unit plugged in,
+// which it correctly suspected was a power problem rather than a wrong
+// address. The HY2.0 port-power hotfix (hotfix-hy20-port-report.md) confirmed
+// exactly that: PORT.A's 5V rail is gated by EXT_5V_EN on IO-expander 0x43
+// P2, which nothing was asserting. With the gate asserted the census returns
+// 0x50, so the NFC unit's address is now CONFIRMED on hardware and the 0x24
+// PN532 guess is retired.
+NfcPN532 nfc_unit(TAB5_NFC_I2C_ADDR);     // 0x50, confirmed (ST25R3916 Unit NFC)
+NfcPN532 rfid2_unit(TAB5_RFID2_I2C_ADDR); // 0x28, per docs (WS1850S); no such
+                                          // unit was plugged in during the
+                                          // hotfix's hardware run, so this
+                                          // address remains doc-only.
 Rf433Gpio rf433;
 
 // Task 9's WiFi STA smoke test still ships with placeholder credentials.
