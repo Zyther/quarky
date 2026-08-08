@@ -18,13 +18,18 @@
 // -----------------------------------------------------------------------------
 // Real MIPI-DSI panel bring-up for the M5Stack Tab5.
 //
-// Structure and every hardware constant follow espp's m5stack-tab5 BSP
-// (github.com/esp-cpp/espp), specifically
-// components/m5stack-tab5/src/video.cpp `M5StackTab5::initialize_lcd()` and
-// `M5StackTab5::detect_display_controller()`, fetched 2026-08-07. The two
-// per-controller vendor init command tables come from espp's display_drivers
-// component and are transcribed in tab5_panel_cmds.h. Pin/timing constants and
-// their citations live in boards/tab5/pins_config.h.
+// The overall sequence follows espp's m5stack-tab5 BSP
+// (github.com/esp-cpp/espp), components/m5stack-tab5/src/video.cpp
+// `M5StackTab5::initialize_lcd()`, fetched 2026-08-07.
+//
+// PANEL IDENTIFICATION AND PER-PANEL CONSTANTS NO LONGER COME FROM espp
+// (changed 2026-08-08). espp recognises a single Sitronix panel, selected by
+// "does anything ACK at I2C 0x55". M5Stack's own M5GFX library shows the Tab5
+// ships one of THREE panels, two of which (ST7121 and ST7123) both answer at
+// 0x55 and need different init tables, different DSI lane rates and different
+// DPI timing. They are told apart by the touch firmware version, which is what
+// detectController() below now reads. Sources and the full diff against espp
+// are documented in tab5_panel_cmds.h and boards/tab5/pins_config.h.
 //
 // BSP sequence, reproduced here in the same order (order matters):
 //   1. acquire the MIPI-DSI PHY power LDO channel        (esp_ldo_acquire_channel)
@@ -234,6 +239,8 @@ const char *controllerName(DisplayTab5::Controller c) {
     switch (c) {
     case DisplayTab5::Controller::Ili9881:
         return "ILI9881";
+    case DisplayTab5::Controller::St7121:
+        return "ST7121";
     case DisplayTab5::Controller::St7123:
         return "ST7123";
     default:
@@ -241,36 +248,84 @@ const char *controllerName(DisplayTab5::Controller c) {
     }
 }
 
-// Runtime hardware-revision detection, transcribed from video.cpp
-// `M5StackTab5::detect_display_controller()`. Must run after the LCD reset
-// pulse -- see pins_config.h.
+// Read the Sitronix touch firmware version: a 1-byte read from 16-bit register
+// 0x0000 at I2C 0x55. This is M5GFX's primary panel discriminator -- 1 means
+// ST7121, 3 means ST7123. Returns -1 if the device does not answer.
 //
-// One deviation from the BSP, forced by what the physical unit actually does:
-// the probes are retried for a short while. The BSP probes once, immediately
-// after releasing reset. On the unit this was developed against, 0x55 does not
-// ACK that early but IS present ~300 ms later (observed: an unrelated I2C bus
-// scan run after panel init lists 0x55, while the pre-init probe here does
-// not). A TDDI part's touch engine scans during the display blanking interval,
-// so it plausibly only comes up once the DPI video stream is running -- which
-// is a chicken-and-egg the retry cannot always win, hence the fallback in
-// init() and the post-init confirmation probe.
+// Note the 16-bit big-endian register address, like the GT911 and unlike the
+// PI4IOE5V6408 expanders on the same bus.
+int readStFwVersion() {
+    Wire.beginTransmission(TAB5_ST7123_I2C_ADDR);
+    Wire.write(static_cast<uint8_t>(TAB5_ST_FW_VERSION_REG_HI));
+    Wire.write(static_cast<uint8_t>(TAB5_ST_FW_VERSION_REG_LO));
+    if (Wire.endTransmission(false) != 0) { // repeated start, keep the bus held
+        return -1;
+    }
+    if (Wire.requestFrom(static_cast<int>(TAB5_ST7123_I2C_ADDR), 1) != 1) {
+        return -1;
+    }
+    return Wire.read();
+}
+
+// Runtime hardware-revision detection. Must run after the LCD reset pulse.
+//
+// This follows M5GFX's board_M5Tab5 bring-up (src/M5GFX.cpp), NOT espp's
+// detect_display_controller(). espp's version returns ST7123 for any ACK at
+// 0x55, which is wrong on an ST7121 board -- both variants live at 0x55, and
+// the ST7121 in hand was being driven with the ST7123's register table, lane
+// rate and DPI timing, which is why it accepted every command and stayed dark.
+//
+// Order, per the vendor:
+//   1. GT911 at 0x14 => the ILI9881 revision (standalone touch IC).
+//   2. otherwise read the touch firmware version at 0x55: 1 = ST7121,
+//      3 = ST7123.
+//
+// Two deviations from the vendor, both forced by what this unit actually does:
+//   * The vendor reads the firmware version BEFORE creating the DSI bus and
+//     retries 3x/10 ms. Here the probe is retried 6x/50 ms because on this
+//     board 0x55 does not ACK at all until ~50 ms after reset is released
+//     (probe #0 consistently reads nothing, probe #1 reads fw=1).
+//   * The vendor's secondary DSI ID read of register 0xF4 is deliberately
+//     omitted; see the note in pins_config.h -- that read can hang forever.
 DisplayTab5::Controller detectController() {
     constexpr int kAttempts = 6;   // ~250 ms total
     constexpr int kSettleMs = 50;
     for (int attempt = 0; attempt < kAttempts; attempt++) {
         const bool gt911 = i2cProbe(TAB5_ILI9881_PROBE_I2C_ADDR);
-        const bool st7123 = i2cProbe(TAB5_ST7123_I2C_ADDR);
-        if (attempt == 0 || gt911 || st7123) {
-            Serial.printf(
-                "quarky-tab5: display probe #%d: 0x%02X(GT911/ILI9881)=%s 0x%02X(ST7123)=%s\n",
-                attempt, TAB5_ILI9881_PROBE_I2C_ADDR, gt911 ? "ACK" : "-", TAB5_ST7123_I2C_ADDR,
-                st7123 ? "ACK" : "-");
+        const bool sitronix = i2cProbe(TAB5_ST7123_I2C_ADDR);
+        // Only ask for the firmware version once the device is actually there,
+        // so a failed read is unambiguous.
+        const int fw = sitronix ? readStFwVersion() : -1;
+        if (attempt == 0 || gt911 || sitronix) {
+            Serial.printf("quarky-tab5: display probe #%d: 0x%02X(GT911/ILI9881)=%s "
+                          "0x%02X(Sitronix)=%s fw=",
+                          attempt, TAB5_ILI9881_PROBE_I2C_ADDR, gt911 ? "ACK" : "-",
+                          TAB5_ST7123_I2C_ADDR, sitronix ? "ACK" : "-");
+            if (fw < 0) {
+                Serial.println("(no read)");
+            } else {
+                Serial.printf("%d\n", fw);
+            }
         }
         if (gt911) {
             return DisplayTab5::Controller::Ili9881;
         }
-        if (st7123) {
+        // The firmware version is the only thing that distinguishes the two
+        // Sitronix panels, so prefer it over bare presence.
+        if (fw == TAB5_ST_FW_VERSION_ST7121) {
+            return DisplayTab5::Controller::St7121;
+        }
+        if (fw == TAB5_ST_FW_VERSION_ST7123) {
             return DisplayTab5::Controller::St7123;
+        }
+        if (sitronix && fw >= 0 && attempt + 1 >= kAttempts) {
+            // It answered, and answered consistently, but with a version M5GFX
+            // does not list. Report it rather than silently picking a variant:
+            // the number is the single most useful thing to know if this board
+            // is a revision newer than the vendor source consulted here.
+            Serial.printf("quarky-tab5: display Sitronix panel reports UNKNOWN touch fw "
+                          "version %d (M5GFX knows 1=ST7121, 3=ST7123)\n",
+                          fw);
         }
         if (attempt + 1 < kAttempts) {
             delay(kSettleMs);
@@ -278,6 +333,82 @@ DisplayTab5::Controller detectController() {
     }
     return DisplayTab5::Controller::Unknown;
 }
+
+#if defined(TAB5_DISPLAY_SELFTEST) && TAB5_DISPLAY_SELFTEST
+// Bring-up bisection aid, compiled out unless -DTAB5_DISPLAY_SELFTEST=1.
+//
+// A blank screen has two very different causes and the serial log cannot tell
+// them apart: either the panel/DSI/timing is wrong (nothing we draw will ever
+// appear), or the panel is fine and the fault is upstream in the pixel path
+// (rotation, LVGL, or simply a UI that renders black). This splits them:
+//
+//   Stage 1  DSI peripheral's built-in colour-bar generator. Generated inside
+//            the P4's DSI host, downstream of everything software touches. If
+//            the bars appear, the lane rate, DPI timing, vendor init table and
+//            panel-on state are all CORRECT.
+//   Stage 2  Solid colours pushed through esp_lcd_panel_draw_bitmap() at NATIVE
+//            portrait coordinates, no rotation, no LVGL. If stage 1 works and
+//            stage 2 does not, the frame-buffer write path is at fault.
+//
+// Anything still black after both stages is upstream of this driver.
+// This deliberately NEVER RETURNS: it cycles the stages on a slow loop so each
+// state stays on the glass long enough to be looked at, and so a blank LVGL
+// screen can never be mistaken for a blank panel. Serial names each state as it
+// is applied, so the log and the glass can be lined up directly.
+void runSelfTest() {
+    constexpr int kStripRows = 64;
+    const size_t strip_px = static_cast<size_t>(TAB5_PANEL_NATIVE_WIDTH) * kStripRows;
+    uint16_t *strip = static_cast<uint16_t *>(
+        heap_caps_aligned_alloc(64, strip_px * sizeof(uint16_t), MALLOC_CAP_SPIRAM));
+    if (strip == nullptr) {
+        Serial.println("quarky-tab5: display SELFTEST no PSRAM for strip; bars only");
+    }
+    struct { const char *name; uint16_t rgb565; } kColors[] = {
+        {"RED", 0xF800}, {"GREEN", 0x07E0}, {"BLUE", 0x001F}, {"WHITE", 0xFFFF}};
+
+    Serial.println("quarky-tab5: display SELFTEST running (loops forever, never reaches LVGL)");
+    for (uint32_t pass = 0;; pass++) {
+        // -- Stage 1: DSI host's internal colour-bar generator ----------------
+        Serial.printf("quarky-tab5: SELFTEST[%u] stage 1: DSI COLOUR BARS (8s) <- if you see "
+                      "these, panel+DSI+timing+init table are all GOOD\n",
+                      pass);
+        esp_err_t err = esp_lcd_dpi_panel_set_pattern(s_panel, MIPI_DSI_PATTERN_BAR_HORIZONTAL);
+        if (err != ESP_OK) {
+            Serial.printf("quarky-tab5: SELFTEST set_pattern failed: %s\n", esp_err_to_name(err));
+        }
+        delay(8000);
+        esp_lcd_dpi_panel_set_pattern(s_panel, MIPI_DSI_PATTERN_NONE);
+
+        // -- Stage 2: solid colours through the real framebuffer path ---------
+        if (strip == nullptr) {
+            continue;
+        }
+        for (const auto &c : kColors) {
+            for (size_t i = 0; i < strip_px; i++) {
+                strip[i] = c.rgb565;
+            }
+            bool ok = true;
+            for (int y = 0; y < TAB5_PANEL_NATIVE_HEIGHT; y += kStripRows) {
+                const int rows = (y + kStripRows > TAB5_PANEL_NATIVE_HEIGHT)
+                                     ? (TAB5_PANEL_NATIVE_HEIGHT - y)
+                                     : kStripRows;
+                err = esp_lcd_panel_draw_bitmap(s_panel, 0, y, TAB5_PANEL_NATIVE_WIDTH, y + rows,
+                                                strip);
+                if (err != ESP_OK) {
+                    ok = false;
+                    Serial.printf("quarky-tab5: SELFTEST draw_bitmap y=%d failed: %s\n", y,
+                                  esp_err_to_name(err));
+                    break;
+                }
+                delay(2); // the copy is async; pace it so the strip stays valid
+            }
+            Serial.printf("quarky-tab5: SELFTEST[%u] stage 2: FULL SCREEN %s (4s): %s\n", pass,
+                          c.name, ok ? "sent" : "FAILED");
+            delay(4000);
+        }
+    }
+}
+#endif // TAB5_DISPLAY_SELFTEST
 
 } // namespace
 
@@ -344,37 +475,41 @@ void DisplayTab5::init() {
     controller_ = Controller::Ili9881;
 #elif TAB5_DISPLAY_FORCE_CONTROLLER == 2
     controller_ = Controller::St7123;
+#elif TAB5_DISPLAY_FORCE_CONTROLLER == 3
+    controller_ = Controller::St7121;
 #else
-#error "TAB5_DISPLAY_FORCE_CONTROLLER must be 1 (ILI9881) or 2 (ST7123)"
+#error "TAB5_DISPLAY_FORCE_CONTROLLER must be 1 (ILI9881), 2 (ST7123) or 3 (ST7121)"
 #endif
     Serial.printf("quarky-tab5: display controller FORCED to %s by build flag\n",
                   controllerName(controller_));
 #else
     if (controller_ == Controller::Unknown) {
-        // The BSP gives up here. This project cannot: a Tab5 with no picture is
-        // unusable, and there is a well-founded fallback. The BSP's ILI9881 test
-        // is "does a GT911 answer at 0x14" precisely because the ILI9881
-        // revision always ships a standalone GT911 alongside it; no GT911 means
-        // it is not that revision, which leaves the ST7123 (whose own touch
-        // engine may simply not be answering yet -- see detectController()).
-        // Guess loudly rather than silently, and make it overridable.
-        Serial.println("quarky-tab5: display controller NOT DETECTED at 0x14 or 0x55 -- "
-                       "assuming ST7123 (no GT911 => not the ILI9881 revision). "
-                       "Override with -DTAB5_DISPLAY_FORCE_CONTROLLER=1 (ILI9881) or 2 (ST7123).");
+        // Both vendors give up here. This project cannot: a Tab5 with no
+        // picture is unusable. But the fallback is now a genuinely weak guess
+        // rather than the near-certainty it looked like before -- ST7121 and
+        // ST7123 are indistinguishable without the firmware-version read, and
+        // they need different tables, lane rates and timing. Say so plainly.
+        Serial.println("quarky-tab5: display controller NOT IDENTIFIED (no GT911 at 0x14, and no "
+                       "usable touch fw version at 0x55) -- falling back to ST7123. This is a "
+                       "GUESS: an ST7121 needs a different init table, lane rate and DPI timing, "
+                       "and driving the wrong one gives a blank screen. If the panel is dark, try "
+                       "-DTAB5_DISPLAY_FORCE_CONTROLLER=3 (ST7121), =2 (ST7123) or =1 (ILI9881).");
         controller_ = Controller::St7123;
     }
 #endif
     Serial.printf("quarky-tab5: display controller = %s\n", controllerName(controller_));
 
     const bool is_ili = (controller_ == Controller::Ili9881);
+    const bool is_st7121 = (controller_ == Controller::St7121);
 
     // --- 5. MIPI-DSI bus ----------------------------------------------------
     esp_lcd_dsi_bus_config_t bus_config = {};
     bus_config.bus_id = 0;
     bus_config.num_data_lanes = TAB5_DSI_NUM_DATA_LANES;
     bus_config.phy_clk_src = MIPI_DSI_PHY_CLK_SRC_DEFAULT;
-    bus_config.lane_bit_rate_mbps =
-        is_ili ? TAB5_DSI_LANE_BIT_RATE_MBPS_ILI9881 : TAB5_DSI_LANE_BIT_RATE_MBPS_ST7123;
+    bus_config.lane_bit_rate_mbps = is_ili    ? TAB5_DSI_LANE_BIT_RATE_MBPS_ILI9881
+                                    : is_st7121 ? TAB5_DSI_LANE_BIT_RATE_MBPS_ST7121
+                                                : TAB5_DSI_LANE_BIT_RATE_MBPS_ST7123;
     esp_err_t err = esp_lcd_new_dsi_bus(&bus_config, &s_dsi_bus);
     if (err != ESP_OK) {
         Serial.printf("quarky-tab5: display FATAL - esp_lcd_new_dsi_bus failed: %s\n",
@@ -412,6 +547,14 @@ void DisplayTab5::init() {
         dpi_cfg.video_timing.vsync_back_porch = TAB5_DPI_VSYNC_BP_ILI9881;
         dpi_cfg.video_timing.vsync_pulse_width = TAB5_DPI_VSYNC_PW_ILI9881;
         dpi_cfg.video_timing.vsync_front_porch = TAB5_DPI_VSYNC_FP_ILI9881;
+    } else if (is_st7121) {
+        dpi_cfg.dpi_clock_freq_mhz = TAB5_DPI_CLK_MHZ_ST7121;
+        dpi_cfg.video_timing.hsync_back_porch = TAB5_DPI_HSYNC_BP_ST7121;
+        dpi_cfg.video_timing.hsync_pulse_width = TAB5_DPI_HSYNC_PW_ST7121;
+        dpi_cfg.video_timing.hsync_front_porch = TAB5_DPI_HSYNC_FP_ST7121;
+        dpi_cfg.video_timing.vsync_back_porch = TAB5_DPI_VSYNC_BP_ST7121;
+        dpi_cfg.video_timing.vsync_pulse_width = TAB5_DPI_VSYNC_PW_ST7121;
+        dpi_cfg.video_timing.vsync_front_porch = TAB5_DPI_VSYNC_FP_ST7121;
     } else {
         dpi_cfg.dpi_clock_freq_mhz = TAB5_DPI_CLK_MHZ_ST7123;
         dpi_cfg.video_timing.hsync_back_porch = TAB5_DPI_HSYNC_BP_ST7123;
@@ -436,6 +579,9 @@ void DisplayTab5::init() {
     if (is_ili) {
         sendInitTable(kTab5Ili9881Init,
                       sizeof(kTab5Ili9881Init) / sizeof(kTab5Ili9881Init[0]), "ILI9881");
+    } else if (is_st7121) {
+        sendInitTable(kTab5St7121Init, sizeof(kTab5St7121Init) / sizeof(kTab5St7121Init[0]),
+                      "ST7121");
     } else {
         sendInitTable(kTab5St7123Init, sizeof(kTab5St7123Init) / sizeof(kTab5St7123Init[0]),
                       "ST7123");
@@ -473,18 +619,31 @@ void DisplayTab5::init() {
     initPpa();
 #endif
 
+#if defined(TAB5_DISPLAY_SELFTEST) && TAB5_DISPLAY_SELFTEST
+    runSelfTest();
+#endif
+
     panel_handle_ = s_panel;
 
-    // Post-init confirmation. If detection had to fall back to an assumption
-    // above, this is where it gets checked against reality: a TDDI ST7123's
-    // I2C endpoint shows up once the video stream is running, so an ACK at 0x55
-    // here turns "assumed ST7123" into "confirmed ST7123" in the boot log.
-    if (controller_ == Controller::St7123) {
-        Serial.printf("quarky-tab5: display post-init probe 0x%02X(ST7123)=%s\n",
-                      TAB5_ST7123_I2C_ADDR,
-                      i2cProbe(TAB5_ST7123_I2C_ADDR) ? "ACK (controller confirmed)"
-                                                     : "- (still silent; if the screen is blank, "
-                                                       "try -DTAB5_DISPLAY_FORCE_CONTROLLER=1)");
+    // Post-init confirmation. A TDDI part's I2C endpoint is more likely to be
+    // awake once the video stream is running, so re-read the firmware version
+    // here: this is the check that would have caught the original bug, because
+    // it prints the number that decides ST7121 vs ST7123 rather than just
+    // "something is there".
+    if (controller_ == Controller::St7121 || controller_ == Controller::St7123) {
+        const int fw = readStFwVersion();
+        const int expect = (controller_ == Controller::St7121) ? TAB5_ST_FW_VERSION_ST7121
+                                                               : TAB5_ST_FW_VERSION_ST7123;
+        Serial.printf("quarky-tab5: display post-init touch fw at 0x%02X = ", TAB5_ST7123_I2C_ADDR);
+        if (fw < 0) {
+            Serial.printf("(no answer) -- driving as %s unconfirmed\n", controllerName(controller_));
+        } else if (fw == expect) {
+            Serial.printf("%d (%s CONFIRMED)\n", fw, controllerName(controller_));
+        } else {
+            Serial.printf("%d but driving as %s (expected %d) -- MISMATCH, the panel is very "
+                          "likely the other variant\n",
+                          fw, controllerName(controller_), expect);
+        }
     }
 
     Serial.printf("quarky-tab5: display READY (%s, %dx%d logical)\n", controllerName(controller_),
@@ -539,13 +698,20 @@ void DisplayTab5::flush(int x1, int y1, int x2, int y2, const uint16_t *colors) 
     // One-shot proof-of-life. "No errors in the log" does not distinguish
     // "flushing fine" from "flush() was never called at all", and this driver
     // is otherwise only observable by looking at the screen.
-    static bool logged_first_flush = false;
-    if (!logged_first_flush) {
-        logged_first_flush = true;
-        Serial.printf("quarky-tab5: display first flush: logical (%d,%d)-(%d,%d) -> "
+    static uint32_t flush_count = 0;
+#if defined(TAB5_DISPLAY_SELFTEST) && TAB5_DISPLAY_SELFTEST
+    // While bisecting, log enough flushes to see whether LVGL actually paints
+    // the whole surface or stops after the first strip.
+    const bool log_this = (flush_count < 25);
+#else
+    const bool log_this = (flush_count == 0);
+#endif
+    if (log_this) {
+        Serial.printf("quarky-tab5: display flush #%u: logical (%d,%d)-(%d,%d) -> "
                       "native (%d,%d)-(%d,%d)\n",
-                      x1, y1, x2, y2, nx1, ny1, nx2 - 1, ny2 - 1);
+                      flush_count, x1, y1, x2, y2, nx1, ny1, nx2 - 1, ny2 - 1);
     }
+    flush_count++;
 
     esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel, nx1, ny1, nx2, ny2, src);
     if (err != ESP_OK) {

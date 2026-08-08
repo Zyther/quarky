@@ -5,8 +5,12 @@
 class DisplayTab5 : public IDisplay {
 public:
     // Which panel controller runtime detection settled on. The Tab5 ships with
-    // one of two mutually exclusive display ICs; see detect() in the .cpp.
-    enum class Controller { Unknown, Ili9881, St7123 };
+    // one of THREE mutually exclusive display ICs; see detectController() in
+    // the .cpp. St7121 and St7123 are different panels that both answer at
+    // I2C 0x55 and need different init tables, lane rates and DPI timing --
+    // they are told apart by the touch firmware version, exactly as M5Stack's
+    // own M5GFX library does.
+    enum class Controller { Unknown, Ili9881, St7121, St7123 };
 
     void init() override;
     // Logical (LVGL-facing) size. This is NOT necessarily the panel's native

@@ -94,10 +94,24 @@
 // MIPI-DSI bus configuration (esp_lcd_dsi_bus_config_t), confirmed from
 // video.cpp `M5StackTab5::initialize_lcd()`:
 #define TAB5_DSI_NUM_DATA_LANES      2
-// Lane bit rate depends on which panel controller is detected at runtime:
-//   ILI9881 -> 730 Mbps, ST7123 -> 965 Mbps. Not a single fixed constant.
+// Lane bit rate depends on which panel controller is detected at runtime.
+//
+// CORRECTED 2026-08-08 from M5Stack's own M5GFX library (the vendor's driver
+// for this exact board), src/M5GFX.cpp board_M5Tab5 bring-up:
+//     bus_cfg.lane_mbps = hit_st7121 ? 900 : 1040;
+// espp used 965 Mbps for "ST7123", which matches neither vendor value and is
+// not traceable to any M5Stack source. See the ST7121/ST7123 note below.
+#define TAB5_DSI_LANE_BIT_RATE_MBPS_ST7123  1040
+#define TAB5_DSI_LANE_BIT_RATE_MBPS_ST7121  900
+// ILI9881: left on espp's value deliberately. M5GFX uses 1040 Mbps / 80 MHz
+// for this path too, but this project pairs it with espp's 202-command
+// ILI9881 init table, and espp's table was written against espp's 730 Mbps /
+// 60 MHz. Mixing one vendor's table with the other's clocks is a combination
+// neither project ships. This unit is not an ILI9881 (no GT911 at 0x14), so
+// the path cannot be tested here; keeping espp's self-consistent pair is the
+// lower-risk choice. If an ILI9881 Tab5 ever turns up and is blank, try the
+// vendor pair (1040 Mbps / 80 MHz) together with M5GFX's Panel_ILI9881C table.
 #define TAB5_DSI_LANE_BIT_RATE_MBPS_ILI9881 730
-#define TAB5_DSI_LANE_BIT_RATE_MBPS_ST7123  965
 
 // ESP32-P4 MIPI-DSI PHY requires an LDO power rail before the DSI bus is
 // created (esp_ldo_acquire_channel), confirmed from video.cpp:
@@ -123,7 +137,39 @@
 // Both probes must happen AFTER the LCD reset pulse above, exactly as the BSP
 // orders them -- the ST7123 cannot answer on I2C while it is held in reset.
 #define TAB5_ILI9881_PROBE_I2C_ADDR  0x14  // GT911 presence => ILI9881 variant
-#define TAB5_ST7123_I2C_ADDR         0x55  // ST7123 TDDI controller, probed directly
+#define TAB5_ST7123_I2C_ADDR         0x55  // Sitronix TDDI controller, probed directly
+
+// CORRECTION 2026-08-08 -- "something ACKs at 0x55" IS NOT ENOUGH.
+//
+// espp's detect_display_controller() treats an ACK at 0x55 as "this is an
+// ST7123". M5Stack's own M5GFX library shows that is ambiguous: the Tab5 ships
+// with one of TWO different Sitronix TDDI panels, ST7121 or ST7123, and BOTH
+// live at 0x55 (M5GFX: `Touch_ST7123::default_addr = 0x55`, used for both).
+// They need different register tables, different DSI lane rates and different
+// DPI timing, so guessing wrong gives a panel that ACKs every command over DSI
+// and never lights up.
+//
+// The vendor discriminates by reading the touch firmware version -- a 1-byte
+// read from 16-bit register 0x0000 at 0x55 (M5GFX src/M5GFX.cpp):
+//     uint8_t fw_reg[2] = { 0, 0 };
+//     transactionWriteRead(port, Touch_ST7123::default_addr, fw_reg, 2, &fw_version, 1, ...);
+//     if (fw_version == 1) { hit_st7121 = true; }
+//     if (fw_version == 3) { hit_st7123 = true; }
+// retried up to 3 times with 10 ms between attempts.
+#define TAB5_ST_FW_VERSION_REG_HI    0x00
+#define TAB5_ST_FW_VERSION_REG_LO    0x00
+#define TAB5_ST_FW_VERSION_ST7121    1
+#define TAB5_ST_FW_VERSION_ST7123    3
+
+// The vendor's secondary check is a DSI read of register 0xF4 (2 bytes),
+// expecting 0x71 0x23. DELIBERATELY NOT IMPLEMENTED: esp_lcd_panel_io_rx_param()
+// on a DBI channel lands in mipi_dsi_hal_host_gen_read_dcs_command(), whose
+// read-FIFO wait loops (`while (mipi_dsi_host_ll_gen_is_read_cmd_busy(...));`
+// and `while (mipi_dsi_host_ll_gen_is_read_fifo_empty(...));` in
+// components/hal/mipi_dsi_hal.c, IDF v5.5) have NO timeout. A panel that does
+// not answer hangs the boot with no serial output, which is strictly worse
+// than a wrong guess. The I2C firmware-version read above is bounded and is
+// the vendor's own primary discriminator anyway.
 
 // DPI (parallel-in, DSI-out) video timing, confirmed from video.cpp. These are
 // consumed by src/hal/display_tab5.cpp when it builds the DPI panel. The
@@ -135,18 +181,38 @@
 #define TAB5_DPI_VSYNC_BP_ILI9881       20
 #define TAB5_DPI_VSYNC_PW_ILI9881       4
 #define TAB5_DPI_VSYNC_FP_ILI9881       20
-// DO NOT RAISE the ST7123 pixel clock above 70 MHz. Per video.cpp's own
-// comment: the ST7123 is a TDDI part whose touch engine scans during the
-// display blanking interval, timed against the pixel clock its vendor init
-// table was tuned for; running faster shrinks the blanking window and desyncs
-// the touch scan (panel shows, touch never reports).
-#define TAB5_DPI_CLK_MHZ_ST7123         70
+// Sitronix DPI timing. CORRECTED 2026-08-08 from M5Stack's own M5GFX library,
+// src/M5GFX.cpp board_M5Tab5 bring-up (the `hit_st7123` / `hit_st7121`
+// branches). espp had a single "ST7123" profile that turns out to be a blend:
+// the ST7123's porches with the ST7121's 70 MHz pixel clock. Both variants are
+// now carried separately and selected at runtime.
+//
+// The M5GFX source carries two of its own warnings about these numbers, kept
+// here verbatim in spirit because they explain why they look asymmetric:
+//   * ST7123 vsync: "back + pulse == 10. If it is out of sync, the display
+//     position will shift vertically."
+//   * ST7123 vsync front porch: "reducing the front porch will cause the touch
+//     panel to stop working." (It is a TDDI part -- the touch engine scans in
+//     the vertical blanking interval, so the blanking budget is load-bearing.)
+// espp's "DO NOT RAISE above 70 MHz" comment was espp's own reasoning about
+// that touch-scan constraint, not an M5Stack statement; the vendor runs the
+// ST7123 at 80 MHz with a 220-line front porch.
+#define TAB5_DPI_CLK_MHZ_ST7123         80
 #define TAB5_DPI_HSYNC_BP_ST7123        40
 #define TAB5_DPI_HSYNC_PW_ST7123        2
 #define TAB5_DPI_HSYNC_FP_ST7123        40
 #define TAB5_DPI_VSYNC_BP_ST7123        8
 #define TAB5_DPI_VSYNC_PW_ST7123        2
 #define TAB5_DPI_VSYNC_FP_ST7123        220
+// ST7121: a DIFFERENT panel that also answers at I2C 0x55. espp does not know
+// this variant exists. Note the much wider vsync pulse (20 vs 2).
+#define TAB5_DPI_CLK_MHZ_ST7121         70
+#define TAB5_DPI_HSYNC_BP_ST7121        40
+#define TAB5_DPI_HSYNC_PW_ST7121        2
+#define TAB5_DPI_HSYNC_FP_ST7121        40
+#define TAB5_DPI_VSYNC_BP_ST7121        24
+#define TAB5_DPI_VSYNC_PW_ST7121        20
+#define TAB5_DPI_VSYNC_FP_ST7121        200
 
 // ---------------------------------------------------------------------------
 // GT911 touch controller (Task 6)
