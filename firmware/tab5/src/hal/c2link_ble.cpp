@@ -84,6 +84,12 @@ static volatile bool s_subscribed = false;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_tx_val_handle = 0;
 static uint8_t s_own_addr_type = 0;
+// Task 19: millis() of the last frame dequeued and dispatched by poll() (main
+// task). Set there rather than in rx_access_cb (the NimBLE host task, which
+// runs on the other core) so it's only ever written from the same task that
+// c2link_ble_last_recv_ms() is read from in main.cpp's loop() -- no portMUX
+// needed for this one word, unlike s_rx_head/s_rx_tail above.
+static uint32_t s_last_recv_ms = 0;
 
 // Inbound frames are decoded on NimBLE's host task (in rx_access_cb) and handed
 // to the main task via this single-producer/single-consumer ring, drained by
@@ -389,6 +395,11 @@ void C2LinkBle::poll() {
         }
         portEXIT_CRITICAL(&s_rx_mux);
         if (!have) break;
+        s_last_recv_ms = millis();
         if (s_handler) s_handler(frame);
     }
+}
+
+uint32_t c2link_ble_last_recv_ms() {
+    return s_last_recv_ms;
 }

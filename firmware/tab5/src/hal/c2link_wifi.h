@@ -29,3 +29,10 @@ public:
     bool is_connected() override;
     void poll(); // call every loop() iteration -- accepts a client, reads/dispatches incoming frames
 };
+
+// millis() timestamp of the last frame successfully decoded off this
+// transport (0 if none yet). Free function rather than a method, matching
+// the file-scope-static storage the rest of this translation unit already
+// uses -- see Task 19 (devices_panel.cpp polls this to derive link freshness
+// for the shell's status bar).
+uint32_t c2link_wifi_last_recv_ms();

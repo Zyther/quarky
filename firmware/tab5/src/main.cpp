@@ -12,6 +12,7 @@
 #include "ui/lvgl_port.h"
 #include "ui/shell.h"
 #include "ui/screen_stack.h"
+#include "ui/devices_panel.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
 
@@ -148,5 +149,33 @@ void loop() {
     lvgl_port_tick();
     c2link_wifi.poll(); // no-ops when the AP never came up
     c2link_ble.poll();  // drains BLE frames received on the NimBLE host task
+
+    // Task 19: derive the shell status bar's link label from how recently
+    // each C2 transport last received a frame. Neither transport has a peer
+    // yet (Cardputer-ADV, Tasks 14-17, doesn't exist as of this task) so this
+    // is expected to read "disconnected" for now -- verified end-to-end once
+    // Task 20's ping feature generates real traffic on both sides. Polled at
+    // a fixed interval rather than every loop() iteration since the label
+    // only needs to be roughly live, not per-frame-accurate.
+    static uint32_t s_last_devices_poll_ms = 0;
+    uint32_t now = millis();
+    if (now - s_last_devices_poll_ms > 500) {
+        s_last_devices_poll_ms = now;
+        // A last-recv value of 0 means "never received a frame" (both
+        // statics' un-set default). Without this guard, `now - 0` is just
+        // `now`, which is < 5000ms for the first few seconds after boot --
+        // that reads as freshly "connected" before a single real frame ever
+        // arrived. Excluding the 0 sentinel keeps the label honestly
+        // "disconnected" until an actual frame shows up.
+        uint32_t wifi_last = c2link_wifi_last_recv_ms();
+        uint32_t ble_last = c2link_ble_last_recv_ms();
+        uint32_t wifi_age = now - wifi_last;
+        uint32_t ble_age = now - ble_last;
+        bool wifi_connected = wifi_last != 0 && wifi_age < 5000;
+        bool ble_connected = ble_last != 0 && ble_age < 5000;
+        int32_t freshest_age = wifi_connected ? (int32_t)wifi_age : (int32_t)ble_age;
+        DevicesPanel::update(wifi_connected, ble_connected, freshest_age);
+    }
+
     delay(5);
 }
