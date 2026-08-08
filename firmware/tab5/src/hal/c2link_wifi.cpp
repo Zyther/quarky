@@ -1,4 +1,6 @@
 #include "c2link_wifi.h"
+#include "hosted_link.h"
+#include <Arduino.h>
 #include <WiFi.h>
 #include <crypto.h>
 #include <cstring>
@@ -40,14 +42,39 @@ static void reset_rx_state() {
 
 bool C2LinkWifi::init(const uint8_t psk[16], const char *ap_ssid, const char *ap_password, uint16_t port) {
     memcpy(s_psk, psk, 16);
-    WiFi.mode(WIFI_AP);
-    if (!WiFi.softAP(ap_ssid, ap_password)) return false;
+
+    // This whole transport rides the ESP32-C6 co-processor. Bail out before
+    // touching any WiFi API if its SDIO link is down -- otherwise WiFi.mode()
+    // re-enters the failing esp-hosted bring-up on every call, which is what
+    // used to crash-loop the board via the brownout detector. See hosted_link.h.
+    if (!hosted_link::begin()) {
+        Serial.println("quarky-tab5: c2link_wifi init skipped, C6 link down");
+        return false;
+    }
+
+    // WiFi.mode()'s return value was previously discarded; it is false when the
+    // radio failed to come up, and continuing past that used to leave s_server
+    // null while poll() dereferenced it every loop() iteration.
+    if (!WiFi.mode(WIFI_AP)) {
+        Serial.println("quarky-tab5: c2link_wifi WiFi.mode(WIFI_AP) failed");
+        return false;
+    }
+    if (!WiFi.softAP(ap_ssid, ap_password)) {
+        Serial.println("quarky-tab5: c2link_wifi softAP failed");
+        return false;
+    }
     s_server = new WiFiServer(port);
     s_server->begin();
     return true;
 }
 
 void C2LinkWifi::poll() {
+    // s_server stays null when init() failed or was never called. Without this
+    // guard the s_server->accept() below is a null dereference on the very
+    // first loop() iteration -- i.e. a failed AP bring-up turned into a crash
+    // rather than a degraded-but-running board.
+    if (s_server == nullptr) return;
+
     if (!s_client || !s_client.connected()) {
         WiFiClient incoming = s_server->accept();
         if (incoming) {

@@ -1,7 +1,12 @@
 #include "c2link_ble.h"
+#include "hosted_link.h"
 #include <Arduino.h> // Serial (boot-path logging) + FreeRTOS portMUX
 #include <crypto.h>
 #include <cstring>
+
+extern "C" {
+#include "esp32-hal-hosted.h" // hostedInitBLE(): enables the C6's BT controller
+}
 
 // -----------------------------------------------------------------------------
 // Why this is written against the ESP-IDF NimBLE C API, not NimBLE-Arduino
@@ -264,6 +269,33 @@ bool C2LinkBle::init(const uint8_t psk[16], const char *device_name) {
     memcpy(s_psk, psk, 16);
     strncpy(s_device_name, device_name, sizeof(s_device_name) - 1);
     s_device_name[sizeof(s_device_name) - 1] = '\0';
+
+    // BLE on this board is proxied to the ESP32-C6 over the same esp-hosted
+    // SDIO transport WiFi uses, so it cannot come up if that link is down.
+    // Bail out here rather than letting nimble_port_init() discover it: the
+    // NimBLE stack retries HCI bring-up internally and would reproduce the
+    // reset storm this guard exists to stop. See hosted_link.h.
+    if (!hosted_link::begin()) {
+        Serial.println("quarky-tab5: c2link_ble init skipped, C6 link down");
+        return false;
+    }
+
+    // Explicitly enable the co-processor's BT controller BEFORE nimble_port_init().
+    // This mirrors what arduino-esp32's own BLEDevice::init() does under
+    // CONFIG_ESP_HOSTED_ENABLE_BT_NIMBLE (libraries/BLE/src/BLEDevice.cpp), and
+    // was missing here. Previously this file relied on the esp-hosted LL
+    // transport self-initialising from inside NimBLE -- which works only if
+    // something else (the WiFi path) had already brought esp-hosted up first,
+    // and would otherwise initialise the transport from the sdkconfig defaults
+    // (CONFIG_ESP_HOSTED_SDIO_PIN_* = the generic EV-board's WRONG pins,
+    // 18/19/14/15/16/17/54) instead of the Tab5 pins. hostedInitBLE() is
+    // idempotent w.r.t. the shared transport: hosted_link::begin() already
+    // established it, so this only adds the BT-controller enable on top.
+    if (!hostedInitBLE()) {
+        Serial.println("quarky-tab5: c2link_ble hostedInitBLE failed "
+                       "(C6 BT controller did not come up)");
+        return false;
+    }
 
     esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {
