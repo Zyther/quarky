@@ -211,14 +211,25 @@
 // ESP32-C6 co-processor link, real Tab5 pins, on SDMMC host SLOT 1
 // (GPIO-matrix-routed -- confirmed disjoint from the SD pins above).
 // Source: m5stack-tab5.hpp, comments label these net names "SDIO2_*".
-// NOTE: this project's currently-selected PlatformIO board
-// (`esp32-p4-evboard`) does NOT use these values -- its pins_arduino.h
-// hardcodes the *generic* ESP32-P4-Function-EV-Board's C6 pins instead
-// (18/19/14/15/16/17/54, see BOARD_SDIO_ESP_HOSTED_* below), consumed by
-// cores/esp32/esp32-hal-hosted.c at compile time. That is a real,
-// unresolved pin mismatch against real Tab5 hardware, flagged forward in
-// task-10-report.md -- not fixed here (board-config decision, affects
-// Task 9's radio too, out of this task's scope).
+// Independently corroborated by the pioarduino framework's own
+// variants/m5stack_tab5/pins_arduino.h, which declares the identical seven
+// values.
+//
+// STATUS (updated by the C6 SDIO hotfix, see
+// hotfix-c6-sdio-pins-report.md): these values are now LIVE in the build.
+// Task 10 recorded them here as documentation only, and flagged that the
+// then-selected `esp32-p4-evboard` board baked in the generic EV-board's
+// wrong C6 pins instead (see TAB5_EVBOARD_C6_* below) -- which on real
+// hardware meant esp-hosted drove the wrong GPIOs, the C6 never enumerated,
+// and the board crash-looped into the brownout detector on every boot. That
+// is fixed two ways now:
+//   1. At compile time, by this repo's own board + variant
+//      (boards/quarky_tab5_p4.json, boards/variants/quarky_tab5_p4/
+//      pins_arduino.h), which set BOARD_SDIO_ESP_HOSTED_* to these values.
+//      A `-D` build flag could NOT have done this: the framework's macros
+//      are unconditional #defines with no #ifndef guard.
+//   2. At run time, by src/hal/hosted_link.cpp, which passes the macros
+//      below to WiFi.setPins() before any radio API call.
 #define TAB5_C6_SDIO_CLK_GPIO   12
 #define TAB5_C6_SDIO_CMD_GPIO   13
 #define TAB5_C6_SDIO_D0_GPIO    11
@@ -228,11 +239,42 @@
 #define TAB5_C6_RESET_GPIO      15
 #define TAB5_C6_SDIO_SDMMC_SLOT 1
 
-// Generic ESP32-P4-Function-EV-Board's C6 pins, for reference -- these are
-// what's ACTUALLY baked into this project's build today via
-// framework-arduinoespressif32/variants/esp32p4/pins_arduino.h
-// (BOARD_HAS_SDIO_ESP_HOSTED / BOARD_SDIO_ESP_HOSTED_*), not the Tab5
-// values above. See caveat (b) in storage_sd.cpp.
+// ESP32-C6 POWER RAIL -- the C6 is NOT powered by default.
+// Found the hard way during the C6 SDIO hotfix: even with the correct SDIO
+// pins above, `sdmmc_init_ocr: send_op_cond returned 0x107` (ESP_ERR_TIMEOUT)
+// on every attempt, because the co-processor had no power at all. On Tab5 the
+// C6's supply is gated by WLAN_PWR_EN, which is NOT a P4 GPIO -- it is P0 of
+// the *second* PI4IOE5V6408 I2C IO-expander, at address 0x44 (distinct from
+// the 0x43 expander that carries LCD_RST/TP_RST above), on the same internal
+// I2C bus (TAB5_INTERNAL_I2C_SDA_GPIO/SCL_GPIO).
+// Source: espp/m5stack-tab5 m5stack-tab5.hpp --
+//   `static constexpr int WLAN_PWR_EN_PIN = (1 << 0); // WLAN_PWR_EN`
+//   and `IOX_0x44_DEFAULT_OUTPUTS = WLAN_PWR_EN_PIN | USB_5V_EN_PIN`
+// (the BSP asserts it as part of expander init, which is why BSP-based
+// projects never notice it is a prerequisite). Driven by
+// src/hal/hosted_link.cpp before esp-hosted bring-up.
+#define TAB5_PWR_IOEXP_I2C_ADDR   0x44
+#define TAB5_WLAN_PWR_EN_IOEXP_BIT 0    // PI4IOE5V6408 P0 / WLAN_PWR_EN
+
+// PI4IOE5V6408 register map (both the 0x43 and 0x44 expanders are the same
+// part). Single-byte register addresses -- note this differs from the GT911's
+// 16-bit big-endian register addressing used in touch_gt911.cpp.
+// Source: espp/components/pi4ioe5v/include/pi4ioe5v.hpp register enum.
+#define PI4IOE5V6408_REG_CHIP_ID_CTRL   0x01
+#define PI4IOE5V6408_REG_DIRECTION      0x03  // 1 = output, 0 = input
+#define PI4IOE5V6408_REG_OUTPUT         0x05
+#define PI4IOE5V6408_REG_OUTPUT_HIGH_IM 0x07  // 1 = high-Z (output disconnected)
+#define PI4IOE5V6408_REG_INPUT_DEFAULT  0x09
+#define PI4IOE5V6408_REG_PULL_ENABLE    0x0B
+#define PI4IOE5V6408_REG_PULL_SELECT    0x0D
+#define PI4IOE5V6408_REG_INPUT          0x0F
+
+// Generic ESP32-P4-Function-EV-Board's C6 pins, kept for reference and as a
+// regression tripwire: these are the WRONG-for-Tab5 values that
+// framework-arduinoespressif32/variants/esp32p4/pins_arduino.h bakes in, and
+// that this project shipped until the C6 SDIO hotfix. If a future boot ever
+// logs esp-hosted using these numbers again, the custom board definition has
+// been bypassed -- see hotfix-c6-sdio-pins-report.md.
 #define TAB5_EVBOARD_C6_SDIO_CLK_GPIO   18
 #define TAB5_EVBOARD_C6_SDIO_CMD_GPIO   19
 #define TAB5_EVBOARD_C6_SDIO_D0_GPIO    14

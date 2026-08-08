@@ -1,0 +1,78 @@
+{
+  "_comment": [
+    "In-repo PlatformIO board definition for the M5Stack Tab5 (ESP32-P4).",
+    "",
+    "WHY THIS EXISTS: this project previously used the platform-provided",
+    "'esp32-p4-evboard' board, whose Arduino variant",
+    "(framework-arduinoespressif32/variants/esp32p4/pins_arduino.h) hardcodes",
+    "the generic ESP32-P4-Function-EV-Board's GPIOs for the SDIO link to the",
+    "ESP32-C6 radio co-processor (BOARD_SDIO_ESP_HOSTED_* = 18/19/14/15/16/17,",
+    "reset 54). Those are NOT the Tab5's pins (12/13/11/10/9/8, reset 15).",
+    "cores/esp32/esp32-hal-hosted.c consumes those macros at compile time, so",
+    "on real Tab5 hardware esp-hosted drove the wrong pins, the C6 never came",
+    "up, and the board crash-looped into the brownout detector. Those macros",
+    "have no #ifndef guard, so a -D build flag cannot override them.",
+    "",
+    "This board is a deliberate MINIMAL fork of esp32-p4-evboard.json: every",
+    "field below is byte-identical to it except 'variant' (+ the new",
+    "'variants_dir'), so every other already-working setting other tasks",
+    "depend on (mcu, chip_variant, flash mode/speed, PSRAM, 16MB flash sizing,",
+    "upload speed, openocd target) is preserved exactly. The paired variant",
+    "boards/variants/quarky_tab5_p4/pins_arduino.h is likewise a minimal fork",
+    "of variants/esp32p4/pins_arduino.h with ONLY the seven",
+    "BOARD_SDIO_ESP_HOSTED_* pins changed.",
+    "",
+    "Deliberately NOT using the platform's own 'm5stack-tab5-p4' board: it",
+    "selects the m5stack_tab5 variant, which (a) drops BOARD_SDMMC_POWER_*,",
+    "(b) drops BOARD_PERIMAN_IO_LDO_* (the on-chip LDO VO4 auto-enable that",
+    "covers GPIO 39-48 -- i.e. the SD card's slot-0 IOMUX pins 39-44),",
+    "(c) moves default SDA/SCL from 7/8 to 53/54, and its companion",
+    "m5stack-tab5-p4.py force-installs M5Unified from git into .pio/libdeps.",
+    "Each of those is an unrelated behavioural change to already-working",
+    "Task 5/6/10 code paths. See hotfix-c6-sdio-pins-report.md.",
+    "",
+    "Build flags are intentionally NOT set here (unlike the platform's",
+    "m5stack-tab5-p4.json, which injects USB CDC flags): platformio.ini",
+    "already declares -DARDUINO_USB_CDC_ON_BOOT=1 / -DARDUINO_USB_MODE=1 /",
+    "-DBOARD_HAS_PSRAM explicitly, and keeping the single source of truth",
+    "there avoids duplicate-definition surprises."
+  ],
+  "build": {
+    "core": "esp32",
+    "extra_flags": [
+      "-DBOARD_HAS_PSRAM"
+    ],
+    "f_cpu": "360000000L",
+    "f_flash": "80000000L",
+    "f_psram": "200000000L",
+    "flash_mode": "qio",
+    "mcu": "esp32p4",
+    "chip_variant": "esp32p4_es",
+    "variant": "quarky_tab5_p4",
+    "variants_dir": "boards/variants"
+  },
+  "arduino": {
+    "partitions": "default_16MB.csv"
+  },
+  "connectivity": [
+    "bluetooth",
+    "openthread"
+  ],
+  "debug": {
+    "openocd_target": "esp32p4.cfg"
+  },
+  "frameworks": [
+    "arduino",
+    "espidf"
+  ],
+  "name": "M5Stack Tab5 (ESP32-P4) -- quarky in-repo board",
+  "upload": {
+    "flash_size": "16MB",
+    "maximum_ram_size": 512000,
+    "maximum_size": 16777216,
+    "require_upload_port": true,
+    "speed": 1500000
+  },
+  "url": "https://docs.m5stack.com/en/core/Tab5",
+  "vendor": "M5STACK"
+}
