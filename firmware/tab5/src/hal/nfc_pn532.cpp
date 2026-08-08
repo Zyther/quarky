@@ -1,5 +1,6 @@
 #include "nfc_pn532.h"
 #include "../../boards/tab5/pins_config.h"
+#include "io_expander.h"
 #include <Wire.h>
 #include <Arduino.h>
 
@@ -55,8 +56,24 @@
 //     M5Stack community threads as "NFC PN532 grove v1.1"), but no longer
 //     appears in M5Stack's current product/I2C-address documentation. Which
 //     one the physically-connected unit actually is could not be determined
-//     from research; it is resolved below by probing BOTH candidate
-//     addresses on real hardware and reporting exactly what answers.
+//     from research; it was left to the real-hardware census below to
+//     resolve. RESOLVED 2026-08-08 by that census, once the port-power bug
+//     immediately below was fixed: the connected unit answers at 0x50, i.e.
+//     it is the CURRENT ST25R3916-based Unit NFC, not a PN532. The 0x24
+//     guess is retired (see TAB5_NFC_I2C_ADDR in pins_config.h).
+//
+// WHICH POWER RAIL (added by the HY2.0 port-power hotfix, 2026-08-08).
+// Task 18's first hardware run scanned all of 0x08-0x77 on this bus with a
+// physical M5Stack NFC unit plugged into PORT.A and found "(nothing
+// responded)". That is not a wrong-address symptom -- a wrong address still
+// leaves the *right* one visible in a full sweep -- it is a dead-bus symptom.
+// The cause turned out to be identical in kind to the C6 SDIO hotfix's second
+// root cause: PORT.A's 5V pin is gated by EXT_5V_EN, P2 of the PI4IOE5V6408
+// IO-expander at 0x43 on the INTERNAL bus, and nothing in this project was
+// asserting it. The plugged-in unit simply had no supply. See
+// TAB5_EXT_5V_EN_IOEXP_* in pins_config.h for the three corroborating
+// sources. ensureExternalI2CBegun() below now asserts that gate, and waits
+// for the unit's power-on reset, before the bus is touched.
 //
 // detect() below is therefore a bare I2C address ACK probe, not a real PN532
 // GetFirmwareVersion exchange -- correcting the brief's code comment, which
@@ -73,10 +90,31 @@ namespace {
 
 bool s_external_bus_begun = false;
 
+// Turn on the external 5V bus that feeds PORT.A's red wire (and the rear
+// M5-Bus / side 2.54-10P header). Off at reset; nothing on PORT.A can answer
+// until this is asserted. The gate itself lives on the INTERNAL I2C bus, so
+// Wire -- not Wire1 -- has to be up first. Wire.begin() is idempotent (the
+// framework logs "Bus already started in Master Mode" and returns), and
+// display_tab5.cpp / touch_tab5.cpp / hosted_link.cpp all call it the same
+// way for the same reason: no module may assume it is the first user.
+void ensureExternalPortPowered() {
+    Wire.begin(TAB5_INTERNAL_I2C_SDA_GPIO, TAB5_INTERNAL_I2C_SCL_GPIO);
+    bool ok = tab5_ioexp::set_output(TAB5_EXT_5V_EN_IOEXP_I2C_ADDR,
+                                     TAB5_EXT_5V_EN_IOEXP_BIT, true);
+    Serial.printf("quarky-tab5: EXT_5V_EN (ioexp 0x%02X P%d) assert: %s\n",
+                  TAB5_EXT_5V_EN_IOEXP_I2C_ADDR, TAB5_EXT_5V_EN_IOEXP_BIT,
+                  ok ? "OK" : "FAILED (I2C write to IO-expander failed)");
+    // Even on failure, fall through and probe anyway: the scan output is the
+    // diagnostic, and reporting "power enable failed AND bus empty" is more
+    // useful than refusing to look.
+    delay(TAB5_EXT_5V_SETTLE_MS);
+}
+
 void ensureExternalI2CBegun() {
     if (s_external_bus_begun) {
         return;
     }
+    ensureExternalPortPowered();
     Wire1.begin(TAB5_EXTERNAL_I2C_SDA_GPIO, TAB5_EXTERNAL_I2C_SCL_GPIO);
     Wire1.setClock(TAB5_EXTERNAL_I2C_FREQ_HZ);
     s_external_bus_begun = true;

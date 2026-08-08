@@ -395,7 +395,7 @@
 //   0x40  ES7210 microphone ADC / AEC front-end
 //   0x41  INA226 battery power monitor
 //   0x43  PI4IOE5V6408 IO-expander #1 (LCD_RST P4, TP_RST P5, CAM_RST P6,
-//         SPK_EN P1)
+//         SPK_EN P1, EXT_5V_EN P2)
 //   0x44  PI4IOE5V6408 IO-expander #2 (WLAN_PWR_EN P0, USB 5V, charger)
 //   0x55  ST7121/ST7123 panel AND its integrated touch engine
 //   0x68  BMI270 6-axis IMU
@@ -554,6 +554,51 @@
 // measured. Revisit if verified stable at 400 kHz.
 #define TAB5_EXTERNAL_I2C_FREQ_HZ  100000
 
+// EXTERNAL 5V RAIL -- PORT.A's red (5V) wire is NOT powered by default.
+//
+// Found the same way, and for the same reason, as the C6's WLAN_PWR_EN gate
+// above: Task 18's first real-hardware run scanned the whole 0x08-0x77 range
+// on GPIO 53/54 with a physical M5Stack NFC unit plugged in and got
+// "(nothing responded)" -- not a wrong address, an entirely silent bus. The
+// unit had no supply, so it could not ACK anything.
+//
+// On Tab5 the external 5V bus is gated by EXT_5V_EN, which is NOT a P4 GPIO.
+// It is P2 of the *first* PI4IOE5V6408 IO-expander, at address 0x43 (the same
+// expander that carries LCD_RST P4 / TP_RST P5 above), on the INTERNAL I2C
+// bus (TAB5_INTERNAL_I2C_SDA_GPIO/SCL_GPIO = 31/32) -- i.e. the gate for the
+// external bus lives on the internal one.
+//
+// Three independent sources agree, fetched 2026-08-08:
+//   1. M5Stack's own product page, docs.m5stack.com/en/core/Tab5, pinmap
+//      section: "EXT_5V_BUS: Provides 5V power to the Tab5 rear M5-Bus, the
+//      side 2.54-10P expansion port, and the HY2.0-4P interface", with the
+//      output controlled by EXT5V_EN. This is the authoritative statement
+//      that PORT.A's 5V pin specifically hangs off this switch.
+//   2. espp/m5stack-tab5 BSP (esp-cpp/espp, components/m5stack-tab5/include/
+//      m5stack-tab5.hpp):
+//        static constexpr int EXT_5V_EN_PIN = (1 << 2); // EXT_5V_EN (via PI4IOE5V6408 P2)
+//        IOX_0x43_OUTPUTS = CAM_RST_PIN | TP_RST_PIN | LCD_RST_PIN | EXT_5V_EN_PIN | SPK_EN_PIN;
+//        IOX_0x43_DEFAULT_OUTPUTS = IOX_0x43_OUTPUTS; // All outputs high to start
+//      i.e. the BSP drives it HIGH as part of generic expander init -- which
+//      is exactly why BSP-based projects never notice it is a prerequisite,
+//      the identical blind spot that hid WLAN_PWR_EN.
+//   3. ESPHome's community Tab5 device config (devices.esphome.io/devices/
+//      m5stack-tab5/) declares the 0x43 expander's pin 2 as
+//      `external_5v_power` (output), on an i2c bus at sda GPIO31/scl GPIO32.
+//
+// Active HIGH (all three sources drive/describe it as "enable"). Asserted by
+// src/hal/nfc_pn532.cpp before the external bus is scanned.
+#define TAB5_EXT_5V_EN_IOEXP_I2C_ADDR 0x43
+#define TAB5_EXT_5V_EN_IOEXP_BIT      2    // PI4IOE5V6408 P2 / EXT_5V_EN
+
+// Settle time between asserting EXT_5V_EN and first addressing anything on
+// PORT.A. Not a documented figure from any vendor source -- deliberately
+// generous, covering the load switch's rise time plus the power-on reset of
+// whichever unit is plugged in (M5Stack HY2.0 units regulate 5V down on-board
+// and their MCU/reader ICs need their own POR to complete before they will
+// ACK). Reduce only with measurements.
+#define TAB5_EXT_5V_SETTLE_MS 200
+
 // NFC unit and RFID2 unit I2C addresses.
 //
 // RFID2: CONFIRMED. docs.m5stack.com/en/product_i2c_addr and
@@ -566,10 +611,9 @@
 // probe, not a PN532-specific protocol exchange.
 #define TAB5_RFID2_I2C_ADDR 0x28
 
-// NFC: UNRESOLVED BY DOCUMENTATION, resolved by real-hardware bus scan
-// instead (nfc_scan_external_i2c_bus(), called from main.cpp before the
-// detect() calls). Two candidates found in research, both real M5Stack/
-// PN532-ecosystem values, kept here for reference:
+// NFC: was UNRESOLVED BY DOCUMENTATION; now RESOLVED ON REAL HARDWARE
+// (2026-08-08, HY2.0 port-power hotfix). Two candidates were found in
+// research, both real M5Stack/PN532-ecosystem values:
 //   0x24 -- PN532 datasheet default I2C address (also an older, likely-EOL
 //           M5Stack Grove NFC module referenced in M5Stack community
 //           threads as "NFC PN532 grove v1.1"; does not appear in M5Stack's
@@ -577,10 +621,17 @@
 //   0x50 -- M5Stack's current "Unit NFC" / "NFC Universal Unit" product,
 //           confirmed via docs.m5stack.com/en/unit/Unit_NFC: chip
 //           ST25R3916-AQWT, "I2C @0x50 (100K / 400K)".
-// main.cpp's NfcPN532 instance is constructed against whichever of these the
-// real bus scan on this specific physical unit showed present; see
-// task-18-report.md for that scan's actual output.
-#define TAB5_NFC_I2C_ADDR_CANDIDATE_PN532_DEFAULT 0x24
+// Task 18 could not choose between them because its bus scan found nothing at
+// all -- the EXT_5V_EN gate above was the reason. With that gate asserted, the
+// full 0x08-0x77 sweep of PORT.A returns exactly one device:
+//     quarky-tab5:   0x50  ST25R3916 (M5Stack Unit NFC / NFC Universal Unit)
+// So the physically-connected unit is the CURRENT ST25R3916-based Unit NFC,
+// NOT a PN532. This retires the 0x24 guess. (The `NfcPN532` class name is
+// now a misnomer; its detect() is a chip-agnostic address ACK probe, so it is
+// still correct -- see nfc_pn532.cpp's header. Renaming is deliberately left
+// to whoever implements real read/write, which WILL be chip-specific.)
+#define TAB5_NFC_I2C_ADDR 0x50   // CONFIRMED on hardware: ST25R3916 Unit NFC
+#define TAB5_NFC_I2C_ADDR_CANDIDATE_PN532_DEFAULT 0x24  // retired; kept for history
 #define TAB5_NFC_I2C_ADDR_CANDIDATE_ST25R3916      0x50
 
 // RF433R/T GPIO pins: GENUINELY UNKNOWN, left as an explicit TODO rather
