@@ -2,6 +2,7 @@
 #include "hal/device.h"
 #include "hal/c2link_wifi.h"
 #include "remote/command_dispatcher.h"
+#include "local_menu.h"
 #include <feature_registry.h>
 
 static C2LinkWifi c2link_wifi;
@@ -26,9 +27,12 @@ void setup() {
     c2link_wifi.set_receive_handler([](const c2proto::Frame &frame) {
         CommandDispatcher::handle(frame, c2link_wifi, g_registry);
     });
+
+    LocalMenu::init();
 }
 
 void loop() {
+    LocalMenu::tick();
     c2link_wifi.poll();
-    delay(10);
+    delay(20);
 }
