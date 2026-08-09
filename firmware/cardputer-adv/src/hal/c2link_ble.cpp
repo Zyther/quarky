@@ -107,9 +107,29 @@ bool C2LinkBle::init(const uint8_t psk[16], const char *target_device_name) {
 }
 
 void C2LinkBle::poll() {
-    if (s_client != nullptr && s_client->isConnected()) return;
-
+    // Only scan/connect when not already connected. IMPORTANT: this used to be
+    // `if (connected) return;` at the top of poll(), which skipped the rx-queue
+    // drain loop below entirely once connected -- so inbound frames (received on
+    // the NimBLE host task in on_notify() and queued) were NEVER dispatched to
+    // the receive handler after the link came up. That made CommandDispatcher
+    // never run for BLE-delivered commands, so PingFeature::handle_start()
+    // never fired and no RESP_TELEMETRY reply was ever produced (Task 20 BLE
+    // reply-path bug). The scan is now guarded but the drain always runs.
+    if (s_client == nullptr || !s_client->isConnected()) {
     NimBLEScan *scan = NimBLEDevice::getScan();
+    // Task 20 hardware-verification fix: NimBLEScan defaults to PASSIVE
+    // scanning (NimBLEScan.cpp's m_scanParams ctor initializer), which never
+    // requests/receives scan-response packets. Tab5's c2link_ble.cpp
+    // (start_advertising()) puts the device name ONLY in the scan response
+    // (the primary advertisement only carries flags + the 128-bit service
+    // UUID, to fit the 31-byte limit) -- so with the default passive scan,
+    // every NimBLEAdvertisedDevice here has haveName() == false forever, the
+    // name filter below never matches, and this device could never find (or
+    // connect to) Tab5 over BLE at all. Confirmed on real hardware: without
+    // this call, Tab5's own serial log never showed a single "c2link_ble
+    // connected" event no matter how long the two boards sat next to each
+    // other. Active scanning requests the scan response explicitly.
+    scan->setActiveScan(true);
     NimBLEScanResults results = scan->getResults(2000, false); // 2s blocking scan window
     for (const NimBLEAdvertisedDevice *dev : results) {        // 2.5.1: iterator yields pointers, not refs
         if (!dev->haveName() || dev->getName() != s_target_name) continue;
@@ -140,8 +160,11 @@ void C2LinkBle::poll() {
         Serial.printf("quarky-cardputer-adv: c2link_ble connected to \"%s\"\n", s_target_name);
         break;
     }
+    } // end scan/connect guard
 
-    // Drain any frames the host task queued while we were scanning/connecting.
+    // Drain frames the host task queued (in on_notify) -- runs EVERY poll(),
+    // whether or not we scanned this cycle, so inbound commands are dispatched
+    // to the receive handler once the link is up, not just during connect.
     for (;;) {
         c2proto::Frame frame;
         bool have = false;
@@ -185,6 +208,24 @@ bool C2LinkBle::send(const c2proto::Frame &frame) {
     memcpy(out, frame_buf, n);
     memcpy(out + n, mac, 32);
 
+    // response=false => ATT "Write Command" (write-without-response):
+    // fire-and-forget, no ACK, cannot block. This is deliberate. Tab5's Rx
+    // characteristic (firmware/tab5/src/hal/c2link_ble.cpp, s_chrs[]) now
+    // declares BOTH BLE_GATT_CHR_F_WRITE and BLE_GATT_CHR_F_WRITE_NO_RSP, so the
+    // server accepts these Write Commands and rx_access_cb fires normally --
+    // this is the reply path (Cardputer-ADV -> Tab5, RESP_TELEMETRY).
+    //
+    // Task 20 history: originally the server declared only
+    // BLE_GATT_CHR_F_WRITE, and NimBLE-Arduino's client does not verify the
+    // peer advertises WRITE_NO_RSP before firing ble_gattc_write_no_rsp_flat(),
+    // so the server silently dropped these Write Commands (no rx_access_cb, no
+    // observable error either side) and RESP_TELEMETRY never arrived. The
+    // "obvious" client-side fix of switching to response=true (Write Request)
+    // hung this device's main loop (writeValue()'s with-response path blocks on
+    // NimBLEUtils::taskWait(..., BLE_NPL_TIME_FOREVER)). The chosen fix is
+    // server-side: advertise WRITE_NO_RSP on Tab5's Rx characteristic, keeping
+    // this call fire-and-forget and never blocking the loop. Verified on real
+    // hardware. See task-20-report.md.
     return s_rxChar->writeValue(out, n + 32, false);
 }
 

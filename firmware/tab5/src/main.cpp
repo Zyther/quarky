@@ -13,8 +13,12 @@
 #include "ui/shell.h"
 #include "ui/screen_stack.h"
 #include "ui/devices_panel.h"
+#include "ui/pairing_screen.h"
+#include "features/ping_feature.h"
+#include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
+#include <crypto.h>
 
 DisplayTab5 display;
 TouchTab5 touch;
@@ -22,7 +26,18 @@ RadioEspHosted radio;
 StorageSD storage;
 C2LinkWifi c2link_wifi;
 C2LinkBle c2link_ble;
-FeatureRegistry g_registry; // populated further in Task 15
+FeatureRegistry g_registry; // populated by PingFeature::register_module() (Task 20)
+
+// Task 20: dispatched on receipt of a RESP_TELEMETRY frame from Cardputer-ADV
+// over either transport -- see both c2link_*.set_receive_handler(...) calls
+// in setup(), below.
+void on_c2_receive(const c2proto::Frame &frame) {
+    if (frame.type == c2proto::MsgType::RESP_TELEMETRY) {
+        char msg[c2proto::kMaxPayload + 1] = {0};
+        memcpy(msg, frame.payload, frame.payload_len);
+        Serial.printf("quarky-tab5: telemetry received: %s\n", msg);
+    }
+}
 
 // Task 18: HY2.0 peripheral detection (NFC, RFID2, RF433R/T). See
 // hal/nfc_pn532.cpp and boards/tab5/pins_config.h for the real-hardware
@@ -71,6 +86,10 @@ void setup() {
     touch.init();
     lvgl_port_init(display, touch);
 
+    PingFeature::register_module(); // makes the "Ping Satellite" tile appear in
+                                     // Shell::build's launcher grid (Task 7),
+                                     // so this must run before Shell::build below
+
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
     Serial.println("quarky-tab5: lvgl ready");
@@ -118,28 +137,48 @@ void setup() {
         }
 
         // Task 11 (amended 2026-08-07, was ESP-NOW -- see task-11-report.md for
-        // why that was replaced): C2LinkWifi init-only smoke test. Starts the
-        // Tab5's self-contained WiFi AP + TCP server; joining as a station and
-        // opening a connection is Cardputer-ADV's side, which doesn't exist yet.
-        // This is a placeholder PSK (all-zero) and placeholder AP credentials --
-        // none of this is a real credential. The real PSK and AP-credential
-        // derivation come from Task 12's pairing flow.
-        uint8_t test_psk[16] = {0};
-        bool c2_wifi_ok = c2link_wifi.init(test_psk, "Quarky-Tab5-Test", "quarkytest123", 7777);
+        // why that was replaced): C2LinkWifi. Starts the Tab5's self-contained
+        // WiFi AP + TCP server; joining as a station and opening a connection
+        // is Cardputer-ADV's side (Task 15).
+        //
+        // Task 20: this used to pass a local all-zero placeholder array here,
+        // completely disconnected from Task 12's pairing_screen.cpp (which
+        // generates/persists a PSK to NVS via PskStore but never fed it back
+        // into these init() calls) -- so a Cardputer-ADV hardcoded with the
+        // real, pairing-screen-displayed PSK would fail HMAC verification
+        // against Tab5's still-all-zero key and have every frame silently
+        // dropped ("bad auth") on both transports. Fixed here by loading (or,
+        // on a factory-fresh device with nobody having opened "Pair Satellite"
+        // yet, generating+persisting) the same NVS-backed PSK pairing_screen.cpp
+        // uses, so both call sites -- boot-time C2 link init and the pairing
+        // screen's later display -- always agree on one real provisioned key.
+        uint8_t provisioned_psk[16];
+        if (!PskStore::load(provisioned_psk)) {
+            c2proto::generate_psk(provisioned_psk);
+            PskStore::save(provisioned_psk);
+            Serial.println("quarky-tab5: generated and persisted new PSK (boot-time)");
+        } else {
+            Serial.println("quarky-tab5: loaded existing PSK from NVS (boot-time)");
+        }
+
+        bool c2_wifi_ok = c2link_wifi.init(provisioned_psk, "Quarky-Tab5-Test", "quarkytest123", 7777);
         Serial.printf("quarky-tab5: c2link_wifi init %s\n", c2_wifi_ok ? "OK" : "FAILED");
 
-        // Task 13: C2LinkBle init-only smoke test -- the second C2 transport,
-        // used when the WiFi radio is busy with an active feature. Coexists
-        // with C2LinkWifi above (both transports are brought up here; feature
-        // code picks which one to actually use at runtime, per the foundation
-        // spec). Same placeholder PSK as the WiFi transport until Task 12's
-        // pairing flow wires the real one. A known, already-flagged, deferred
-        // concern from Task 11 is that WiFi.mode(WIFI_AP) (above) and BLE
-        // together touch the same C6 co-processor radio at runtime. Full
-        // advertise/connect verification needs a real BLE central (a scanner
-        // app, or Cardputer-ADV's future BLE client from Task 17).
-        bool c2_ble_ok = c2link_ble.init(test_psk, "Quarky-Tab5");
+        // Task 13: C2LinkBle -- the second C2 transport, used when the WiFi
+        // radio is busy with an active feature. Coexists with C2LinkWifi above
+        // (both transports are brought up here; feature code picks which one
+        // to actually use at runtime, per the foundation spec). Same
+        // provisioned PSK as the WiFi transport, per the fix above. A known,
+        // already-flagged, deferred concern from Task 11 is that
+        // WiFi.mode(WIFI_AP) (above) and BLE together touch the same C6
+        // co-processor radio at runtime.
+        bool c2_ble_ok = c2link_ble.init(provisioned_psk, "Quarky-Tab5");
         Serial.printf("quarky-tab5: c2link_ble init %s\n", c2_ble_ok ? "OK" : "FAILED");
+
+        // Task 20: both transports report RESP_TELEMETRY (and any future
+        // RESP_*) frames to the same handler -- it's transport-agnostic.
+        c2link_wifi.set_receive_handler(on_c2_receive);
+        c2link_ble.set_receive_handler(on_c2_receive);
     }
 
     Serial.println("quarky-tab5: setup complete");
@@ -149,6 +188,27 @@ void loop() {
     lvgl_port_tick();
     c2link_wifi.poll(); // no-ops when the AP never came up
     c2link_ble.poll();  // drains BLE frames received on the NimBLE host task
+
+    // --- Serial-driven headless-verification aid (intentionally kept) ---
+    // Drives the same actions a real touch tap on "Pair Satellite"/"Ping
+    // Satellite" would, from Serial input. This is deliberately retained (Task
+    // 20): the automated hardware-verification harness has no physical touch
+    // access to the device, so this is the only way to exercise send_ping()
+    // (and re-run pairing) headlessly for regression checks. It calls the exact
+    // same code paths the UI tiles do -- no behavioral divergence from a real
+    // tap. 'k' opens the pairing screen (generates/logs the PSK); 'p' calls
+    // PingFeature::send_ping(). Safe to remove once touch-driven CI exists.
+    if (Serial.available()) {
+        char c = Serial.read();
+        if (c == 'k') {
+            Serial.println("quarky-tab5: [debug] opening pairing screen via serial trigger");
+            ScreenStack::push(build_pairing_screen());
+        } else if (c == 'p') {
+            Serial.println("quarky-tab5: [debug] send_ping() via serial trigger");
+            PingFeature::send_ping();
+        }
+    }
+    // --- end temporary aid ---
 
     // Task 19: derive the shell status bar's link label from how recently
     // each C2 transport last received a frame. Neither transport has a peer

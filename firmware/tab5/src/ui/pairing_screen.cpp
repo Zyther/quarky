@@ -84,6 +84,19 @@ lv_obj_t *build_pairing_screen() {
     } else {
         Serial.println("quarky-tab5: loaded existing PSK from NVS");
     }
+    // Task 20 verification aid: the hex string below is the same one
+    // rendered on-screen (see render_qr_canvas) for a human to read off the
+    // display and hardcode into Cardputer-ADV's test_psk. Logging it here too
+    // means it's also readable over the physically-attached USB serial
+    // connection -- useful for bench/CI verification without needing someone
+    // to look at the screen. Not a networked exposure; this is a local
+    // pairing flow already designed to be human-read off-device.
+    {
+        char psk_hex[33];
+        for (int i = 0; i < 16; i++) sprintf(psk_hex + i * 2, "%02X", psk[i]);
+        psk_hex[32] = '\0';
+        Serial.printf("quarky-tab5: pairing PSK (hex) = %s\n", psk_hex);
+    }
 
     render_qr_canvas(screen, psk);
 

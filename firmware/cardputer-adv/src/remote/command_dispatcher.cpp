@@ -1,4 +1,5 @@
 #include "command_dispatcher.h"
+#include "../features/ping_feature.h"
 #include <Arduino.h>
 #include <cstring>
 
@@ -68,12 +69,17 @@ void handle(const c2proto::Frame &frame, IC2Link &link, FeatureRegistry &registr
             return;
         }
 
-        // m's start/stop callback is invoked here once Phase 2+ modules add
-        // one to FeatureModule's struct; Task 4's contract only carries
-        // id/name/category/affinity today, and Task 20 (ping) extends it
-        // with actual start/stop/telemetry function pointers.
+        if (frame.type == c2proto::MsgType::CMD_START_FEATURE && strcmp(m->id, "ping") == 0) {
+            PingFeature::handle_start(link, frame.seq);
+            return;
+        }
+
+        // Unknown/unsupported feature id, or a start/stop request for a
+        // module with no callback wired up yet -- silently ignored beyond
+        // this log line. Tab5's capability check (populated from
+        // CMD_GET_STATUS) should prevent this in practice.
         Serial.printf("quarky-cardputer-adv: command_dispatcher: %s requested for feature '%s' "
-                       "(no start/stop callback wired yet -- see Task 20)\n",
+                       "(no start/stop callback wired yet)\n",
                        frame.type == c2proto::MsgType::CMD_START_FEATURE ? "start" : "stop", m->id);
         return;
     }

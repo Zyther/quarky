@@ -2,7 +2,9 @@
 #include "screen_stack.h"
 #include "keyboard_test_screen.h"
 #include "pairing_screen.h"
+#include "../features/ping_feature.h"
 #include <lvgl.h>
+#include <cstring>
 
 lv_obj_t *Shell::status_bar_ = nullptr;
 
@@ -30,6 +32,16 @@ lv_obj_t *Shell::build(FeatureRegistry &registry) {
         lv_obj_set_size(tile, 200, 100);
         lv_obj_t *label = lv_label_create(tile);
         lv_label_set_text(label, m.name);
+
+        // Task 20: only "ping" exists today, so this is the sole tile wired
+        // to a real click handler; a Phase 2+ feature would need its own
+        // dispatch (e.g. a table keyed by m.id) rather than this hardcoded
+        // check, once more than one UTILITY module is registered.
+        if (strcmp(m.id, "ping") == 0) {
+            lv_obj_add_event_cb(tile, [](lv_event_t *e) {
+                PingFeature::send_ping();
+            }, LV_EVENT_CLICKED, nullptr);
+        }
     });
 
     // Debug launcher tile for testing lv_keyboard

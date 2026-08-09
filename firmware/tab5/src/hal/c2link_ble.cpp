@@ -153,7 +153,18 @@ static const struct ble_gatt_chr_def s_chrs[] = {
     {
         .uuid = &kRxCharUUID.u,
         .access_cb = rx_access_cb,
-        .flags = BLE_GATT_CHR_F_WRITE,
+        // Declare BOTH write-with-response (Write Request) and
+        // write-without-response (Write Command). The Cardputer-ADV client's
+        // C2LinkBle::send() issues an ATT Write Command (writeValue(...,
+        // response=false)) for its reply direction; NimBLE-Arduino's client does
+        // NOT verify the peer characteristic advertises WRITE_NO_RSP before
+        // firing ble_gattc_write_no_rsp_flat(), and a GATT server silently drops
+        // a Write Command to a characteristic missing this flag (Task 20 BLE
+        // bug: RESP_TELEMETRY never arrived). Advertising WRITE_NO_RSP here makes
+        // the server accept those Commands (rx_access_cb still fires with
+        // BLE_GATT_ACCESS_OP_WRITE_CHR for both write kinds), fixing the reply
+        // path without any client-side change. See task-20-report.md.
+        .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
     },
     {
         .uuid = &kTxCharUUID.u,
