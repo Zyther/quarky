@@ -189,7 +189,8 @@ void loop() {
     c2link_wifi.poll(); // no-ops when the AP never came up
     c2link_ble.poll();  // drains BLE frames received on the NimBLE host task
 
-    // --- Serial-driven headless-verification aid (intentionally kept) ---
+#ifdef QUARKY_SERIAL_DEBUG
+    // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
     // Drives the same actions a real touch tap on "Pair Satellite"/"Ping
     // Satellite" would, from Serial input. This is deliberately retained (Task
     // 20): the automated hardware-verification harness has no physical touch
@@ -197,7 +198,14 @@ void loop() {
     // (and re-run pairing) headlessly for regression checks. It calls the exact
     // same code paths the UI tiles do -- no behavioral divergence from a real
     // tap. 'k' opens the pairing screen (generates/logs the PSK); 'p' calls
-    // PingFeature::send_ping(). Safe to remove once touch-driven CI exists.
+    // PingFeature::send_ping().
+    //
+    // Gated behind QUARKY_SERIAL_DEBUG (off by default -- not in platformio.ini
+    // build_flags) per task review: an unconditionally-compiled single-byte
+    // trigger on the same UART used for real console/debug traffic risks
+    // firing on stray line noise or incidental text in production firmware.
+    // Pass `-DQUARKY_SERIAL_DEBUG` (e.g. via `pio run -t upload
+    // --build-flags="-DQUARKY_SERIAL_DEBUG"`) for hardware-verification runs.
     if (Serial.available()) {
         char c = Serial.read();
         if (c == 'k') {
@@ -208,7 +216,8 @@ void loop() {
             PingFeature::send_ping();
         }
     }
-    // --- end temporary aid ---
+    // --- end debug aid ---
+#endif
 
     // Task 19: derive the shell status bar's link label from how recently
     // each C2 transport last received a frame. Neither transport has a peer
