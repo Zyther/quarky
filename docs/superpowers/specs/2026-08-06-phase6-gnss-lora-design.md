@@ -1,8 +1,8 @@
-# Phase 5: GNSS/SX1262 LoRa on Cardputer-ADV — Design
+# Phase 6: GNSS/SX1262 LoRa on Cardputer-ADV — Design
 
 **Status:** Draft for review
 **Date:** 2026-08-06
-**Depends on:** Phase 1 Foundation — Cardputer-ADV `Device`/`IC2Link`/`CommandDispatcher`/`FeatureModule` contract; Phase 4's `hat_radio_lock` pattern (extended here to a second hat, since the GNSS/SX1262 hat is physically separate from the CC1101/nRF24 hydra hat and can run concurrently with it).
+**Depends on:** Phase 1 Foundation — Cardputer-ADV `Device`/`IC2Link`/`CommandDispatcher`/`FeatureModule` contract; Phase 5's `hat_radio_lock` pattern (extended here to a second hat, since the GNSS/SX1262 hat is physically separate from the CC1101/nRF24 hydra hat and can run concurrently with it).
 **Scope:** LoRa (SX1262) and GNSS features on the owner's confirmed GNSS+SX1262 hat. This is the weakest-precedent phase — none of the three donor projects have a working, complete implementation to port from directly, so more of this phase is original design than adaptation.
 
 ## 1. Why This Phase Is Different From 2–4
@@ -57,7 +57,7 @@ firmware/cardputer-adv/src/features/
 
 ### 3.2 Cross-Device Wardriving Coordination (New Protocol Surface)
 
-This is the one place in Phase 5 that extends `shared/c2proto` beyond what Phase 1 defined. Two workable shapes:
+This is the one place in Phase 6 that extends `shared/c2proto` beyond what Phase 1 defined. Two workable shapes:
 
 **Option A — push model:** Cardputer-ADV streams `RESP_TELEMETRY` frames containing GPS fixes at a fixed interval (e.g. 1Hz) whenever wardriving mode is active; Tab5 buffers the latest fix and stamps it onto WiFi scan results as they arrive locally.
 
@@ -67,11 +67,11 @@ Recommend **Option A** — wardriving is inherently a streaming/continuous activ
 
 ### 3.3 Hat Radio Exclusivity
 
-Unlike Phase 4's CC1101/nRF24, the GNSS+SX1262 hat is a **separate physical unit** from the hydra hat (per the owner's confirmed hardware inventory: two distinct hats). Confirm during implementation whether Cardputer-ADV's SPI bus can genuinely run both hats concurrently (UniGeek's research noted SD, LoRa-CS, CC1101, and nRF24 all share *one* SPI bus electrically, even though LoRa's chip-select is a separate pin from CC1101/nRF24's) — if concurrent operation isn't reliable, extend `hat_radio_lock` (Phase 4) to arbitrate three-way (CC1101 / nRF24 / SX1262) rather than assuming the GNSS/SX1262 hat is automatically free of the exclusivity constraint just because it's a different physical unit.
+Unlike Phase 5's CC1101/nRF24, the GNSS+SX1262 hat is a **separate physical unit** from the hydra hat (per the owner's confirmed hardware inventory: two distinct hats). Confirm during implementation whether Cardputer-ADV's SPI bus can genuinely run both hats concurrently (UniGeek's research noted SD, LoRa-CS, CC1101, and nRF24 all share *one* SPI bus electrically, even though LoRa's chip-select is a separate pin from CC1101/nRF24's) — if concurrent operation isn't reliable, extend `hat_radio_lock` (Phase 5) to arbitrate three-way (CC1101 / nRF24 / SX1262) rather than assuming the GNSS/SX1262 hat is automatically free of the exclusivity constraint just because it's a different physical unit.
 
 ## 4. Risks / Open Questions
 
-- **Highest implementation risk in the whole program**: this phase has no working reference implementation to port, only a driver library (RadioLib) and a feature list (Poseidon's, unverified). Budget more exploratory/spike time here than Phases 2–4, which are genuine ports.
+- **Highest implementation risk in the whole program**: this phase has no working reference implementation to port, only a driver library (RadioLib) and a feature list (Poseidon's, unverified). Budget more exploratory/spike time here than Phases 2–5, which are genuine ports.
 - **Meshtastic protocol compatibility** depends on tracking Meshtastic's own protobuf schema versions — verify against a current Meshtastic device/app if available, since a stale schema silently fails to decode rather than erroring clearly.
 - **SPI bus sharing between the two hats** is unconfirmed (Section 3.3) — resolve early, since it determines whether `hat_radio_lock` needs a three-way extension or the GNSS/SX1262 hat is genuinely independent.
 - **GNSS cold-fix time** (potentially several minutes outdoors, longer/never indoors) means on-device testing for this phase needs actual outdoor time with sky visibility — plan bring-up sessions accordingly rather than expecting quick desk-testing turnaround.

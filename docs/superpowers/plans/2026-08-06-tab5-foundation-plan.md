@@ -1916,7 +1916,7 @@ git commit -m "Add Tab5 BLE GATT C2 transport (IC2Link second transport)"
 - Modify: `firmware/cardputer-adv/platformio.ini`
 
 **Interfaces:**
-- Produces: `Device` singleton (`Device::instance()`) exposing `display()` (ST7789 240×135), `keyboard()` (TCA8418), matching UniGeek's `Device`/`IDisplay`/`IKeyboard` pattern. This is the base every later Cardputer-ADV feature (Phases 4–5) and the remote dispatcher (Task 15) builds on.
+- Produces: `Device` singleton (`Device::instance()`) exposing `display()` (ST7789 240×135), `keyboard()` (TCA8418), matching UniGeek's `Device`/`IDisplay`/`IKeyboard` pattern. This is the base every later Cardputer-ADV feature (Phases 5–6) and the remote dispatcher (Task 15) builds on.
 
 - [ ] **Step 1: Write the pin config from confirmed UniGeek values**
 
@@ -1938,7 +1938,7 @@ git commit -m "Add Tab5 BLE GATT C2 transport (IC2Link second transport)"
 #define CP_ADV_LORA_CS_PIN   5
 #define CP_ADV_CC1101_CS_PIN 1
 #define CP_ADV_CC1101_GDO0_PIN 2
-#define CP_ADV_NRF24_CSN_PIN 1  // shared with CC1101_CS -- electrically exclusive, see Phase 4 spec
+#define CP_ADV_NRF24_CSN_PIN 1  // shared with CC1101_CS -- electrically exclusive, see Phase 5 spec
 #define CP_ADV_NRF24_CE_PIN  2  // shared with CC1101_GDO0
 ```
 
@@ -2270,7 +2270,7 @@ git commit -m "Add Cardputer-ADV WiFi C2 client and command dispatcher, replacin
 
 **Interfaces:**
 - Consumes: `Device` from Task 14.
-- Produces: `LocalMenu::tick()` — a minimal keyboard-navigable menu proving the device remains fully operable standalone, independent of any Tab5 connection. This is the baseline every Phase 4/5 local feature adds a menu entry to, and the reference against which "remote control is additive, not a replacement" (spec constraint) is checked.
+- Produces: `LocalMenu::tick()` — a minimal keyboard-navigable menu proving the device remains fully operable standalone, independent of any Tab5 connection. This is the baseline every Phase 5/5 local feature adds a menu entry to, and the reference against which "remote control is additive, not a replacement" (spec constraint) is checked.
 
 - [ ] **Step 1: Write a minimal local menu**
 
@@ -2300,7 +2300,7 @@ void LocalMenu::init() {
 void LocalMenu::tick() {
     // Real keyboard polling reads TCA8418 interrupt/registers via Device;
     // this bring-up version proves the menu loop runs without crashing.
-    // Phase 4+ replaces this stub with real ';'/'.' up/down navigation
+    // Phase 5+ replaces this stub with real ';'/'.' up/down navigation
     // and Enter/Backspace select/back, matching UniGeek's nav convention.
 }
 ```
@@ -3059,7 +3059,7 @@ git commit -m "Record foundation phase bring-up verification against Definition 
 - **Spec coverage:** every Definition-of-Done item (spec §8) maps to a task (see Task 21's table). Every architectural component in spec §4 (repo layout, device roles, HAL interfaces, UI shell, C2 protocol, feature contract) has a corresponding task. The illustrative data-flow example in spec §5 is Task 20.
 - **Placeholder scan:** GPIO pin values that genuinely cannot be sourced from this research pass (Tab5 backlight/reset GPIOs, GT911 exact pins, Cardputer-ADV keyboard interrupt pin, HY2.0 port assignment for RF433) are explicitly marked with `-1 // TODO` and a named authoritative source to consult, rather than silently invented — this is a deliberate, flagged exception to "no placeholders," since fabricating hardware register values as if verified would be worse than marking them honestly unverified.
 - **Type consistency:** `c2proto::Frame`/`MsgType` used identically across Tasks 2, 11, 13, 15, 17, 20. `FeatureModule`/`FeatureRegistry` signatures from Task 4 are extended (not renamed) in Task 20 — `for_each_in_category`, `find_by_id`, `register_module` keep the same names/signatures throughout.
-- **Scope check:** this plan covers Phase 1 only, as scoped. Phases 2–7 are separate specs/plans per the program roadmap.
+- **Scope check:** this plan covers Phase 1 only, as scoped. Phases 2–8 are separate specs/plans per the program roadmap.
 - **Amendment (2026-08-07):** Tasks 2–4 corrected to place `shared/c2proto` and `shared/feature_contract` sources under `src/` (not the package root), and Tasks 7 and 15 gained a `lib_extra_dirs = ../../shared` step — discovered during Task 2's execution that the original root-level layout both failed PlatformIO's native test auto-compilation and, more seriously, was never actually wired into either firmware's build at all (Tasks 11/13/15/17/20 would have failed to link). All firmware-side includes changed from relative `../../../shared/...` paths to plain `<proto.h>`/`<crypto.h>`/`<feature_registry.h>`, resolved via PlatformIO's Library Dependency Finder.
 - **Amendment (2026-08-07, Task 3 execution):** `shared/c2proto/test/` actually ended up as per-suite subdirectories (`test/test_proto/test_proto.cpp`, `test/test_crypto/test_crypto.cpp`) rather than flat files as Tasks 2/3's text above shows — PlatformIO's native platform links every flat `test/*.cpp` file into one binary, so a second flat test file collided with the first over a duplicate `main()`. Tasks 2/3's code blocks above are left as originally written (the content is unchanged, only the containing directory), and this note is the record of the actual final layout. No other task's file paths were affected — `shared/feature_contract` (Task 4) is a separate PlatformIO project with only one test file, so it doesn't hit this.
 - **Amendment (2026-08-07, Task 11 execution — major):** ESP-NOW, the originally-designed C2 control-channel transport (Tasks 11/15), has no implementation for the ESP32-P4 in the installed Arduino-ESP32 framework — esp-hosted's WiFi remoting to the C6 co-processor doesn't proxy the ESP-NOW API surface at all (verified: no `libespnow.a` for `esp32p4`, unlike every other Espressif target; zero ESP-NOW entries among the ~89 functions `esp_wifi_remote_api.h` actually proxies). Per the project owner's direction, redesigned Tasks 11/13/15/17/19/20 around two transports selected by which radio is free: WiFi TCP socket (folding in what was Task 13's separate bulk channel, since ESP-NOW's payload ceiling that motivated the split no longer applies) and BLE GATT via NimBLE (confirmed working on the P4 — `libbt.a` links `ble_hs_init`, unlike ESP-NOW). `IC2Link`'s shape simplified in the process (no more per-message MAC/peer addressing, since both transports are single persistent connections rather than ESP-NOW's connectionless peer model) — this simplification applies retroactively to Tasks 11/13/15/17/20's text above, all already written against the corrected shape. See the foundation spec's §4.5 for the full design rationale, and the SDD ledger for the verification trail (independently re-confirmed by the controller before the redesign was approved).

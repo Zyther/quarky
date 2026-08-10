@@ -1,4 +1,4 @@
-# Phase 6: ESP32-C5 5GHz Sidecar — Design
+# Phase 7: ESP32-C5 5GHz Sidecar — Design
 
 **Status:** Draft for review
 **Date:** 2026-08-06
@@ -47,12 +47,12 @@ Per the Phase 1 foundation spec's device-role definition, the C5 node is a **pur
 
 ### 2.4 Zigbee Scoping Decision
 
-Flagged in Section 1: the C6 co-processor (already on the Tab5) supports 802.15.4/Zigbee/Thread natively, per Phase 1's confirmed hardware research. Recommend Zigbee sniffing be scoped as a **Tab5-native feature (added to Phase 2's WiFi/BLE suite retroactively, or its own small Phase 2.5)** rather than built into this C5 node, since it doesn't need 5GHz and doesn't need a satellite at all — TRIDENT only has it because Poseidon's Cardputer (ESP32-S3) has no 802.15.4 capability of its own, which is not our situation. This should be confirmed with the project owner before the Phase 6 implementation plan is written, since it changes which phase's plan actually contains this feature.
+Flagged in Section 1: the C6 co-processor (already on the Tab5) supports 802.15.4/Zigbee/Thread natively, per Phase 1's confirmed hardware research. Recommend Zigbee sniffing be scoped as a **Tab5-native feature (added to Phase 2's WiFi/BLE suite retroactively, or its own small Phase 2.5)** rather than built into this C5 node, since it doesn't need 5GHz and doesn't need a satellite at all — TRIDENT only has it because Poseidon's Cardputer (ESP32-S3) has no 802.15.4 capability of its own, which is not our situation. This should be confirmed with the project owner before the Phase 7 implementation plan is written, since it changes which phase's plan actually contains this feature.
 
 ## 3. Risks / Open Questions
 
 - **Hardware not yet acquired** (Section header note) — this phase can be fully spec'd and implementation-planned ahead of time, but on-device Definition-of-Done verification blocks on the owner acquiring an ESP32-C5 dev board.
-- **ESP-IDF/Arduino boundary**: `shared/c2proto` and `shared/feature_contract` need to prove they genuinely compile as a plain ESP-IDF component with no hidden Arduino-only assumptions creeping in from Phases 2–5's work on the Arduino targets — worth a compile-check spike early in this phase rather than discovering an Arduino dependency crept in only once this phase is underway.
+- **ESP-IDF/Arduino boundary**: `shared/c2proto` and `shared/feature_contract` need to prove they genuinely compile as a plain ESP-IDF component with no hidden Arduino-only assumptions creeping in from Phases 2–6's work on the Arduino targets — worth a compile-check spike early in this phase rather than discovering an Arduino dependency crept in only once this phase is underway.
 - **PMKID/handshake capture exfiltration** over the Phase 1 bulk WiFi socket depends on the C5 node being able to join the same WiFi network as the Tab5 (or run its own AP) — TRIDENT's original design didn't need this since it stayed within ESP-NOW's limits by accepting the fragmentation constraint; confirm the bulk-channel approach (a deliberate improvement over TRIDENT) doesn't reintroduce complexity TRIDENT avoided by simply accepting smaller capture windows.
 - **Zigbee scoping** (Section 2.4) should be settled as an explicit decision, not left ambiguous, before this phase's implementation plan is written.
 

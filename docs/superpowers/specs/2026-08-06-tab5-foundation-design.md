@@ -94,7 +94,7 @@ quarky/
 │   │   │   ├── remote/          # C2 command dispatcher → local feature invocation
 │   │   │   └── main.cpp
 │   │   └── boards/cardputer-adv/
-│   └── c5-node/                # ESP32-C5 target — not built in this phase (Phase 6)
+│   └── c5-node/                # ESP32-C5 target — not built in this phase (Phase 7)
 ├── shared/
 │   ├── c2proto/                 # wire protocol: framing, ESP-NOW + WiFi-socket transport, PSK crypto
 │   │   ├── proto.h              # message types, frame structs
@@ -112,7 +112,7 @@ quarky/
 
 - **Tab5 — command center.** Owns the LVGL UI and all user interaction (touch + on-screen keyboard). Runs WiFi/BLE natively via the C6 co-processor, transparently through esp-hosted's WiFiRemote (Arduino `WiFi.h`/NimBLE APIs work unmodified). Hosts the NFC, RFID2, RF433R, and RF433T HY2.0 units directly. Dispatches commands to satellites and renders their telemetry/results. This is the single point of interaction for the whole suite.
 - **Satellite (present phase: Cardputer-ADV) — not headless.** Retains its own screen and physical keyboard; can run fully standalone with its local menu system unmodified (important for field use without the Tab5). A remote-control mode layers on top, accepting commands from the Tab5 over the C2 link and streaming results back, without disabling local operation. Hosts IR, the CC1101/nRF24 hydra hat, and the GNSS/SX1262 hat.
-- **Satellite (future, Phase 6: C5-node) — pure satellite.** No UI. ESP-NOW controlled directly by the Tab5 (not routed through Cardputer-ADV). Hosts 5GHz WiFi only.
+- **Satellite (future, Phase 7: C5-node) — pure satellite.** No UI. ESP-NOW controlled directly by the Tab5 (not routed through Cardputer-ADV). Hosts 5GHz WiFi only.
 
 ### 4.3 Hardware Abstraction Layer
 
@@ -167,9 +167,9 @@ Both firmware targets adopt UniGeek's interface-based `Device` HAL pattern — t
 5. No per-session pairing ceremony required after initial setup — chosen over interactive per-session pairing as the right tradeoff for a personal 2–3-device kit rather than a fleet.
 6. The same key authenticates both transports (WiFi HMAC frames and BLE GATT frames) — one pairing ceremony, not one per transport.
 
-**Command surface is deliberately minimal in v1** — the message types listed above and nothing feature-specific. Feature parameters and telemetry ride inside a generic payload blob defined per feature module (see below), so Phases 2–7 can add features without ever touching the core protocol.
+**Command surface is deliberately minimal in v1** — the message types listed above and nothing feature-specific. Feature parameters and telemetry ride inside a generic payload blob defined per feature module (see below), so Phases 2–8 can add features without ever touching the core protocol.
 
-**Forward note for Phase 6 (ESP32-C5 sidecar):** the C5 has native WiFi and BLE (no P4-style remoting gap), so its link to the Tab5 is unaffected by this amendment — that design decision in the Phase 6 spec should be revisited only if it assumed ESP-NOW specifically; if so, apply the same WiFi/BLE dual-transport pattern there for consistency, since the Tab5 side of that link has the identical P4 constraint.
+**Forward note for Phase 7 (ESP32-C5 sidecar):** the C5 has native WiFi and BLE (no P4-style remoting gap), so its link to the Tab5 is unaffected by this amendment — that design decision in the Phase 7 spec should be revisited only if it assumed ESP-NOW specifically; if so, apply the same WiFi/BLE dual-transport pattern there for consistency, since the Tab5 side of that link has the identical P4 constraint.
 
 ### 4.6 Feature Module Contract (`shared/feature_contract`)
 
@@ -177,7 +177,7 @@ Establishes now, in the foundation, how every feature in every later phase plugs
 
 - **`FeatureModule` descriptor:** id, display name, category, target-device affinity (`TAB5_NATIVE` / `CARDPUTER_ADV` / `C5_NODE`), a parameter schema (drives an auto-generated LVGL input form — text field, frequency field, dropdown, etc.), and a telemetry/result renderer.
 - **Tab5-native features** (Phase 2 WiFi/BLE, Phase 3 NFC/RFID2/RF433) implement both the descriptor and the execution logic in one module.
-- **Remote features** (Phase 4 IR/CC1101/nRF24, Phase 5 LoRa/GNSS, Phase 6 5GHz) are split: the Tab5 side holds only the descriptor (parameter form + result rendering); the actual execution logic lives in the satellite's firmware. The descriptor builds a command payload from user input, ships it over `c2proto`, and renders whatever telemetry comes back.
+- **Remote features** (Phase 5 IR/CC1101/nRF24, Phase 6 LoRa/GNSS, Phase 7 5GHz) are split: the Tab5 side holds only the descriptor (parameter form + result rendering); the actual execution logic lives in the satellite's firmware. The descriptor builds a command payload from user input, ships it over `c2proto`, and renders whatever telemetry comes back.
 - **Static registration only** — all modules compiled directly into the firmware image and registered into a `FeatureRegistry` at startup, populating the app-launcher grid by category. No dynamic/runtime plugin loading at this scale.
 - **Capability negotiation at connect time:** when a satellite connects (or reconnects), it reports the feature IDs/versions it actually supports in firmware. The Tab5 UI grays out or hides any feature tile the connected satellite doesn't currently support, preventing a mismatched-firmware situation where a command is sent to a satellite that silently can't handle it — important given the goal of full feature parity across every donor firmware.
 
@@ -204,7 +204,7 @@ This proves the descriptor/dispatcher split, the ESP-NOW round trip, and the UI 
 
 - **SD card vs C6 SDIO bus sharing on Tab5** — expected to be separate SDIO hosts (matching Espressif's P4-Function-EV-Board reference design) but not yet confirmed against the actual Tab5 board; first item to verify in hardware bring-up, since a conflict here would affect the HAL design for both `IDisplay`'s asset loading and `IC2Link`'s bulk-transfer channel.
 - **esp-hosted WiFiRemote maturity under Arduino-ESP32 v3.x** — actively developed by Espressif but relatively new; version-mismatch issues between host and co-processor firmware have been reported in the wider community (P4↔C6 RPC timeouts). Foundation bring-up should pin specific tested versions of both the P4 and C6 firmware rather than tracking latest.
-- **CC1101/nRF24 mutual exclusivity on the hydra hat** (confirmed via UniGeek) means Phase 4's feature-module design must expose only one of the two as active at a time on Cardputer-ADV — the capability-negotiation mechanism in Section 4.6 should reflect this as a runtime constraint, not just a static capability list.
+- **CC1101/nRF24 mutual exclusivity on the hydra hat** (confirmed via UniGeek) means Phase 5's feature-module design must expose only one of the two as active at a time on Cardputer-ADV — the capability-negotiation mechanism in Section 4.6 should reflect this as a runtime constraint, not just a static capability list.
 - **LVGL performance at 1280×720 on ESP32-P4** — expected to be comfortable given the PPA and 32MB PSRAM, but not yet measured; worth a basic frame-rate check during bring-up before committing to heavier UI polish (animations, transitions) in later phases.
 
 ## 8. Definition of Done
@@ -223,8 +223,8 @@ Given all target hardware is in hand, this phase closes with real on-device veri
 
 ## 9. Explicitly Out of Scope for This Phase
 
-- Any actual offensive/defensive feature (WiFi attacks, BLE attacks, Sub-GHz, NFC operations, IR, LoRa, etc.) — all deferred to Phases 2–7.
-- ESP32-C5 satellite firmware (Phase 6).
+- Any actual offensive/defensive feature (WiFi attacks, BLE attacks, Sub-GHz, NFC operations, IR, LoRa, etc.) — all deferred to Phases 2–8.
+- ESP32-C5 satellite firmware (Phase 7).
 - Licensing/attribution cleanup for redistribution (explicitly deferred per project owner).
 - Interactive per-session pairing, key rotation, or multi-satellite fleet management beyond the single Cardputer-ADV pairing.
 - Camera (MIPI-CSI) usage on the Tab5.

@@ -1,9 +1,9 @@
-# Phase 7: Remaining Feature Sweep — Design
+# Phase 8: Remaining Feature Sweep — Design
 
 **Status:** Draft for review
 **Date:** 2026-08-06
-**Depends on:** Phases 1–6 all landed — this phase explicitly allocates each remaining donor feature to whichever device/pattern fits once the full architecture is proven out, per the program roadmap.
-**Scope:** Everything from Bruce/Poseidon/UniGeek not already covered by Phases 2–6: BadUSB/HID injection, FIDO2/KERBEROS, scripting engine, network-layer attacks, defensive/anomaly detection, GPS/wardriving polish, and smaller utility features.
+**Depends on:** Phases 1–7 all landed — this phase explicitly allocates each remaining donor feature to whichever device/pattern fits once the full architecture is proven out, per the program roadmap.
+**Scope:** Everything from Bruce/Poseidon/UniGeek not already covered by Phases 2–7: BadUSB/HID injection, FIDO2/KERBEROS, scripting engine, network-layer attacks, defensive/anomaly detection, GPS/wardriving polish, and smaller utility features.
 
 ## 1. Feature Inventory, Device Allocation, and Source Mapping
 
@@ -56,14 +56,14 @@
 ## 2. Architecture Notes
 
 - This phase is intentionally the least architecturally novel — its job is applying the `FeatureModule`/`FeatureRegistry` pattern (Phase 1) to a long tail of remaining features, mostly on the Tab5 (network/scripting/defensive/utility) with a smaller Cardputer-ADV group (BadUSB, KERBEROS — both tied to physical USB hardware).
-- KERBEROS's `lib/kerberos_core` vendoring (Section 1) is the one piece of this phase worth calling out architecturally: it should land as a near-verbatim vendored library with its existing native test suite intact, not a rewrite — matching this program's general principle (established across Phases 2–5) of porting proven donor logic rather than re-deriving it, applied here to the most rigorously-tested single component across all three donor codebases.
+- KERBEROS's `lib/kerberos_core` vendoring (Section 1) is the one piece of this phase worth calling out architecturally: it should land as a near-verbatim vendored library with its existing native test suite intact, not a rewrite — matching this program's general principle (established across Phases 2–6) of porting proven donor logic rather than re-deriving it, applied here to the most rigorously-tested single component across all three donor codebases.
 - The scripting engine's GPIO/display bindings (Bruce's original) should be redesigned as `FeatureRegistry` bindings (Section 1) — this is a deliberate improvement over the direct port pattern used elsewhere in this phase, since Bruce's original binding surface predates this program's feature-module contract and a straight port would bypass it.
 
 ## 3. Risks / Open Questions
 
-- **This phase's scope is the least certain of the whole program** — by design, it's "whatever's left," and its actual task list should be finalized only after Phases 2–6 reveal which architectural patterns really stuck and which needed adjustment. Treat this document as a starting allocation, not a locked plan.
+- **This phase's scope is the least certain of the whole program** — by design, it's "whatever's left," and its actual task list should be finalized only after Phases 2–7 reveal which architectural patterns really stuck and which needed adjustment. Treat this document as a starting allocation, not a locked plan.
 - **KERBEROS's "not yet stable" status** (Poseidon's own assessment) should carry forward as-is; don't represent this feature as more mature than its own donor project claims.
-- **Password manager secure storage** needs a real design decision (encrypted NVS partition vs. SD-based encrypted vault) before implementation — not addressed in this draft, flagged for the eventual Phase 7 implementation plan.
+- **Password manager secure storage** needs a real design decision (encrypted NVS partition vs. SD-based encrypted vault) before implementation — not addressed in this draft, flagged for the eventual Phase 8 implementation plan.
 
 ## 4. Testing Strategy
 

@@ -1,4 +1,4 @@
-# Phase 4: Cardputer-ADV Satellite — IR, CC1101 Hydra-Hat, nRF24 — Design
+# Phase 5: Cardputer-ADV Satellite — IR, CC1101 Hydra-Hat, nRF24 — Design
 
 **Status:** Draft for review
 **Date:** 2026-08-06
@@ -99,7 +99,7 @@ Cardputer-ADV's 240×135 screen is cramped for CC1101's spectrum/waterfall/radar
 1. Render locally on Cardputer-ADV at reduced fidelity (matches donor precedent, works standalone).
 2. Stream the raw scan data (not a rendered image) back to the Tab5 over the C2 bulk channel, where it's rendered at full 1280×720 fidelity using LVGL's `lv_chart` — a genuinely better experience than any donor project can offer on their native hardware, and a natural showcase for the "why build a Tab5 command center" premise.
 
-Recommend implementing (1) first for standalone parity, then (2) as a natural enhancement once the bulk channel is proven in Phase 1 — but this is a judgment call worth confirming with the project owner before the Phase 4 implementation plan locks it in.
+Recommend implementing (1) first for standalone parity, then (2) as a natural enhancement once the bulk channel is proven in Phase 1 — but this is a judgment call worth confirming with the project owner before the Phase 5 implementation plan locks it in.
 
 ## 3. Risks / Open Questions
 

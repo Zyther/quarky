@@ -28,7 +28,7 @@
 | Protocol decode/identify | UniGeek `utils/rf/M5RF433Util.*` — **direct match**, UniGeek has an M5-RF433-specific utility already, likely the closest possible reference for this exact hardware unit | Prioritize this over Bruce's generic rc-switch path if the pin/API shape matches the actual M5 RF433R/T unit |
 
 ### Explicitly out of scope for Phase 3 (belongs elsewhere)
-- Full CC1101-class spectrum analysis, waterfall, wideband 300–900MHz scanning, jamming — that's the hydra hat's CC1101, which lives on Cardputer-ADV (Phase 4). The RF433R/T unit is receive/transmit only at a fixed ~433MHz band with no SPI radio chip, so it cannot do any of this regardless of software.
+- Full CC1101-class spectrum analysis, waterfall, wideband 300–900MHz scanning, jamming — that's the hydra hat's CC1101, which lives on Cardputer-ADV (Phase 5). The RF433R/T unit is receive/transmit only at a fixed ~433MHz band with no SPI radio chip, so it cannot do any of this regardless of software.
 - KeeLoq rolling-code replay-plus-one (UniGeek's CC1101-based feature) — same reasoning, needs the CC1101's capability, not RF433R/T's.
 
 ## 2. Architecture

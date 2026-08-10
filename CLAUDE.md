@@ -3,9 +3,27 @@
 Unified offensive/defensive security suite firmware. M5Stack Tab5 (ESP32-P4 + ESP32-C6) as a touch-driven command center, controlling an M5Stack Cardputer-ADV (ESP32-S3) satellite over a dual WiFi/BLE C2 transport. Built by consolidating features from three donor firmwares (Bruce, Poseidon, UniGeek — all local checkouts under `~/src/`), authorized for derivation.
 
 Program is decomposed into phases; each phase has a design spec and (once its turn comes) an implementation plan:
-- Specs: `docs/superpowers/specs/2026-08-06-phaseN-*-design.md` (Phase 1 is `tab5-foundation-design.md`)
-- Plans: `docs/superpowers/plans/2026-08-06-*-plan.md`
+- Specs: `docs/superpowers/specs/<date>-phaseN-*-design.md` (Phase 1 is `tab5-foundation-design.md`)
+- Plans: `docs/superpowers/plans/<date>-*-plan.md`
 - Phase documentation (what was actually built): `docs/phases/phase-N-*.md`
+
+### Phase roadmap
+
+Phase numbers are execution order, **except Phase 10** (see note). Don't infer this list from spec filenames alone — the gap after 8 is intentional.
+
+| # | Name | Device | Status |
+|---|---|---|---|
+| 1 | Foundation | Both | Complete |
+| 2 | Tab5-Native 2.4GHz WiFi/BLE Suite | Tab5 | Not started |
+| 3 | Tab5-Native NFC/RFID2/RF433 Peripherals | Tab5 | Not started |
+| 4 | Chameleon Ultra 3.0 Integration | Tab5 (BLE-central, fallback via Cardputer-ADV relay) | Not started |
+| 5 | Cardputer-ADV Satellite — IR, CC1101 Hydra-Hat, nRF24 | Cardputer-ADV | Not started |
+| 6 | GNSS/SX1262 LoRa | Cardputer-ADV | Not started |
+| 7 | ESP32-C5 5GHz Sidecar | C5 (new satellite) | Not started |
+| 8 | Remaining Feature Sweep | Whichever fits | Not started |
+| 10 | Tab5-Native CC1101 via M-Bus | Tab5 | Not started |
+
+Phases 4-8 were renumbered from an original 4-7 spread when Phase 4 (Chameleon Ultra) was inserted on 2026-08-09, per the project owner's explicit direction to sequence it right before Phase 5's real Cardputer-ADV feature work. Phase 10 was deliberately given a non-sequential number (owner's choice, not a numbering mistake) when this hardware became available after the rest of the roadmap was drafted — it has no dependency on Phase 9 (which doesn't exist) and can run whenever its own M-Bus GPIO-mapping risk (see its spec) is resolved.
 
 ## Process: every phase ends with documentation, not just a Definition-of-Done check
 

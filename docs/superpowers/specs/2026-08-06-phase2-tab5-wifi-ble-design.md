@@ -3,7 +3,7 @@
 **Status:** Draft for review
 **Date:** 2026-08-06
 **Depends on:** Phase 1 Foundation (`2026-08-06-tab5-foundation-design.md`) — `IRadio` (esp-hosted WiFiRemote), `FeatureRegistry`, LVGL shell/launcher, `lv_keyboard` text-input pattern.
-**Scope:** Every WiFi and BLE feature that the ESP32-C6 co-processor can do natively (2.4GHz only — 5GHz is Phase 6, on a separate C5 satellite), running entirely on the Tab5 with no Cardputer-ADV involvement.
+**Scope:** Every WiFi and BLE feature that the ESP32-C6 co-processor can do natively (2.4GHz only — 5GHz is Phase 7, on a separate C5 satellite), running entirely on the Tab5 with no Cardputer-ADV involvement.
 
 ## 1. Feature Inventory and Source Mapping
 
@@ -22,7 +22,7 @@ Pulled directly from the Bruce and Poseidon research (both are 2.4GHz-native on 
 | Probe sniff | Poseidon | Passive |
 | PMKID + 4-way handshake capture | Bruce, Poseidon `wifi_pmkid.cpp` | Output format: `.pcap` or hashcat-compatible, written via Phase 1's bulk-transfer-capable SD storage |
 | 2.4GHz WiFi spectrum analyzer | Poseidon | RSSI sweep across channels 1–14 |
-| GPS wardrive + WiGLE export | Bruce `wardriving.cpp`/`wigle.cpp`, Poseidon `wifi_wardrive.h` | **Deferred to Phase 5** — needs GPS, which lives on the Cardputer-ADV's GNSS hat, not the Tab5. This entry is WiFi-scan logic only; the GPS-tagging half is a Phase 5 dependency. |
+| GPS wardrive + WiGLE export | Bruce `wardriving.cpp`/`wigle.cpp`, Poseidon `wifi_wardrive.h` | **Deferred to Phase 6** — needs GPS, which lives on the Cardputer-ADV's GNSS hat, not the Tab5. This entry is WiFi-scan logic only; the GPS-tagging half is a Phase 6 dependency. |
 | CIW zero-click (malicious SSID payloads) | Poseidon `triton.cpp` (157 payloads: cmd injection, Log4Shell, XSS, buffer overflow) | Payload library ported as static data, no logic changes needed |
 | Connect (join a network) | All three | Trivial `IRadio::connect_wifi` already exists from Phase 1 |
 
@@ -48,8 +48,8 @@ Pulled directly from the Bruce and Poseidon research (both are 2.4GHz-native on 
 
 ### Explicitly out of scope for Phase 2
 - BLE-based nRF52 features (Poseidon's `nrf52_hw.cpp` suite) — that's a different satellite hardware concept not part of this program's device inventory.
-- 5GHz anything — Phase 6.
-- Network-layer attacks riding on top of an established WiFi connection (Responder, SSDP, DHCP starvation, MITM, port scanning) — these aren't radio-specific; bundled into Phase 7's sweep since they're closer to "network toolkit" than "WiFi radio feature."
+- 5GHz anything — Phase 7.
+- Network-layer attacks riding on top of an established WiFi connection (Responder, SSDP, DHCP starvation, MITM, port scanning) — these aren't radio-specific; bundled into Phase 8's sweep since they're closer to "network toolkit" than "WiFi radio feature."
 
 ## 2. Architecture
 
@@ -97,7 +97,7 @@ Each feature screen follows the Phase 1 reference patterns directly:
 
 ### 2.3 Capture File Handling
 
-PMKID/handshake captures and BLE sniffer CSVs write to the Tab5's SD card (Phase 1 Task 10's `IStorage`/`StorageSD`), using the same directory convention as Bruce (`/BruceRF`-style top-level folders) adapted to `/quarky/captures/wifi/` and `/quarky/captures/ble/`. No new bulk-transfer protocol work needed here — these files stay local to the Tab5 that captured them; the C2 bulk channel (Phase 1) is for satellite-originated captures (Phase 4+), not Tab5-native ones.
+PMKID/handshake captures and BLE sniffer CSVs write to the Tab5's SD card (Phase 1 Task 10's `IStorage`/`StorageSD`), using the same directory convention as Bruce (`/BruceRF`-style top-level folders) adapted to `/quarky/captures/wifi/` and `/quarky/captures/ble/`. No new bulk-transfer protocol work needed here — these files stay local to the Tab5 that captured them; the C2 bulk channel (Phase 1) is for satellite-originated captures (Phase 5+), not Tab5-native ones.
 
 ## 3. Risks / Open Questions
 
