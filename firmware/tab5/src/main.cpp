@@ -15,6 +15,7 @@
 #include "ui/devices_panel.h"
 #include "ui/pairing_screen.h"
 #include "features/ping_feature.h"
+#include "features/wifi/wifi_scan.h"
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -89,6 +90,9 @@ void setup() {
     PingFeature::register_module(); // makes the "Ping Satellite" tile appear in
                                      // Shell::build's launcher grid (Task 7),
                                      // so this must run before Shell::build below
+    WifiScanFeature::register_module(); // Task 3: first WiFi-category tile
+                                         // (Category::WIFI), same reason --
+                                         // must run before Shell::build below
 
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
