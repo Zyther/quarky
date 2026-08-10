@@ -513,6 +513,8 @@ git commit -m "Add WiFi AP scan feature (Tab5-native, first WiFi category tile)"
 
 **Contingent on Task 2's result:** if Task 2 found the spoofed-source frame was silently dropped, this task as written does not apply — stop and get direction on re-scoping to Cardputer-ADV instead (per spec Section 3) rather than implementing a feature that cannot work. The steps below assume Task 2 confirmed spoofed-source frames do reach the air.
 
+> **DEFERRED (2026-08-10, real hardware result):** Task 2's real spike found `esp_wifi_80211_tx()` returns `ESP_ERR_NOT_SUPPORTED` on the Tab5 for both own-MAC and spoofed-MAC frames — worse than the "silently dropped" contingency above anticipated; raw frame injection isn't usable through esp-hosted WiFiRemote at all. Per the project owner's explicit direction, this task is **not implemented as part of this plan**. It is re-scoped to a Cardputer-ADV-affinity feature (native, non-hosted ESP32-S3 WiFi — no RPC-proxy limitation) and deferred to whichever future phase does real Cardputer-ADV WiFi feature work (Phase 5 or later), not attempted now. The steps below are left in place as real, considered design work — the frame-building logic (`wifi_tx_spike.h`'s `build_deauth_frame`, already merged) and the target-selection UI pattern remain valid reference material for whoever picks this up on Cardputer-ADV later; only the *host device* changes, not the underlying approach. Task 5 (WiFi Spectrum Analyzer) is next in this plan's actual execution order.
+
 - [ ] **Step 1: Promote the spike's frame-builder to a shared header**
 
 ```cpp
