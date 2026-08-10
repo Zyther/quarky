@@ -19,3 +19,11 @@ void FeatureRegistry::for_each_in_category(Category c, const std::function<void(
         if (modules_[i].category == c) fn(modules_[i]);
     }
 }
+
+int FeatureRegistry::count_in_category(Category c) const {
+    int n = 0;
+    for (int i = 0; i < count_; i++) {
+        if (modules_[i].category == c) n++;
+    }
+    return n;
+}

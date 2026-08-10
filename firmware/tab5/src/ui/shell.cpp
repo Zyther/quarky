@@ -5,8 +5,48 @@
 #include "../features/ping_feature.h"
 #include <lvgl.h>
 #include <cstring>
+#include <utility>
 
 lv_obj_t *Shell::status_bar_ = nullptr;
+
+static const struct { Category cat; const char *label; } kCategoryTiles[] = {
+    {Category::UTILITY, "Utility"},
+    {Category::WIFI, "WiFi"},
+    {Category::BLE, "BLE"},
+};
+
+// Registry captured by reference in the click handler's user_data (a pointer
+// to it, since FeatureRegistry outlives every screen -- it's a global in
+// main.cpp) so the category screen can be built lazily, on tap, rather than
+// pre-building all three up front.
+lv_obj_t *build_category_screen(FeatureRegistry &registry, Category cat) {
+    lv_obj_t *screen = lv_obj_create(nullptr);
+    lv_obj_set_layout(screen, LV_LAYOUT_GRID);
+
+    lv_obj_t *back = lv_button_create(screen);
+    lv_obj_align(back, LV_ALIGN_TOP_LEFT, 10, 10);
+    lv_obj_t *back_label = lv_label_create(back);
+    lv_label_set_text(back_label, "Back");
+    lv_obj_add_event_cb(back, [](lv_event_t *e) { ScreenStack::pop(); }, LV_EVENT_CLICKED, nullptr);
+
+    registry.for_each_in_category(cat, [screen](const FeatureModule &m) {
+        lv_obj_t *tile = lv_button_create(screen);
+        lv_obj_set_size(tile, 200, 100);
+        lv_obj_t *label = lv_label_create(tile);
+        lv_label_set_text(label, m.name);
+
+        // Generic dispatch: every registered module (this plan onward) is
+        // required (Global Constraints) to have a real on_start -- store the
+        // function pointer itself as the event's user_data so the click
+        // handler needs no per-id branching.
+        lv_obj_add_event_cb(tile, [](lv_event_t *e) {
+            FeatureStartFn fn = (FeatureStartFn)lv_event_get_user_data(e);
+            if (fn) fn();
+        }, LV_EVENT_CLICKED, (void *)m.on_start);
+    });
+
+    return screen;
+}
 
 lv_obj_t *Shell::build(FeatureRegistry &registry) {
     lv_obj_t *root = lv_obj_create(nullptr);
@@ -25,24 +65,20 @@ lv_obj_t *Shell::build(FeatureRegistry &registry) {
     lv_obj_set_size(launcher, LV_PCT(100), LV_PCT(100));
     lv_obj_set_layout(launcher, LV_LAYOUT_GRID);
 
-    // Populate one tile per registered feature module. In this phase only
-    // the Task 15 "ping" module exists, so the grid will show a single tile.
-    registry.for_each_in_category(Category::UTILITY, [launcher](const FeatureModule &m) {
+    // One tile per category that has at least one registered module --
+    // empty categories are skipped so e.g. BLE doesn't show as a dead end
+    // before this plan's BLE tasks land.
+    for (const auto &entry : kCategoryTiles) {
+        if (registry.count_in_category(entry.cat) == 0) continue;
         lv_obj_t *tile = lv_button_create(launcher);
         lv_obj_set_size(tile, 200, 100);
         lv_obj_t *label = lv_label_create(tile);
-        lv_label_set_text(label, m.name);
-
-        // Task 20: only "ping" exists today, so this is the sole tile wired
-        // to a real click handler; a Phase 2+ feature would need its own
-        // dispatch (e.g. a table keyed by m.id) rather than this hardcoded
-        // check, once more than one UTILITY module is registered.
-        if (strcmp(m.id, "ping") == 0) {
-            lv_obj_add_event_cb(tile, [](lv_event_t *e) {
-                PingFeature::send_ping();
-            }, LV_EVENT_CLICKED, nullptr);
-        }
-    });
+        lv_label_set_text(label, entry.label);
+        lv_obj_add_event_cb(tile, [](lv_event_t *e) {
+            auto *ctx = (std::pair<FeatureRegistry *, Category> *)lv_event_get_user_data(e);
+            ScreenStack::push(build_category_screen(*ctx->first, ctx->second));
+        }, LV_EVENT_CLICKED, new std::pair<FeatureRegistry *, Category>(&registry, entry.cat));
+    }
 
     // Debug launcher tile for testing lv_keyboard
     lv_obj_t *kb_test_tile = lv_button_create(launcher);
@@ -53,10 +89,6 @@ lv_obj_t *Shell::build(FeatureRegistry &registry) {
         ScreenStack::push(build_keyboard_test_screen());
     }, LV_EVENT_CLICKED, nullptr);
 
-    // Launcher tile for Task 12's pairing screen: generates/loads the PSK
-    // that authenticates both C2 transports (WiFi Task 11, BLE Task 13) and
-    // displays it as a QR code + hex string for Cardputer-ADV to be paired
-    // with.
     lv_obj_t *pairing_tile = lv_button_create(launcher);
     lv_obj_set_size(pairing_tile, 200, 100);
     lv_obj_t *pairing_label = lv_label_create(pairing_tile);

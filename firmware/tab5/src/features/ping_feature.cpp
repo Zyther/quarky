@@ -14,7 +14,11 @@ static uint16_t s_seq = 0;
 namespace PingFeature {
 
 void register_module() {
-    g_registry.register_module({"ping", "Ping Satellite", Category::UTILITY, Affinity::CARDPUTER_ADV});
+    // on_start wired to send_ping() so the Task 1 generic-dispatch launcher
+    // (shell.cpp's build_category_screen) can invoke it via m.on_start()
+    // instead of the old hardcoded strcmp(m.id, "ping") check -- without
+    // this, the tile would tap into a null function pointer and do nothing.
+    g_registry.register_module({"ping", "Ping Satellite", Category::UTILITY, Affinity::CARDPUTER_ADV, send_ping});
 }
 
 void send_ping() {

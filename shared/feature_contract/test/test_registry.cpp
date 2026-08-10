@@ -28,10 +28,21 @@ void test_for_each_in_category() {
     TEST_ASSERT_EQUAL_INT(1, count);
 }
 
+void test_count_in_category() {
+    FeatureRegistry r;
+    r.register_module({"a", "A", Category::WIFI, Affinity::TAB5_NATIVE});
+    r.register_module({"b", "B", Category::WIFI, Affinity::TAB5_NATIVE});
+    r.register_module({"c", "C", Category::BLE, Affinity::TAB5_NATIVE});
+    TEST_ASSERT_EQUAL(2, r.count_in_category(Category::WIFI));
+    TEST_ASSERT_EQUAL(1, r.count_in_category(Category::BLE));
+    TEST_ASSERT_EQUAL(0, r.count_in_category(Category::NFC));
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_register_and_find_by_id);
     RUN_TEST(test_duplicate_id_rejected);
     RUN_TEST(test_for_each_in_category);
+    RUN_TEST(test_count_in_category);
     return UNITY_END();
 }
