@@ -1,5 +1,6 @@
 #include "wifi_scan.h"
 #include "wifi_common.h"
+#include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
 #include <feature_registry.h>
 #include <lvgl.h>
@@ -9,23 +10,53 @@ extern FeatureRegistry g_registry;
 
 namespace WifiScanFeature {
 
+static lv_obj_t *s_list = nullptr;
+
 static lv_obj_t *build_screen() {
-    lv_obj_t *screen = lv_obj_create(nullptr);
-    lv_obj_set_layout(screen, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(screen, LV_FLEX_FLOW_COLUMN);
+    // Menu-bar Back button + flex content area, same as every other
+    // sub-screen -- see ui/screen_scaffold.cpp.
+    lv_obj_t *content = nullptr;
+    lv_obj_t *screen = build_sub_screen("WiFi Scan", &content);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
 
-    lv_obj_t *back = lv_button_create(screen);
-    lv_obj_t *back_label = lv_label_create(back);
-    lv_label_set_text(back_label, "Back");
-    lv_obj_add_event_cb(back, [](lv_event_t *e) { ScreenStack::pop(); }, LV_EVENT_CLICKED, nullptr);
+    s_list = lv_list_create(content);
+    lv_obj_set_size(s_list, LV_PCT(100), LV_PCT(100));
+    lv_list_add_text(s_list, "Scanning...");
+    // The list dies with the screen when Back is tapped (ScreenStack::pop()
+    // deletes it). Clearing s_list from the widget's own delete event, rather
+    // than from the Back button's click handler, covers every path that can
+    // destroy it -- including a pop triggered from somewhere else -- so
+    // run_scan_and_populate() can never write through a dangling pointer.
+    lv_obj_add_event_cb(s_list, [](lv_event_t *e) { s_list = nullptr; }, LV_EVENT_DELETE, nullptr);
 
-    lv_obj_t *list = lv_list_create(screen);
-    lv_obj_set_size(list, LV_PCT(100), LV_PCT(85));
+    return screen;
+}
+
+// Polled from an LVGL timer rather than run inline: see wifi_common.h for why
+// the blocking scan this replaced locked the device solid. Everything here
+// runs on the LVGL task between lv_timer_handler() iterations, so the screen
+// stays responsive -- Back included -- for the whole scan.
+static void scan_poll_timer_cb(lv_timer_t *timer) {
+    if (!s_list) { // Back was tapped; the list (and screen) are gone
+        lv_timer_delete(timer);
+        return;
+    }
 
     static WifiApInfo aps[32];
-    int n = wifi_scan_aps(aps, 32);
+    int n = wifi_scan_poll(aps, 32);
+    if (n == -1) {
+        return; // still scanning
+    }
+    lv_timer_delete(timer);
+
+    lv_obj_clean(s_list);
+    if (n == -2) {
+        lv_list_add_text(s_list, "Scan failed or timed out");
+        return;
+    }
     if (n == 0) {
-        lv_list_add_text(list, "No networks found");
+        lv_list_add_text(s_list, "No networks found");
+        return;
     }
     for (int i = 0; i < n; i++) {
         char bssid_str[18];
@@ -33,10 +64,8 @@ static lv_obj_t *build_screen() {
         char row[80];
         snprintf(row, sizeof(row), "%s  ch%d  %ddBm  %s", aps[i].ssid,
                  aps[i].channel, aps[i].rssi, aps[i].open ? "OPEN" : "");
-        lv_list_add_button(list, LV_SYMBOL_WIFI, row);
+        lv_list_add_button(s_list, LV_SYMBOL_WIFI, row);
     }
-
-    return screen;
 }
 
 void register_module() {
@@ -44,8 +73,57 @@ void register_module() {
                                  Affinity::TAB5_NATIVE, start, nullptr});
 }
 
+// -----------------------------------------------------------------------------
+// The scan itself is DISABLED pending an ESP32-C6 co-processor firmware update.
+//
+// Measured on real hardware 2026-08-10. Opening this screen and starting a scan
+// wedges the entire device: serial output stops dead, touch stops, LVGL stops,
+// and only a hardware reset recovers it. Established by bisection with serial
+// probes around every call in wifi_scan_begin():
+//
+//   * WiFi.scanDelete(), WiFi.mode(...) and WiFi.scanNetworks(true) all RETURN
+//     normally -- scanNetworks(true) returns WIFI_SCAN_RUNNING as designed.
+//     The device dies some time AFTER the scan is handed to the radio, which
+//     rules out the UI, the LVGL task and this file's own logic.
+//   * It is not AP/STA coexistence. Tried again in STA-only mode, with
+//     c2link_wifi's SoftAP torn down: identical wedge.
+//
+// So: any esp-hosted WiFi scan hangs this board. WiFi here is proxied over SDIO
+// to the onboard ESP32-C6, and every boot logs a version skew that is the prime
+// suspect:
+//
+//   hostedHasUpdate(): Host firmware version: 2.12.11
+//   hostedHasUpdate(): Slave firmware version: 1.4.1
+//   hostedHasUpdate(): Version on Host is NEWER than version on co-processor
+//   hostedHasUpdate(): Update URL:
+//       https://espressif.github.io/arduino-esp32/hosted/esp32c6-v2.12.11.bin
+//
+// TO RE-ENABLE: flash the C6 with the firmware at that URL, flip kScanEnabled
+// to true, and re-test. The scan path below is complete and correct -- it is
+// gated, not stubbed -- so that is the only change needed. Until then a tap on
+// the "WiFi Scan" tile must not brick the device, which is what this guard
+// buys.
+// -----------------------------------------------------------------------------
+static constexpr bool kScanEnabled = false;
+
 void start() {
     ScreenStack::push(build_screen());
+
+    if (!kScanEnabled) {
+        lv_obj_clean(s_list);
+        lv_list_add_text(s_list, "WiFi scan unavailable");
+        lv_list_add_text(s_list, "The ESP32-C6 radio co-processor needs a firmware");
+        lv_list_add_text(s_list, "update before it can scan without hanging the device.");
+        lv_list_add_text(s_list, "See the note in features/wifi/wifi_scan.cpp.");
+        return;
+    }
+
+    if (!wifi_scan_begin()) {
+        lv_obj_clean(s_list);
+        lv_list_add_text(s_list, "Could not start scan (radio unavailable)");
+        return;
+    }
+    lv_timer_create(scan_poll_timer_cb, 250, nullptr);
 }
 
 } // namespace WifiScanFeature

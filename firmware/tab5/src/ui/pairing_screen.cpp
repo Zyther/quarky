@@ -1,4 +1,5 @@
 #include "pairing_screen.h"
+#include "screen_scaffold.h"
 #include "screen_stack.h"
 #include "../hal/psk_store.h"
 #include <crypto.h>
@@ -40,7 +41,9 @@ static void render_qr_canvas(lv_obj_t *parent, const uint8_t psk[16]) {
 
     lv_obj_t *hex_label = lv_label_create(parent);
     lv_label_set_text(hex_label, hex); // shown alongside the QR since Cardputer-ADV has no camera
-    lv_obj_align(hex_label, LV_ALIGN_BOTTOM_MID, 0, -10);
+    // No lv_obj_align() here: `parent` is the scaffold's flex-managed content
+    // area, which owns child placement. Mixing manual alignment with a flex
+    // parent is what let this screen's widgets overlap each other before.
 
     QRCode qr;
     uint8_t qr_data[qrcode_getBufferSize(4)];
@@ -74,7 +77,16 @@ static void render_qr_canvas(lv_obj_t *parent, const uint8_t psk[16]) {
 }
 
 lv_obj_t *build_pairing_screen() {
-    lv_obj_t *screen = lv_obj_create(nullptr);
+    // Menu-bar Back button + flex content area, same as every other
+    // sub-screen. This screen previously hand-aligned its Back button to
+    // TOP_LEFT (10,10) over hand-aligned content, the same pattern that put
+    // the keyboard test screen's Back button underneath its text area -- see
+    // ui/screen_scaffold.cpp.
+    lv_obj_t *content = nullptr;
+    lv_obj_t *screen = build_sub_screen("Pair Satellite", &content);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
 
     uint8_t psk[16];
     if (!PskStore::load(psk)) {
@@ -98,13 +110,7 @@ lv_obj_t *build_pairing_screen() {
         Serial.printf("quarky-tab5: pairing PSK (hex) = %s\n", psk_hex);
     }
 
-    render_qr_canvas(screen, psk);
-
-    lv_obj_t *back = lv_button_create(screen);
-    lv_obj_align(back, LV_ALIGN_TOP_LEFT, 10, 10);
-    lv_obj_t *back_label = lv_label_create(back);
-    lv_label_set_text(back_label, "Back");
-    lv_obj_add_event_cb(back, [](lv_event_t *e) { ScreenStack::pop(); }, LV_EVENT_CLICKED, nullptr);
+    render_qr_canvas(content, psk);
 
     return screen;
 }

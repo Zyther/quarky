@@ -1,5 +1,6 @@
 #include "shell.h"
 #include "screen_stack.h"
+#include "screen_scaffold.h"
 #include "keyboard_test_screen.h"
 #include "pairing_screen.h"
 #include "../features/ping_feature.h"
@@ -15,22 +16,26 @@ static const struct { Category cat; const char *label; } kCategoryTiles[] = {
     {Category::BLE, "BLE"},
 };
 
+// The category screen's menu-bar title. Same table as the launcher tiles, so
+// tapping "WiFi" lands on a screen that says "WiFi" -- looked up rather than
+// duplicated so the two can never drift apart.
+static const char *category_title(Category cat) {
+    for (const auto &entry : kCategoryTiles) {
+        if (entry.cat == cat) return entry.label;
+    }
+    return "";
+}
+
 // Registry captured by reference in the click handler's user_data (a pointer
 // to it, since FeatureRegistry outlives every screen -- it's a global in
 // main.cpp) so the category screen can be built lazily, on tap, rather than
 // pre-building all three up front.
 lv_obj_t *build_category_screen(FeatureRegistry &registry, Category cat) {
-    lv_obj_t *screen = lv_obj_create(nullptr);
-    lv_obj_set_layout(screen, LV_LAYOUT_GRID);
+    lv_obj_t *content = nullptr;
+    lv_obj_t *screen = build_sub_screen(category_title(cat), &content);
 
-    lv_obj_t *back = lv_button_create(screen);
-    lv_obj_align(back, LV_ALIGN_TOP_LEFT, 10, 10);
-    lv_obj_t *back_label = lv_label_create(back);
-    lv_label_set_text(back_label, "Back");
-    lv_obj_add_event_cb(back, [](lv_event_t *e) { ScreenStack::pop(); }, LV_EVENT_CLICKED, nullptr);
-
-    registry.for_each_in_category(cat, [screen](const FeatureModule &m) {
-        lv_obj_t *tile = lv_button_create(screen);
+    registry.for_each_in_category(cat, [content](const FeatureModule &m) {
+        lv_obj_t *tile = lv_button_create(content);
         lv_obj_set_size(tile, 200, 100);
         lv_obj_t *label = lv_label_create(tile);
         lv_label_set_text(label, m.name);
@@ -63,7 +68,19 @@ lv_obj_t *Shell::build(FeatureRegistry &registry) {
 
     lv_obj_t *launcher = lv_obj_create(root);
     lv_obj_set_size(launcher, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_layout(launcher, LV_LAYOUT_GRID);
+    // Was LV_LAYOUT_GRID. LVGL's grid layout does nothing at all without a
+    // track descriptor: lv_grid.c's calc_rows() logs "No row descriptor found
+    // even on the parent" and returns LV_RESULT_INVALID, so grid_update()
+    // bails before repositioning anything -- and lv_obj_refr_pos() also skips
+    // children whose parent has any layout set, so they are left stacked on
+    // top of one another at the container origin. Neither
+    // lv_obj_set_grid_dsc_array() nor lv_obj_set_grid_cell() was ever called
+    // here. FLEX with wrapping needs no track/cell bookkeeping for a
+    // variable-length tile list, so use that rather than adding the missing
+    // grid plumbing. Do not switch back to LV_LAYOUT_GRID without also adding
+    // a real dsc array plus explicit per-child cell assignments.
+    lv_obj_set_layout(launcher, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(launcher, LV_FLEX_FLOW_ROW_WRAP);
 
     // One tile per category that has at least one registered module --
     // empty categories are skipped so e.g. BLE doesn't show as a dead end
