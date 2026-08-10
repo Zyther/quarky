@@ -634,19 +634,40 @@
 #define TAB5_NFC_I2C_ADDR_CANDIDATE_PN532_DEFAULT 0x24  // retired; kept for history
 #define TAB5_NFC_I2C_ADDR_CANDIDATE_ST25R3916      0x50
 
-// RF433R/T GPIO pins: GENUINELY UNKNOWN, left as an explicit TODO rather
-// than fabricated. Full research trail (what was checked and why nothing
-// resolved it) is in rf433_gpio.cpp's header comment -- short version: the
-// Tab5 has exactly one physical HY2.0 connector (PORT.A, GPIO 53/54 above),
-// already committed to the NFC/RFID2 I2C bus, and no vendor source
-// documents a second HY2.0-style GPIO pair for Tab5 specifically. Override
-// via build flag (-DTAB5_RF433R_PIN=<n> -DTAB5_RF433T_PIN=<n>) once the
-// physical wiring is known.
-#ifndef TAB5_RF433R_PIN
-#define TAB5_RF433R_PIN -1 // TODO: undetermined -- see rf433_gpio.cpp
-#endif
+// RF433R/T GPIO pins. Both units share Tab5's single HY2.0 PORT.A connector
+// with NFC/RFID2 (swapped in one at a time, not simultaneously) -- confirmed
+// on real hardware 2026-08-09 by physically swapping a real RFID2 unit for a
+// real RF433R unit on the same socket. This corrected the prior research
+// conclusion (see rf433_gpio.cpp's older comment) that PORT.A was
+// I2C-exclusive.
+//
+// TAB5_RF433T_PIN: CONFIRMED on real hardware, independently verified. A
+// slow (500ms on/500ms off), unmistakable blink was driven on GPIO53 with a
+// real RF433T unit attached, while a second physical device (Poseidon
+// firmware, tuned to listen at 433MHz) observed real transmitted activity at
+// 433.920MHz -- the standard ISM center frequency for this device class --
+// precisely correlated with the GPIO53 window and not the (also-tested)
+// GPIO54 window. This is real, independent, positive real-hardware evidence,
+// not an assumption.
 #ifndef TAB5_RF433T_PIN
-#define TAB5_RF433T_PIN -1 // TODO: undetermined -- see rf433_gpio.cpp
+#define TAB5_RF433T_PIN 53 // CONFIRMED 2026-08-09: independent 433.92MHz listener test
+#endif
+//
+// TAB5_RF433R_PIN: HYPOTHESIS, not independently confirmed to the same
+// standard as T above -- set to the same pin (53) on the reasoning that R
+// and T share the same physical HY2.0 connector position, but this has NOT
+// been verified by an equally rigorous test. An earlier same-day attempt to
+// verify R by polling digitalRead(53)/digitalRead(54) from loop() during a
+// real remote-control button press found no correlated signal on either
+// pin -- but loop()-based polling samples far too slowly and irregularly to
+// reliably catch genuine OOK receive-pulse timing (typically hundreds of
+// microseconds per bit), so that earlier "no correlation" result is more
+// likely a false negative from inadequate sampling than real evidence this
+// pin is wrong. Treat this value as a reasoned starting point, not a
+// confirmed fact, until a proper interrupt- or timer-driven receive test is
+// run.
+#ifndef TAB5_RF433R_PIN
+#define TAB5_RF433R_PIN 53 // HYPOTHESIS 2026-08-09: same connector position as confirmed T pin; unverified
 #endif
 
 // Free GPIOs on the Tab5's rear M5-Bus connector (per docs.m5stack.com/en/
