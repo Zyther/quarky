@@ -14,42 +14,43 @@ extern FeatureRegistry g_registry;
 extern StorageSD storage; // defined in main.cpp (Phase 1 Task 10)
 
 // -----------------------------------------------------------------------------
-// UNVERIFIED ON REAL HARDWARE (flagged per this task's brief, not papered
-// over): promiscuous mode is proxied to the ESP32-C6 over the same
-// esp-hosted SDIO RPC link WiFi STA scanning (Tasks 3/5, both real-hardware
-// confirmed) already uses -- but scanning is a one-shot request/response RPC
-// while promiscuous mode is a continuous, high-volume callback stream. That
-// is a materially different load on the transport, and this is genuinely
-// the first time this project exercises it.
+// NON-FUNCTIONAL ON TAB5-NATIVE -- CONFIRMED HARD LIMITATION, NOT A BUG IN
+// THIS FILE. Real hardware (2026-08-12): both esp_wifi_set_promiscuous_rx_cb()
+// and esp_wifi_set_promiscuous(true) return 262 (0x106, ESP_ERR_NOT_SUPPORTED)
+// immediately, every time.
 //
-// What IS confirmed (checked, not guessed): esp_wifi_set_promiscuous() and
-// esp_wifi_set_promiscuous_rx_cb() resolve and link against
-// libespressif__esp_wifi_remote.a's RPC proxy symbols
-// (esp_wifi_remote_set_promiscuous / esp_wifi_remote_set_promiscuous_rx_cb --
-// confirmed via `nm` on the actual prebuilt archive
-// framework-arduinoespressif32-libs/esp32p4/lib/libespressif__esp_wifi_remote.a
-// this project links), so the RPC surface is not simply missing/stubbed for
-// this target. What is NOT confirmed: whether the C6 side actually streams
-// captured frame data back over SDIO at a usable rate once enabled, or
-// whether it fires with garbage/truncated payloads under real RF traffic.
-// start() logs both esp_wifi_set_promiscuous_rx_cb()'s and
-// esp_wifi_set_promiscuous()'s return codes specifically so a real-hardware
-// run can tell "the RPC call itself failed" apart from "it reported success
-// but the callback never fires or fires with bad data".
+// This file used to claim (based on `nm` alone showing the RPC proxy symbols
+// present) that "the RPC surface is not simply missing/stubbed for this
+// target." That inference was wrong -- nm can't distinguish a real RPC proxy
+// from a stub with the same symbol name. A follow-up investigation
+// disassembled the actual linked code and found esp_wifi_remote_set_
+// promiscuous()/_rx_cb() are Espressif's weak DEFAULT stubs
+// (esp_wifi_remote_weak.c.obj): exactly `li a0,262; ret` -- two instructions,
+// no RPC call, no SDIO round-trip to the C6 at all. esp_wifi_remote_80211_tx()
+// (Task 2's raw-TX-injection spike, also ESP_ERR_NOT_SUPPORTED) is a
+// byte-identical stub -- same root cause, not a coincidence.
 //
-// AP+STA coexistence is a second, separate open question. Tasks 3/5 found
-// that a plain STA scan coexists with c2link_wifi's SoftAP by running in
-// WIFI_AP_STA rather than WIFI_STA (wifi_common.cpp / wifi_spectrum.cpp),
-// and start() below does the same before enabling promiscuous mode. But the
-// ESP-IDF esp_wifi.h header comments for esp_wifi_set_promiscuous() --
-// checked directly against this project's actual installed framework tree,
-// framework-arduinoespressif32-libs/esp32p4/include/esp_wifi/include/esp_wifi.h
-// -- say nothing at all about interface-mode interactions: no statement
-// that promiscuous mode is restricted to STA-only, and no statement that
-// it's safe under AP_STA either. That silence means this is genuinely
-// unresolved from documentation/headers alone (not a case of not having
-// looked) -- left for the real-hardware pass to settle, per this task's
-// brief, rather than guessed at here.
+// This rules out every "maybe fixable" theory checked: not a co-processor
+// firmware version-skew issue (the check happens entirely on the P4 host
+// before any SDIO traffic, so the C6's firmware version is irrelevant by
+// construction), not an AP_STA-vs-STA mode question (same reason), and not a
+// missing Kconfig flag (none exists for this). Upstream esp-hosted has
+// promiscuous-mode support written but commented out server-side as of this
+// check, its wire protocol reserves message IDs for it without defining
+// payloads, and the maintainers have an open issue stating there are no
+// near-term plans to implement it. No donor firmware (Bruce/Poseidon/
+// UniGeek) solved this either -- Poseidon's handshake capture runs on a
+// node with a native (non-proxied) WiFi radio, not through esp-hosted.
+//
+// Full investigation, sources, and the one real (high-risk, out of scope)
+// escape hatch found: task-6-promiscuous-investigation-report.md in this
+// plan's SDD workspace. Per project decision, this feature is deferred
+// rather than reworked here: it needs to run on hardware with a native
+// WiFi radio (a future Cardputer-ADV satellite feature, or the planned
+// ESP32-C5 sidecar), not the Tab5's esp-hosted-proxied one. The code below
+// (UI, ring buffer, pcap writer, IStorage capture-file methods) is left
+// merged as-is -- it's correct and directly reusable once ported to a
+// native-radio target, it just cannot capture anything on Tab5-native today.
 // -----------------------------------------------------------------------------
 
 namespace WifiPmkidFeature {
