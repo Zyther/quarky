@@ -12,19 +12,23 @@ struct WifiApInfo {
 
 // Asynchronous AP scan.
 //
-// The blocking form this used to expose (a bare WiFi.scanNetworks()) HARD
-// LOCKED THE DEVICE on real hardware -- confirmed 2026-08-10: after opening
-// the WiFi Scan screen the firmware emitted nothing further on serial, ever,
-// and stopped responding to input entirely; only a reset recovered it.
-// Arduino-ESP32's synchronous scan is `while(_scanStarted) delay(10);`, which
-// never terminates if the scan-done event does not arrive -- and on this board
-// WiFi is proxied over SDIO to the ESP32-C6 co-processor which is already
-// running c2link_wifi's SoftAP, so that event does not reliably arrive. Since
-// delay() feeds the task watchdog, it hangs silently rather than panicking.
+// Why asynchronous rather than a bare blocking WiFi.scanNetworks():
 //
-// Hence: kick the scan off, poll it, and give up after a deadline. The caller
-// keeps running lv_timer_handler() throughout, so the UI stays alive and Back
-// stays usable no matter what the radio does.
+// Responsiveness. Arduino-ESP32's synchronous scan is effectively
+// `while(scanning) delay(10);`, which parks the LVGL task for the several
+// seconds a full 2.4GHz scan takes over the SDIO link to the ESP32-C6 -- the
+// screen and the Back button go dead for the duration. Kicking the scan off,
+// polling it from an LVGL timer and giving up after a deadline keeps the UI
+// alive and Back usable no matter what the radio does.
+//
+// HISTORICAL NOTE: this header used to claim the blocking form "HARD LOCKED
+// THE DEVICE" because the scan-done event never arrived over esp-hosted. That
+// diagnosis was wrong and is retracted (2026-08-12). The scan-done event
+// arrives reliably and the scan itself has always worked; the lock-up was
+// LVGL exhausting its draw memory while rendering the results and then
+// spinning forever, which the async rewrite happened not to fix because it
+// was never a scan problem. See ui/lvgl_port.cpp for the real cause and fix.
+// The async design is kept on its own merits, per the paragraph above.
 
 // Starts an asynchronous scan. Returns false if it could not be started at all.
 bool wifi_scan_begin();

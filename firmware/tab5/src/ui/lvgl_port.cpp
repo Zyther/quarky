@@ -1,5 +1,6 @@
 #include "lvgl_port.h"
 #include <lvgl.h>
+#include <src/draw/lv_draw_buf_private.h>
 #include <Arduino.h>
 #include <esp_heap_caps.h>
 
@@ -22,6 +23,76 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
     lv_display_flush_ready(disp);
 }
 
+// -----------------------------------------------------------------------------
+// Draw-buffer allocator: PSRAM, not LVGL's builtin pool.
+//
+// THIS PREVENTS A HARD DEVICE LOCK-UP, it is not a memory-tuning nicety.
+// Measured on real hardware 2026-08-12 while debugging the WiFi Scan freeze
+// (see features/wifi/wifi_scan.cpp and the task-3 hang report):
+//
+//   [Warn] lv_draw_buf_create_ex: No memory: 1240x10, cf: 16, stride: 4960,
+//          49600Byte
+//   [Warn] lv_draw_layer_alloc_buf: Allocating layer buffer failed. Try later
+//
+// LVGL renders any object that needs its own layer (anything with opacity,
+// a blend mode, a transform, or a bitmap mask) into a temporary layer buffer
+// first. For a full-width row strip on this 1280x720 panel that buffer is
+// ~49.6 kB of ARGB8888 -- most of LV_MEM_SIZE (64 kB), which by default is
+// ALSO where every widget, style and label string lives. With a screenful of
+// widgets already resident the allocation simply cannot succeed.
+//
+// And an allocation failure here is not a degraded render, it is fatal:
+// lv_draw_buf_create() returns NULL -> lv_draw_layer_alloc_buf() returns NULL
+// -> the software draw unit reports LV_DRAW_UNIT_IDLE -> and because
+// LV_USE_OS is LV_OS_NONE, lv_refr.c's draw_buf_flush() sits in
+//
+//     while(layer->draw_task_head) { lv_draw_dispatch_wait_for_request();
+//                                    lv_draw_dispatch(); }
+//
+// with lv_draw_dispatch_wait_for_request() compiled down to a bare
+// `while(!dispatch_req);`. Nothing ever frees memory from inside that loop, so
+// it never terminates: lv_timer_handler() never returns, and the Arduino loop
+// task spins at priority 1 on core 1 forever. Neither watchdog catches it --
+// the task WDT only monitors IDLE0 (CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1
+// is not set in this framework's sdkconfig) and the interrupt WDT is happy
+// because interrupts are still being serviced. The result is a totally silent
+// brick: frozen screen, dead touch, no serial, no panic, no reboot, recoverable
+// only by pulling power. That is exactly the WiFi Scan bug.
+//
+// Routing draw buffers to PSRAM fixes it at the source. The board has ~30 MB
+// of SPIRAM free versus 64 kB of LVGL pool, and these buffers are transient,
+// CPU-only (the software renderer writes them, then blends them into the main
+// draw buffer -- no DMA touches them, so no cache maintenance is needed
+// beyond what the display driver already does for its own buffer). LVGL's
+// builtin pool is left to widgets/styles alone, which it comfortably fits:
+// the whole 21-row scan list measured 36% of it.
+static void *psram_draw_buf_malloc(size_t size, lv_color_format_t) {
+    // LVGL's own default over-allocates by LV_DRAW_BUF_ALIGN - 1 so that
+    // align_pointer_cb can round the returned pointer up inside the block;
+    // keep that contract, since we are only replacing malloc/free and the
+    // default align/stride callbacks still apply.
+    size += LV_DRAW_BUF_ALIGN - 1;
+    void *p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (p == nullptr) {
+        // Small buffers are still worth trying in internal RAM -- falling back
+        // keeps a PSRAM hiccup from re-arming the freeze described above.
+        p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    return p;
+}
+
+static void psram_draw_buf_free(void *buf) {
+    heap_caps_free(buf);
+}
+
+// LVGL's warnings are the only reason the freeze above was diagnosable at all;
+// with LV_USE_LOG 0 (the previous setting) LVGL failed completely silently.
+// Kept on permanently at WARN level -- it is quiet in normal operation and
+// turns the next LVGL resource failure into a log line instead of a mystery.
+static void lvgl_log_cb(lv_log_level_t level, const char *buf) {
+    Serial.printf("quarky-tab5: [lvgl:%d] %s\n", (int)level, buf);
+}
+
 static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
     int16_t x, y;
     bool pressed;
@@ -36,6 +107,22 @@ void lvgl_port_init(IDisplay &display, ITouch &touch) {
     s_touch = &touch;
 
     lv_init();
+
+    lv_log_register_print_cb(lvgl_log_cb);
+
+    // Must come after lv_init() (which installs the defaults) and before any
+    // widget is created. Both the general and the image handler sets are
+    // redirected: layers come from the general set, and decoded/rescaled image
+    // buffers from the image set are the other allocation big enough to
+    // exhaust the builtin pool. Font glyph buffers are deliberately left on
+    // the default -- they are small, extremely hot, and better off in
+    // internal RAM.
+    lv_draw_buf_handlers_t *draw_handlers = lv_draw_buf_get_handlers();
+    draw_handlers->buf_malloc_cb = psram_draw_buf_malloc;
+    draw_handlers->buf_free_cb = psram_draw_buf_free;
+    lv_draw_buf_handlers_t *image_handlers = lv_draw_buf_get_image_handlers();
+    image_handlers->buf_malloc_cb = psram_draw_buf_malloc;
+    image_handlers->buf_free_cb = psram_draw_buf_free;
 
     // LVGL 9 dropped the compile-time LV_TICK_CUSTOM macro (see
     // include/lv_conf.h's header comment) in favor of a runtime callback.

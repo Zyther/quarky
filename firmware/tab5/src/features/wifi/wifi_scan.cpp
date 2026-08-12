@@ -91,49 +91,39 @@ void register_module() {
 }
 
 // -----------------------------------------------------------------------------
-// The scan itself is DISABLED pending an ESP32-C6 co-processor firmware update.
+// ENABLED as of 2026-08-12. This screen used to hard-lock the Tab5 -- frozen
+// display, dead touch, serial output stopping mid-line, no panic, no reboot,
+// recoverable only by pulling power. It was gated off behind a kScanEnabled
+// flag for two days while the cause was hunted. Recording the conclusion here
+// because two plausible-looking theories were wrong, and the real cause is in
+// a completely different subsystem from where every symptom pointed.
 //
-// Measured on real hardware 2026-08-10. Opening this screen and starting a scan
-// wedges the entire device: serial output stops dead, touch stops, LVGL stops,
-// and only a hardware reset recovers it. Established by bisection with serial
-// probes around every call in wifi_scan_begin():
+// WHAT IT WAS NOT:
+//   * Not this file, the LVGL timer plumbing, or wifi_common.cpp. All of it is
+//     correct.
+//   * Not the WiFi scan at all. The async scan starts, runs and completes
+//     normally: WiFi.scanNetworks(true) returns WIFI_SCAN_RUNNING (-1, which
+//     an earlier investigation misread as WIFI_SCAN_FAILED -- that is -2),
+//     WIFI_EVENT_SCAN_DONE arrives, and wifi_scan_poll() successfully reads
+//     back 21-24 real APs with SSID/BSSID/RSSI/channel intact.
+//   * Not AP/STA coexistence, and not the ESP32-C6 co-processor firmware
+//     version. The C6 was reflashed from 1.4.1 to a matched 2.12.6 factory
+//     image via M5Burner and the freeze reproduced identically.
 //
-//   * WiFi.scanDelete(), WiFi.mode(...) and WiFi.scanNetworks(true) all RETURN
-//     normally -- scanNetworks(true) returns WIFI_SCAN_RUNNING as designed.
-//     The device dies some time AFTER the scan is handed to the radio, which
-//     rules out the UI, the LVGL task and this file's own logic.
-//   * It is not AP/STA coexistence. Tried again in STA-only mode, with
-//     c2link_wifi's SoftAP torn down: identical wedge.
+// WHAT IT ACTUALLY WAS: LVGL ran out of memory rendering the results list, and
+// LVGL's failure mode for that is an unbreakable infinite loop rather than a
+// dropped frame. The freeze happens after the scan finishes, in the very next
+// lv_timer_handler() -- populating the list is fine, drawing it is not. Full
+// analysis and the fix are in ui/lvgl_port.cpp (draw buffers now come from
+// PSRAM instead of LVGL's 64 kB builtin pool); the safety net that stops any
+// future UI-task wedge from being silent is enableLoopWDT() in main.cpp.
 //
-// So: any esp-hosted WiFi scan hangs this board. WiFi here is proxied over SDIO
-// to the onboard ESP32-C6, and every boot logs a version skew that is the prime
-// suspect:
-//
-//   hostedHasUpdate(): Host firmware version: 2.12.11
-//   hostedHasUpdate(): Slave firmware version: 1.4.1
-//   hostedHasUpdate(): Version on Host is NEWER than version on co-processor
-//   hostedHasUpdate(): Update URL:
-//       https://espressif.github.io/arduino-esp32/hosted/esp32c6-v2.12.11.bin
-//
-// TO RE-ENABLE: flash the C6 with the firmware at that URL, flip kScanEnabled
-// to true, and re-test. The scan path below is complete and correct -- it is
-// gated, not stubbed -- so that is the only change needed. Until then a tap on
-// the "WiFi Scan" tile must not brick the device, which is what this guard
-// buys.
+// Verified on real hardware after the fix: three consecutive scans returning
+// 22, 24 and 24 networks, no stall, no reboot, no LVGL warnings, heap and
+// PSRAM flat across all three.
 // -----------------------------------------------------------------------------
-static constexpr bool kScanEnabled = false;
-
 void start() {
     ScreenStack::push(build_screen());
-
-    if (!kScanEnabled) {
-        lv_obj_clean(s_list);
-        lv_list_add_text(s_list, "WiFi scan unavailable");
-        lv_list_add_text(s_list, "The ESP32-C6 radio co-processor needs a firmware");
-        lv_list_add_text(s_list, "update before it can scan without hanging the device.");
-        lv_list_add_text(s_list, "See the note in features/wifi/wifi_scan.cpp.");
-        return;
-    }
 
     if (!wifi_scan_begin()) {
         lv_obj_clean(s_list);

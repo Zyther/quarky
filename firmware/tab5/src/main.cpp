@@ -73,6 +73,28 @@ void setup() {
     Serial.begin(115200);
     delay(500);
 
+    // Subscribe the Arduino loop task to the ESP-IDF task watchdog.
+    //
+    // Added 2026-08-12 as the systemic half of the WiFi Scan freeze fix. The
+    // proximate cause of that bug is fixed in ui/lvgl_port.cpp, but what made
+    // it a *silent brick* rather than a crash was that nothing on this board
+    // watches core 1. This framework's sdkconfig sets
+    // CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y and leaves the CPU1 equivalent
+    // off, so a loop task spinning on core 1 (which is where
+    // ARDUINO_RUNNING_CORE puts it) starves IDLE1 unnoticed while IDLE0 keeps
+    // feeding the watchdog on the other core. The interrupt watchdog does not
+    // help either -- interrupts are still serviced throughout. The device just
+    // stops, with no panic, no reboot and no serial output, until someone pulls
+    // the power.
+    //
+    // enableLoopWDT() makes the loop task itself a watchdog subscriber
+    // (cores/esp32/main.cpp calls esp_task_wdt_reset() once per iteration), so
+    // any future wedge of the UI task -- from any cause -- becomes a task WDT
+    // panic with a backtrace and a reboot after CONFIG_ESP_TASK_WDT_TIMEOUT_S
+    // (5s) instead of an un-debuggable freeze. Nothing in loop() blocks for
+    // anywhere near that long in normal operation.
+    enableLoopWDT();
+
     // ---- UI first, radios second -------------------------------------------
     // Deliberate ordering, changed as part of the C6 SDIO hotfix. Radio
     // bring-up talks to a separate ESP32-C6 chip over SDIO and is the single
@@ -208,8 +230,14 @@ void loop() {
     // build_flags) per task review: an unconditionally-compiled single-byte
     // trigger on the same UART used for real console/debug traffic risks
     // firing on stray line noise or incidental text in production firmware.
-    // Pass `-DQUARKY_SERIAL_DEBUG` (e.g. via `pio run -t upload
-    // --build-flags="-DQUARKY_SERIAL_DEBUG"`) for hardware-verification runs.
+    // Pass `-DQUARKY_SERIAL_DEBUG` for hardware-verification runs via the
+    // environment:
+    //
+    //   PLATFORMIO_BUILD_FLAGS="-DQUARKY_SERIAL_DEBUG" pio run -t upload
+    //
+    // (This comment used to suggest a `pio run --build-flags=...` option.
+    // There is no such option -- `pio run` rejects it; corrected 2026-08-12
+    // after hitting it during the WiFi-scan hang investigation.)
     if (Serial.available()) {
         char c = Serial.read();
         if (c == 'k') {
@@ -218,6 +246,20 @@ void loop() {
         } else if (c == 'p') {
             Serial.println("quarky-tab5: [debug] send_ping() via serial trigger");
             PingFeature::send_ping();
+        } else if (c == 'b') {
+            // Stands in for the menu-bar Back button. Without it a headless
+            // run can only ever push screens, which is not how the UI is
+            // actually used and which piles up LVGL objects that a real user
+            // would have freed on the way back out.
+            Serial.println("quarky-tab5: [debug] ScreenStack::pop() via serial trigger");
+            ScreenStack::pop();
+        } else if (c == 'w') {
+            // Same entry point the "WiFi Scan" launcher tile calls. Added for
+            // the 2026-08-12 hang investigation: the failure is only reachable
+            // by a physical tap otherwise, which the headless
+            // hardware-verification harness cannot produce.
+            Serial.println("quarky-tab5: [debug] WifiScanFeature::start() via serial trigger");
+            WifiScanFeature::start();
         }
     }
     // --- end debug aid ---
