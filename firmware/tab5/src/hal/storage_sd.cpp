@@ -1,5 +1,6 @@
 #include "storage_sd.h"
 #include <SD_MMC.h> // Tab5's SD is SDIO-attached, not SPI
+#include <cstring> // strncpy (ensure_parent_dirs)
 // boards/tab5/pins_config.h documents the real Tab5 SD/C6 SDIO pins and the
 // SDIO-host-sharing research below in named constants (TAB5_SD_*,
 // TAB5_C6_SDIO_*). Not included/consumed directly here: SD_MMC's own
@@ -148,4 +149,45 @@ bool StorageSD::write_test_file() {
     f.println("quarky foundation bring-up test");
     f.close();
     return true;
+}
+
+// Walks path, creating each directory component in turn -- e.g.
+// "/quarky/captures/wifi/x.pcap" -> mkdir /quarky, then /quarky/captures,
+// then /quarky/captures/wifi. SD_MMC.mkdir() on an already-existing directory
+// is a harmless no-op (confirmed against the ESP32 SD_MMC/FS library), so no
+// existence check is needed before each call.
+static void ensure_parent_dirs(const char *path) {
+    char buf[128];
+    strncpy(buf, path, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    for (char *p = buf + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            SD_MMC.mkdir(buf);
+            *p = '/';
+        }
+    }
+}
+
+bool StorageSD::write_capture_file(const char *path, const uint8_t *data, size_t len) {
+    ensure_parent_dirs(path);
+    File f = SD_MMC.open(path, FILE_WRITE); // truncates/creates
+    if (!f) return false;
+    size_t written = f.write(data, len);
+    f.close();
+    return written == len;
+}
+
+bool StorageSD::append_capture_file(const char *path, const uint8_t *data, size_t len) {
+    ensure_parent_dirs(path);
+    // FILE_APPEND is the ESP32 SD_MMC/FS library's append-mode open flag --
+    // seeks to end-of-file (creating the file if it doesn't exist yet)
+    // instead of truncating like FILE_WRITE does. This is what lets poll()
+    // call this repeatedly across many drain cycles without clobbering
+    // packet records already written to the same capture file.
+    File f = SD_MMC.open(path, FILE_APPEND);
+    if (!f) return false;
+    size_t written = f.write(data, len);
+    f.close();
+    return written == len;
 }

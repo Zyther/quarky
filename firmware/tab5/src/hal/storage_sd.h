@@ -12,4 +12,6 @@ class StorageSD : public IStorage {
 public:
     bool mount() override;
     bool write_test_file() override;
+    bool write_capture_file(const char *path, const uint8_t *data, size_t len) override;
+    bool append_capture_file(const char *path, const uint8_t *data, size_t len) override;
 };

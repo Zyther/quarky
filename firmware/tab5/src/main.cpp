@@ -17,6 +17,7 @@
 #include "features/ping_feature.h"
 #include "features/wifi/wifi_scan.h"
 #include "features/wifi/wifi_spectrum.h"
+#include "features/wifi/wifi_pmkid.h"
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -97,6 +98,9 @@ void setup() {
     WifiSpectrumFeature::register_module(); // Task 5: live per-channel RSSI
                                              // bar chart, same reason --
                                              // must run before Shell::build below
+    WifiPmkidFeature::register_module(); // Task 6: promiscuous-mode capture
+                                          // to a pcap file on SD, same reason
+                                          // -- must run before Shell::build below
 
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
@@ -213,6 +217,8 @@ void loop() {
     c2link_wifi.poll(); // no-ops when the AP never came up
     c2link_ble.poll();  // drains BLE frames received on the NimBLE host task
     WifiSpectrumFeature::poll(); // no-ops unless the WiFi Spectrum screen is open
+    WifiPmkidFeature::poll();    // no-ops unless the PMKID capture screen is open;
+                                  // drains the promiscuous-mode ring buffer to SD
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
@@ -266,6 +272,15 @@ void loop() {
             // otherwise.
             Serial.println("quarky-tab5: [debug] WifiSpectrumFeature::start() via serial trigger");
             WifiSpectrumFeature::start();
+        } else if (c == 'm') {
+            // Same entry point the "WiFi PMKID Capture" launcher tile calls.
+            // Added for Task 6's real-hardware verification pass (same
+            // reasoning as 'w'/'s' above): only reachable by a physical tap
+            // otherwise, and this is the first exercise of promiscuous mode
+            // over esp-hosted in this project -- worth being able to trigger
+            // headlessly.
+            Serial.println("quarky-tab5: [debug] WifiPmkidFeature::start() via serial trigger");
+            WifiPmkidFeature::start();
         }
     }
     // --- end debug aid ---
