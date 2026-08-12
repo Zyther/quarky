@@ -19,6 +19,7 @@
 #include "features/wifi/wifi_spectrum.h"
 #include "features/wifi/wifi_pmkid.h"
 #include "features/ble/ble_scan.h"
+#include "features/ble/ble_spam.h"
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -104,6 +105,9 @@ void setup() {
                                           // -- must run before Shell::build below
     BleScanFeature::register_module(); // Task 7: first BLE-category tile
                                         // (Category::BLE), same reason --
+                                        // must run before Shell::build below
+    BleSpamFeature::register_module(); // Task 8: fake AirPods Continuity
+                                        // advertisement, same reason --
                                         // must run before Shell::build below
 
     lv_obj_t *root = Shell::build(g_registry);
@@ -225,6 +229,11 @@ void loop() {
                                   // drains the promiscuous-mode ring buffer to SD
     BleScanFeature::poll();      // no-ops unless the BLE Scan screen is open;
                                   // pushes gap_scan_event_cb's discoveries to the list
+    BleSpamFeature::poll();      // no-ops unless the BLE Spam screen is open;
+                                  // rotates the fake AirPods advertisement every 200ms.
+                                  // NOTE: while active this STOPS c2link_ble's C2
+                                  // advertisement (legacy BLE adv is single-instance,
+                                  // system-wide) -- disclosed tradeoff, see ble_spam.cpp
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
@@ -297,6 +306,17 @@ void loop() {
             // question this task's brief flags.
             Serial.println("quarky-tab5: [debug] BleScanFeature::start() via serial trigger");
             BleScanFeature::start();
+        } else if (c == 'a') {
+            // Same entry point the "BLE Spam (AirPods)" launcher tile calls.
+            // Added for Task 8's real-hardware verification pass (same
+            // reasoning as 'w'/'s'/'m'/'g' above): only reachable by a
+            // physical tap otherwise, and this is the first exercise of a
+            // second, rotating ble_gap_adv_start() advertisement in this
+            // project -- worth being able to trigger headlessly to check
+            // that it correctly stops c2link_ble's C2 advertisement (see
+            // ble_spam.cpp's disclosed single-advertisement-instance note).
+            Serial.println("quarky-tab5: [debug] BleSpamFeature::start() via serial trigger");
+            BleSpamFeature::start();
         }
     }
     // --- end debug aid ---
