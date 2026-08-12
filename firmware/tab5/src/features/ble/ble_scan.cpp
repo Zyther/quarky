@@ -34,25 +34,43 @@ static int s_device_count = 0;
 static lv_obj_t *s_list = nullptr;
 static bool s_scanning = false;
 
+// Task review finding (2026-08-12): s_devices/s_device_count are written by
+// gap_scan_event_cb() on the NimBLE host task and read by refresh_list_ui()
+// on the main task -- a genuine cross-task case, structurally identical to
+// c2link_ble.cpp's s_rx_queue/s_rx_head/s_rx_tail (which DOES get a
+// portMUX), not its s_last_recv_ms (which doesn't need one specifically
+// because that one word is only ever touched from a single task). An
+// earlier version of this file's comment claimed the opposite and was
+// wrong -- corrected here, with the same portMUX_TYPE/portENTER_CRITICAL/
+// portEXIT_CRITICAL primitive c2link_ble.cpp already uses for its own
+// analogous cross-task state.
+static portMUX_TYPE s_devices_mux = portMUX_INITIALIZER_UNLOCKED;
+// Set (under the lock) whenever a discovery event actually adds or updates
+// an entry; cleared by poll() after a refresh. Lets poll() skip rebuilding
+// the list on loop() ticks where nothing changed -- see refresh throttling
+// below.
+static volatile bool s_devices_dirty = false;
+
 static void add_or_update(const BleDeviceInfo &d) {
+    portENTER_CRITICAL(&s_devices_mux);
     for (int i = 0; i < s_device_count; i++) {
         if (memcmp(s_devices[i].addr, d.addr, 6) == 0) {
             s_devices[i] = d;
+            s_devices_dirty = true;
+            portEXIT_CRITICAL(&s_devices_mux);
             return;
         }
     }
     if (s_device_count < kMaxDevices) {
         s_devices[s_device_count++] = d;
+        s_devices_dirty = true;
     }
+    portEXIT_CRITICAL(&s_devices_mux);
 }
 
-// Runs on the NimBLE host task (not the main/LVGL task) -- only touches
-// s_devices/s_device_count, which poll() (main task) reads back on its next
-// tick. No locking here mirrors c2link_ble.cpp's own comment about which
-// pieces of shared state actually need a portMUX: this array is written here
-// and read from refresh_list_ui() on the main task with no ordering
-// requirement finer than "eventually visible next poll", same shape as
-// wifi_spectrum.cpp's s_chart updates.
+// Runs on the NimBLE host task (not the main/LVGL task) -- see the
+// s_devices_mux comment above for why its writes to s_devices/
+// s_device_count (via add_or_update()) are locked.
 static int gap_scan_event_cb(struct ble_gap_event *event, void *arg) {
     if (event->type != BLE_GAP_EVENT_DISC) return 0;
 
@@ -74,13 +92,27 @@ static int gap_scan_event_cb(struct ble_gap_event *event, void *arg) {
     return 0;
 }
 
+// Snapshots s_devices/s_device_count under the lock (a fast, bounded memcpy)
+// and does the actual LVGL rebuild -- lv_obj_clean() plus up to kMaxDevices
+// lv_list_add_button() calls, each allocating a sub-hierarchy -- outside it,
+// so the NimBLE host task is never blocked for longer than a plain array
+// copy. Same "copy under the lock, do the real work outside it" shape
+// c2link_ble.cpp's poll() already uses when draining s_rx_queue.
 static void refresh_list_ui() {
     if (!s_list) return;
+
+    static BleDeviceInfo snapshot[kMaxDevices];
+    int count;
+    portENTER_CRITICAL(&s_devices_mux);
+    count = s_device_count;
+    memcpy(snapshot, s_devices, sizeof(BleDeviceInfo) * count);
+    portEXIT_CRITICAL(&s_devices_mux);
+
     lv_obj_clean(s_list);
-    for (int i = 0; i < s_device_count; i++) {
+    for (int i = 0; i < count; i++) {
         char row[64];
-        const char *label = s_devices[i].name[0] ? s_devices[i].name : s_devices[i].addr_str;
-        snprintf(row, sizeof(row), "%s  %ddBm", label, s_devices[i].rssi);
+        const char *label = snapshot[i].name[0] ? snapshot[i].name : snapshot[i].addr_str;
+        snprintf(row, sizeof(row), "%s  %ddBm", label, snapshot[i].rssi);
         lv_list_add_button(s_list, LV_SYMBOL_BLUETOOTH, row);
     }
 }
@@ -109,7 +141,15 @@ static lv_obj_t *build_screen() {
     // path instead of only a click.
     lv_obj_add_event_cb(s_list, [](lv_event_t *e) {
         if (s_scanning) {
-            ble_gap_disc_cancel();
+            int rc = ble_gap_disc_cancel();
+            // Minor task-review finding: log this like every other NimBLE
+            // call in this codebase (c2link_ble.cpp is consistently
+            // disciplined about it). A non-zero rc here is a normal,
+            // harmless no-op (e.g. the 10s scan already finished on its
+            // own before Back was tapped), not a functional problem --
+            // logged for the same diagnostic-completeness reason, not
+            // because failure needs handling.
+            Serial.printf("quarky-tab5: [ble-scan] ble_gap_disc_cancel rc=%d\n", rc);
             s_scanning = false;
         }
         s_list = nullptr;
@@ -121,6 +161,7 @@ static lv_obj_t *build_screen() {
     }
 
     s_device_count = 0;
+    s_devices_dirty = false;
     struct ble_gap_disc_params params{};
     params.passive = 0;         // active scan, matches Cardputer-ADV's Task 17 fix
                                   // (setActiveScan(true)) that was needed to see
@@ -146,9 +187,25 @@ void start() {
     ScreenStack::push(build_screen());
 }
 
+// Task review finding (2026-08-12): this used to call refresh_list_ui()
+// unconditionally on every loop() tick (~5-10ms cadence from main.cpp's own
+// delay(5)) for the whole 10s scan -- a full lv_obj_clean() + up to
+// kMaxDevices lv_list_add_button() rebuild roughly 100-200 times/sec,
+// almost all of them pure churn since the underlying data only changes on
+// an actual BLE discovery event. Gated on s_devices_dirty (set only when
+// add_or_update() adds/updates an entry) plus a 250ms floor, matching
+// wifi_scan.cpp's own polling cadence for the same class of screen.
+static uint32_t s_last_refresh_ms = 0;
+static constexpr uint32_t kRefreshIntervalMs = 250;
+
 void poll() {
     if (!s_scanning) return;
+    if (!s_devices_dirty) return;
+    uint32_t now = millis();
+    if (now - s_last_refresh_ms < kRefreshIntervalMs) return;
     refresh_list_ui();
+    s_devices_dirty = false;
+    s_last_refresh_ms = now;
 }
 
 } // namespace BleScanFeature
