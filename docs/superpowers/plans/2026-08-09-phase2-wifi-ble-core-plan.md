@@ -650,8 +650,10 @@ git commit -m "Add WiFi single-target deauth feature, real hardware verified"
 - Modify: `firmware/tab5/src/main.cpp` (register the module)
 
 **Interfaces:**
-- Consumes: standard `<WiFi.h>` scan/RSSI APIs (already proven by Task 3), `lv_chart` (new LVGL widget for this project — first use).
+- Consumes: standard `<WiFi.h>` scan/RSSI APIs (already proven by Task 3), `lv_chart` (new LVGL widget for this project — first use), `build_sub_screen()` (`firmware/tab5/src/ui/screen_scaffold.h` — see amendment note below, this did not exist when this task was originally drafted).
 - Produces: a live-updating channel/RSSI bar chart, the reference pattern for the deferred second plan's other streaming/long-running features (sniffer, BLE flood, etc.).
+
+> **Amendment (2026-08-12):** this task was drafted before `ui/screen_scaffold.{h,cpp}` existed. Real hardware testing during Task 3 found every hand-positioned Back button on this panel's real pixel density (~294 PPI vs LVGL's assumed 130) rendered as a tiny, sometimes-overlapping-content, hard-to-hit button — `build_sub_screen()` is now the mandatory pattern for every non-root screen, replacing the raw `lv_obj_create(nullptr)` + manual Back button construction below. The code sample is updated to match; every remaining task in this plan (6, 7, 8) must use it too, not the older raw pattern any earlier plan text might still show.
 
 - [ ] **Step 1: Write the feature**
 
@@ -671,6 +673,7 @@ void poll();
 ```cpp
 // firmware/tab5/src/features/wifi/wifi_spectrum.cpp
 #include "wifi_spectrum.h"
+#include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
 #include <feature_registry.h>
 #include <lvgl.h>
@@ -688,26 +691,32 @@ static uint32_t s_last_hop_ms = 0;
 static uint8_t s_channel = 1;
 
 static lv_obj_t *build_screen() {
-    lv_obj_t *screen = lv_obj_create(nullptr);
-    lv_obj_set_layout(screen, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(screen, LV_FLEX_FLOW_COLUMN);
+    // Menu-bar Back button + flex content area -- see ui/screen_scaffold.cpp
+    // for why every sub-screen must build through this rather than
+    // hand-positioning its own Back button.
+    lv_obj_t *content = nullptr;
+    lv_obj_t *screen = build_sub_screen("WiFi Spectrum", &content);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
 
-    lv_obj_t *back = lv_button_create(screen);
-    lv_obj_t *back_label = lv_label_create(back);
-    lv_label_set_text(back_label, "Back");
-    lv_obj_add_event_cb(back, [](lv_event_t *e) {
-        s_active = false;
-        s_chart = nullptr;
-        ScreenStack::pop();
-    }, LV_EVENT_CLICKED, nullptr);
-
-    s_chart = lv_chart_create(screen);
-    lv_obj_set_size(s_chart, LV_PCT(95), LV_PCT(80));
+    s_chart = lv_chart_create(content);
+    lv_obj_set_size(s_chart, LV_PCT(95), LV_PCT(90));
     lv_chart_set_type(s_chart, LV_CHART_TYPE_BAR);
     lv_chart_set_range(s_chart, LV_CHART_AXIS_PRIMARY_Y, -100, 0); // dBm
     lv_chart_set_point_count(s_chart, 14); // channels 1-14
     s_series = lv_chart_add_series(s_chart, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
     for (int i = 0; i < 14; i++) lv_chart_set_next_value(s_chart, s_series, -100);
+
+    // The chart (and s_series, s_active) must not outlive the screen -- the
+    // scaffold's Back button pops the screen and deletes it (and everything
+    // parented under it, including this chart) via ScreenStack::pop(), so
+    // clear these from the chart's own LV_EVENT_DELETE rather than a
+    // click handler, the same pattern Task 3's wifi_scan.cpp established for
+    // its list (closes the same "stale pointer after Back" class of bug).
+    lv_obj_add_event_cb(s_chart, [](lv_event_t *e) {
+        s_active = false;
+        s_chart = nullptr;
+        s_series = nullptr;
+    }, LV_EVENT_DELETE, nullptr);
 
     s_channel = 1;
     s_active = true;
@@ -801,6 +810,8 @@ git commit -m "Add WiFi spectrum analyzer feature (live lv_chart pattern)"
 **Interfaces:**
 - Consumes: `esp_wifi_set_promiscuous`/`esp_wifi_set_promiscuous_rx_cb` (standard ESP-IDF, confirmed proxied by esp-hosted per this plan's pre-work research), `IStorage` (Phase 1 Task 10, extended here).
 - Produces: `IStorage::write_capture_file(const char*, const uint8_t*, size_t)`, reusable by the deferred second plan's BLE sniffer CSV export and any other future capture feature — this is the first real capture-file writer in the project, not scope creep specific to PMKID.
+
+> **Amendment (2026-08-12), same as Task 5:** this task's screen-building code below predates `ui/screen_scaffold.{h,cpp}`. Build the screen through `build_sub_screen("WiFi PMKID Capture", &content)` (parent all content to the returned `content`, not to the screen directly) instead of the raw `lv_obj_create(nullptr)` + manual Back button shown below — real hardware testing found hand-positioned Back buttons unusable on this panel. Also apply the `LV_EVENT_DELETE`-based cleanup pattern (clear any screen-owned pointers from the relevant widget's own delete event, not from the Back button's click handler) that Tasks 3 and 5 both landed on, for the same "must survive being popped via any path" reasoning.
 
 - [ ] **Step 1: Extend `IStorage` with a generic capture-file writer**
 
@@ -1028,6 +1039,8 @@ git commit -m "Add WiFi promiscuous capture + PMKID feature, generic SD capture-
 **Interfaces:**
 - Consumes: the already-running NimBLE host from `c2link_ble.cpp` (Phase 1 Task 13) — this task adds the query function needed to know when it's safe to call `ble_gap_disc()`.
 - Produces: `BleDeviceInfo` struct + `ble_common.h`'s shared device-list model, reused by the deferred second plan's BLE spam/finder/sniffer features.
+
+> **Amendment (2026-08-12), same as Task 5:** build this task's screen through `build_sub_screen("BLE Scan", &content)` (`ui/screen_scaffold.h`), not the raw `lv_obj_create(nullptr)` + manual Back button the code below shows — see Task 5's amendment note for why. Apply the same `LV_EVENT_DELETE`-based cleanup for `s_list`/`s_scanning` that Tasks 3 and 5 both use.
 
 ### Why this is a spike, same category of risk as Task 2
 
@@ -1265,6 +1278,8 @@ git commit -m "Add BLE scan feature and spike: confirm ble_gap_disc over raw Nim
 - Produces: nothing consumed by later tasks in this plan — the last task, establishing the "TX-heavy BLE feature" reference pattern for the deferred second plan's remaining BLE attack features (flood, karma, sourApple, findmy).
 
 **Contingent on Task 7's result:** if Task 7 found scanning while the C2 server advertises doesn't work cleanly, this task (a *second* concurrent advertisement, alongside the C2 link's existing one) carries the same category of risk and should be treated with the same caution — note this explicitly in the report if Task 7 came back negative, and consider whether this task should pause pending a decision, same as Task 4 depends on Task 2.
+
+> **Amendment (2026-08-12), same as Task 5:** if this task's screen (the code below builds one for the spam start/stop UI) uses the raw `lv_obj_create(nullptr)` + manual Back button pattern, convert it to `build_sub_screen()` (`ui/screen_scaffold.h`) instead — see Task 5's amendment note.
 
 - [ ] **Step 1: Write the spam feature**
 
