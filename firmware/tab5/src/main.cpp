@@ -73,28 +73,6 @@ void setup() {
     Serial.begin(115200);
     delay(500);
 
-    // Subscribe the Arduino loop task to the ESP-IDF task watchdog.
-    //
-    // Added 2026-08-12 as the systemic half of the WiFi Scan freeze fix. The
-    // proximate cause of that bug is fixed in ui/lvgl_port.cpp, but what made
-    // it a *silent brick* rather than a crash was that nothing on this board
-    // watches core 1. This framework's sdkconfig sets
-    // CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y and leaves the CPU1 equivalent
-    // off, so a loop task spinning on core 1 (which is where
-    // ARDUINO_RUNNING_CORE puts it) starves IDLE1 unnoticed while IDLE0 keeps
-    // feeding the watchdog on the other core. The interrupt watchdog does not
-    // help either -- interrupts are still serviced throughout. The device just
-    // stops, with no panic, no reboot and no serial output, until someone pulls
-    // the power.
-    //
-    // enableLoopWDT() makes the loop task itself a watchdog subscriber
-    // (cores/esp32/main.cpp calls esp_task_wdt_reset() once per iteration), so
-    // any future wedge of the UI task -- from any cause -- becomes a task WDT
-    // panic with a backtrace and a reboot after CONFIG_ESP_TASK_WDT_TIMEOUT_S
-    // (5s) instead of an un-debuggable freeze. Nothing in loop() blocks for
-    // anywhere near that long in normal operation.
-    enableLoopWDT();
-
     // ---- UI first, radios second -------------------------------------------
     // Deliberate ordering, changed as part of the C6 SDIO hotfix. Radio
     // bring-up talks to a separate ESP32-C6 chip over SDIO and is the single
@@ -206,6 +184,22 @@ void setup() {
         c2link_wifi.set_receive_handler(on_c2_receive);
         c2link_ble.set_receive_handler(on_c2_receive);
     }
+
+    // Subscribe the Arduino loop task to the ESP-IDF task watchdog, now that
+    // setup() -- which includes documented multi-second blocking stages the
+    // watchdog is never fed during (the 15s WiFi STA connect timeout above,
+    // C6 SDIO bring-up, SD mount, the HY2.0 I2C census) -- is done. Task
+    // review (2026-08-12) on the original placement (top of setup()) found
+    // exactly this: arming a 5s panic timer over a path the code itself
+    // documents as able to take up to 15s would turn a slow-but-legitimate
+    // boot into a reboot loop the moment real WiFi credentials are filled
+    // in above, defeating the very "device works, no comms" degradation this
+    // file's own radio-bring-up ordering comment (see the top of setup())
+    // is designed to guarantee. Moved here, and armed only once loop()'s own
+    // per-iteration budget (~50ms, Global Constraint) is what's being
+    // watched -- see enableLoopWDT()'s own comment at its definition for the
+    // full story of what it protects against.
+    enableLoopWDT();
 
     Serial.println("quarky-tab5: setup complete");
 }
