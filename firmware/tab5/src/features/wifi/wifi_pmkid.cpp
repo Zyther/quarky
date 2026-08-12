@@ -292,6 +292,17 @@ void poll() {
         }
     }
 
+    // Task review finding (2026-08-12): this used to run unconditionally,
+    // which clobbered start()'s own failure-message labels ("SD write
+    // failed...", "Promiscuous mode failed to start") one loop iteration
+    // after they were set -- s_active stays false in both failure paths, so
+    // the screen would silently settle on "Capturing... 0 packets (0
+    // dropped)" forever, reading as a healthy just-started capture instead
+    // of the failure it actually is. Gating on s_active makes a failure
+    // message set by start() persist until the screen closes or a new
+    // start() supersedes it.
+    if (!s_active) return;
+
     char buf[64];
     snprintf(buf, sizeof(buf), "Capturing... %lu packets (%lu dropped)",
              (unsigned long)s_packet_count, (unsigned long)s_dropped_count);

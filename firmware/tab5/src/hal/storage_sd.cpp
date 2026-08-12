@@ -179,14 +179,28 @@ bool StorageSD::write_capture_file(const char *path, const uint8_t *data, size_t
 }
 
 bool StorageSD::append_capture_file(const char *path, const uint8_t *data, size_t len) {
-    ensure_parent_dirs(path);
     // FILE_APPEND is the ESP32 SD_MMC/FS library's append-mode open flag --
     // seeks to end-of-file (creating the file if it doesn't exist yet)
     // instead of truncating like FILE_WRITE does. This is what lets poll()
     // call this repeatedly across many drain cycles without clobbering
     // packet records already written to the same capture file.
+    //
+    // Task review finding (2026-08-12): ensure_parent_dirs() used to run
+    // unconditionally here, adding 3 redundant SD_MMC.mkdir() RPC calls to
+    // every single drain -- potentially several times a second for the
+    // whole duration of an active capture -- even though the one caller in
+    // this codebase (wifi_pmkid.cpp's poll(), draining after start()'s
+    // write_capture_file() call already created the same directory tree
+    // once) never needs it again. Try the open first; only pay for
+    // ensure_parent_dirs() (and retry) on the rarer path where it's
+    // actually missing, e.g. a future caller that appends without an
+    // earlier write_capture_file() call.
     File f = SD_MMC.open(path, FILE_APPEND);
-    if (!f) return false;
+    if (!f) {
+        ensure_parent_dirs(path);
+        f = SD_MMC.open(path, FILE_APPEND);
+        if (!f) return false;
+    }
     size_t written = f.write(data, len);
     f.close();
     return written == len;
