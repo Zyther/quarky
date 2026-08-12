@@ -259,6 +259,13 @@ void loop() {
             // hardware-verification harness cannot produce.
             Serial.println("quarky-tab5: [debug] WifiScanFeature::start() via serial trigger");
             WifiScanFeature::start();
+        } else if (c == 's') {
+            // Same entry point the "WiFi Spectrum" launcher tile calls.
+            // Added for the Task 5 real-hardware verification pass (same
+            // reasoning as 'w' above): only reachable by a physical tap
+            // otherwise.
+            Serial.println("quarky-tab5: [debug] WifiSpectrumFeature::start() via serial trigger");
+            WifiSpectrumFeature::start();
         }
     }
     // --- end debug aid ---

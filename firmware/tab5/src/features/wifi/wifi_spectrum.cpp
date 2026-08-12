@@ -40,7 +40,7 @@ static lv_obj_t *build_screen() {
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
 
     s_chart = lv_chart_create(content);
-    lv_obj_set_size(s_chart, LV_PCT(95), LV_PCT(90));
+    lv_obj_set_size(s_chart, LV_PCT(95), LV_PCT(80));
     lv_chart_set_type(s_chart, LV_CHART_TYPE_BAR);
     // LVGL 9 renamed the v8-era lv_chart_set_range() to
     // lv_chart_set_axis_range() (confirmed against the actual
@@ -51,6 +51,23 @@ static lv_obj_t *build_screen() {
     lv_chart_set_point_count(s_chart, 14); // channels 1-14
     s_series = lv_chart_add_series(s_chart, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
     for (int i = 0; i < 14; i++) lv_chart_set_next_value(s_chart, s_series, -100);
+
+    // Real-hardware finding (2026-08-12, controller verification pass): the
+    // chart alone gives no indication of which bar is which channel. LVGL's
+    // built-in axis ticks render numeric divisions of the axis range, not
+    // arbitrary per-bar text, so a plain row of labels underneath -- one per
+    // channel, evenly spaced the same way the chart's own bars are -- is
+    // simpler and more legible here than fighting the tick-label API for a
+    // 14-category axis.
+    lv_obj_t *labels_row = lv_obj_create(content);
+    lv_obj_remove_style_all(labels_row);
+    lv_obj_set_size(labels_row, LV_PCT(95), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(labels_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(labels_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    for (int ch = 1; ch <= 14; ch++) {
+        lv_obj_t *label = lv_label_create(labels_row);
+        lv_label_set_text_fmt(label, "%d", ch);
+    }
 
     // The chart (and s_series/s_active/s_scanning) must not outlive the
     // screen -- the scaffold's Back button pops the screen and deletes it
