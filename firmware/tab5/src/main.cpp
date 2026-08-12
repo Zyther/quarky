@@ -16,6 +16,7 @@
 #include "ui/pairing_screen.h"
 #include "features/ping_feature.h"
 #include "features/wifi/wifi_scan.h"
+#include "features/wifi/wifi_spectrum.h"
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -93,6 +94,9 @@ void setup() {
     WifiScanFeature::register_module(); // Task 3: first WiFi-category tile
                                          // (Category::WIFI), same reason --
                                          // must run before Shell::build below
+    WifiSpectrumFeature::register_module(); // Task 5: live per-channel RSSI
+                                             // bar chart, same reason --
+                                             // must run before Shell::build below
 
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
@@ -208,6 +212,7 @@ void loop() {
     lvgl_port_tick();
     c2link_wifi.poll(); // no-ops when the AP never came up
     c2link_ble.poll();  // drains BLE frames received on the NimBLE host task
+    WifiSpectrumFeature::poll(); // no-ops unless the WiFi Spectrum screen is open
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
