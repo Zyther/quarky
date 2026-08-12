@@ -18,6 +18,7 @@
 #include "features/wifi/wifi_scan.h"
 #include "features/wifi/wifi_spectrum.h"
 #include "features/wifi/wifi_pmkid.h"
+#include "features/ble/ble_scan.h"
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -101,6 +102,9 @@ void setup() {
     WifiPmkidFeature::register_module(); // Task 6: promiscuous-mode capture
                                           // to a pcap file on SD, same reason
                                           // -- must run before Shell::build below
+    BleScanFeature::register_module(); // Task 7: first BLE-category tile
+                                        // (Category::BLE), same reason --
+                                        // must run before Shell::build below
 
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
@@ -219,6 +223,8 @@ void loop() {
     WifiSpectrumFeature::poll(); // no-ops unless the WiFi Spectrum screen is open
     WifiPmkidFeature::poll();    // no-ops unless the PMKID capture screen is open;
                                   // drains the promiscuous-mode ring buffer to SD
+    BleScanFeature::poll();      // no-ops unless the BLE Scan screen is open;
+                                  // pushes gap_scan_event_cb's discoveries to the list
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
@@ -281,6 +287,16 @@ void loop() {
             // headlessly.
             Serial.println("quarky-tab5: [debug] WifiPmkidFeature::start() via serial trigger");
             WifiPmkidFeature::start();
+        } else if (c == 'g') {
+            // Same entry point the "BLE Scan" launcher tile calls. Added for
+            // Task 7's real-hardware verification pass (same reasoning as
+            // 'w'/'s'/'m' above): only reachable by a physical tap otherwise,
+            // and this is the first exercise of ble_gap_disc() (BLE central/
+            // observer role) in this project -- worth being able to trigger
+            // headlessly to check for the concurrent scan-while-advertising
+            // question this task's brief flags.
+            Serial.println("quarky-tab5: [debug] BleScanFeature::start() via serial trigger");
+            BleScanFeature::start();
         }
     }
     // --- end debug aid ---

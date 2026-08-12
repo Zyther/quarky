@@ -33,3 +33,10 @@ public:
 // c2link_wifi_last_recv_ms() -- see Task 19 (devices_panel.cpp polls this to
 // derive link freshness for the shell's status bar).
 uint32_t c2link_ble_last_recv_ms();
+
+// True once the NimBLE host and (remote C6) controller have synced and
+// on_sync() has run (i.e. this device is actively advertising as a GATT
+// server). Task 7: features that also need the BLE host for a central/
+// observer-role call (e.g. ble_gap_disc() scanning) check this first --
+// calling into NimBLE before sync leaves the host in an undefined state.
+bool c2link_ble_host_synced();

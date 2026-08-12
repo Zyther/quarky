@@ -90,6 +90,10 @@ static uint8_t s_own_addr_type = 0;
 // c2link_ble_last_recv_ms() is read from in main.cpp's loop() -- no portMUX
 // needed for this one word, unlike s_rx_head/s_rx_tail above.
 static uint32_t s_last_recv_ms = 0;
+// Task 7: set from on_sync() below; read by c2link_ble_host_synced() so
+// central/observer-role features (BLE scan) know it's safe to call into the
+// NimBLE host.
+static bool s_host_synced = false;
 
 // Inbound frames are decoded on NimBLE's host task (in rx_access_cb) and handed
 // to the main task via this single-producer/single-consumer ring, drained by
@@ -275,6 +279,7 @@ static void on_sync() {
         return;
     }
     start_advertising();
+    s_host_synced = true;
 }
 
 static void host_task(void *) {
@@ -413,4 +418,8 @@ void C2LinkBle::poll() {
 
 uint32_t c2link_ble_last_recv_ms() {
     return s_last_recv_ms;
+}
+
+bool c2link_ble_host_synced() {
+    return s_host_synced;
 }
