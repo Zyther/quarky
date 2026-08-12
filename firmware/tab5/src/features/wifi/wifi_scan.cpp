@@ -11,6 +11,15 @@ extern FeatureRegistry g_registry;
 namespace WifiScanFeature {
 
 static lv_obj_t *s_list = nullptr;
+// Task-review finding (2026-08-11, Phase 2 Task 3 hotfix review): owning the
+// timer handle here (rather than letting scan_poll_timer_cb notice s_list==
+// nullptr on its own next 250ms tick) closes a real race -- Back-then-reopen
+// inside that window used to leave the old timer alive polling a NEW list
+// (s_list had already been reassigned, not nulled), with two timers driving
+// one shared wifi_scan_begin()/s_scan_started_ms state. Deleting the timer
+// synchronously from the list's own LV_EVENT_DELETE makes "the list is gone"
+// and "the timer is gone" the same event, not a race between two.
+static lv_timer_t *s_poll_timer = nullptr;
 
 static lv_obj_t *build_screen() {
     // Menu-bar Back button + flex content area, same as every other
@@ -23,11 +32,18 @@ static lv_obj_t *build_screen() {
     lv_obj_set_size(s_list, LV_PCT(100), LV_PCT(100));
     lv_list_add_text(s_list, "Scanning...");
     // The list dies with the screen when Back is tapped (ScreenStack::pop()
-    // deletes it). Clearing s_list from the widget's own delete event, rather
-    // than from the Back button's click handler, covers every path that can
-    // destroy it -- including a pop triggered from somewhere else -- so
-    // run_scan_and_populate() can never write through a dangling pointer.
-    lv_obj_add_event_cb(s_list, [](lv_event_t *e) { s_list = nullptr; }, LV_EVENT_DELETE, nullptr);
+    // deletes it). Clearing s_list (and the poll timer, if any) from the
+    // widget's own delete event, rather than from the Back button's click
+    // handler, covers every path that can destroy it -- including a pop
+    // triggered from somewhere else -- so run_scan_and_populate() can never
+    // write through a dangling pointer, and no stale timer can outlive it.
+    lv_obj_add_event_cb(s_list, [](lv_event_t *e) {
+        s_list = nullptr;
+        if (s_poll_timer) {
+            lv_timer_delete(s_poll_timer);
+            s_poll_timer = nullptr;
+        }
+    }, LV_EVENT_DELETE, nullptr);
 
     return screen;
 }
@@ -38,7 +54,7 @@ static lv_obj_t *build_screen() {
 // stays responsive -- Back included -- for the whole scan.
 static void scan_poll_timer_cb(lv_timer_t *timer) {
     if (!s_list) { // Back was tapped; the list (and screen) are gone
-        lv_timer_delete(timer);
+        s_poll_timer = nullptr; // already being deleted by the DELETE handler above
         return;
     }
 
@@ -48,6 +64,7 @@ static void scan_poll_timer_cb(lv_timer_t *timer) {
         return; // still scanning
     }
     lv_timer_delete(timer);
+    s_poll_timer = nullptr;
 
     lv_obj_clean(s_list);
     if (n == -2) {
@@ -123,7 +140,7 @@ void start() {
         lv_list_add_text(s_list, "Could not start scan (radio unavailable)");
         return;
     }
-    lv_timer_create(scan_poll_timer_cb, 250, nullptr);
+    s_poll_timer = lv_timer_create(scan_poll_timer_cb, 250, nullptr);
 }
 
 } // namespace WifiScanFeature
