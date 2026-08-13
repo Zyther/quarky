@@ -19,8 +19,13 @@ static constexpr uint32_t kSpikeTimeoutMs = 8000;
 
 // Written on the NimBLE host task, read on the main/loop task (poll()) --
 // same cross-task situation ble_scan.cpp documents for s_devices_dirty /
-// s_scan_complete. Single words, so volatile is sufficient here (no portMUX
-// needed for the same reason c2link_ble.cpp's s_last_recv_ms doesn't get one).
+// s_scan_complete, which is the correct precedent here: single-word
+// scalars crossing a real task boundary, where volatile alone suffices.
+// (c2link_ble.cpp's s_last_recv_ms is a different case -- it never crosses
+// a task boundary at all, written and read only from the main task, so
+// it needed neither volatile nor a portMUX; citing it here would wrongly
+// suggest the reason these are safe is "no cross-task hazard," when the
+// real reason is "cross-task hazard exists, but only on single words.")
 static volatile uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static volatile uint32_t s_svc_count = 0;
 static volatile uint32_t s_connect_started_ms = 0;
