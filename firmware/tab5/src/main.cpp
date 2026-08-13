@@ -100,9 +100,18 @@ void setup() {
     WifiSpectrumFeature::register_module(); // Task 5: live per-channel RSSI
                                              // bar chart, same reason --
                                              // must run before Shell::build below
-    WifiPmkidFeature::register_module(); // Task 6: promiscuous-mode capture
-                                          // to a pcap file on SD, same reason
-                                          // -- must run before Shell::build below
+    // Task 6's WifiPmkidFeature::register_module() is deliberately NOT
+    // called. Final whole-branch review finding I3 (2026-08-13): real
+    // hardware confirmed promiscuous mode is a hard esp-hosted limitation
+    // (see wifi_pmkid.cpp's file-level comment) -- a registered tile would
+    // fail on every single tap, and (before this same fix also reordered
+    // wifi_pmkid.cpp's start()) was writing a fresh, permanently-empty pcap
+    // file to SD before even checking promiscuous-mode availability, so
+    // every tap also littered /quarky/captures/wifi/ with junk. The plan's
+    // decision to keep the CODE merged (UI, ring buffer, pcap writer,
+    // IStorage capture-file methods) as reusable reference for a future
+    // native-radio port stands -- it just isn't reachable from the
+    // launcher. Re-add this call if/when that port happens.
     BleScanFeature::register_module(); // Task 7: first BLE-category tile
                                         // (Category::BLE), same reason --
                                         // must run before Shell::build below

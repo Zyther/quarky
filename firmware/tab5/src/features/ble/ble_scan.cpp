@@ -50,6 +50,13 @@ static portMUX_TYPE s_devices_mux = portMUX_INITIALIZER_UNLOCKED;
 // the list on loop() ticks where nothing changed -- see refresh throttling
 // below.
 static volatile bool s_devices_dirty = false;
+// Final whole-branch review finding M6 (2026-08-13): set (no lock needed --
+// a single bool, same class as s_devices_dirty above) when
+// BLE_GAP_EVENT_DISC_COMPLETE fires; poll() checks this to know the 10s
+// scan window closed on its own, rather than the list simply going quiet
+// with nothing telling the user why. volatile per this file's own
+// cross-task convention (written on the NimBLE host task, read on main).
+static volatile bool s_scan_complete = false;
 
 static void add_or_update(const BleDeviceInfo &d) {
     portENTER_CRITICAL(&s_devices_mux);
@@ -72,6 +79,10 @@ static void add_or_update(const BleDeviceInfo &d) {
 // s_devices_mux comment above for why its writes to s_devices/
 // s_device_count (via add_or_update()) are locked.
 static int gap_scan_event_cb(struct ble_gap_event *event, void *arg) {
+    if (event->type == BLE_GAP_EVENT_DISC_COMPLETE) {
+        s_scan_complete = true;
+        return 0;
+    }
     if (event->type != BLE_GAP_EVENT_DISC) return 0;
 
     BleDeviceInfo d{};
@@ -160,8 +171,17 @@ static lv_obj_t *build_screen() {
         return screen;
     }
 
+    // Final whole-branch review finding M5 (2026-08-13): s_device_count's
+    // reset used to run outside s_devices_mux, the one unlocked touch of an
+    // otherwise uniformly-locked variable. Safe by construction (no
+    // producer task exists until ble_gap_disc() below is actually called),
+    // but locked anyway for uniformity -- an unlocked exception invites a
+    // future edit to assume the lock is optional here.
+    portENTER_CRITICAL(&s_devices_mux);
     s_device_count = 0;
+    portEXIT_CRITICAL(&s_devices_mux);
     s_devices_dirty = false;
+    s_scan_complete = false;
     struct ble_gap_disc_params params{};
     params.passive = 0;         // active scan, matches Cardputer-ADV's Task 17 fix
                                   // (setActiveScan(true)) that was needed to see
@@ -200,6 +220,26 @@ static constexpr uint32_t kRefreshIntervalMs = 250;
 
 void poll() {
     if (!s_scanning) return;
+
+    // Final whole-branch review finding M6 (2026-08-13): this used to have
+    // no path that ever noticed the scan's own 10s window closing --
+    // s_scanning stayed true for the life of the screen, the list just
+    // stopped updating, and the user had no way to tell "scan finished"
+    // from "nothing else nearby." Handle BLE_GAP_EVENT_DISC_COMPLETE (set
+    // by gap_scan_event_cb above) by doing one final refresh, appending a
+    // completion row, and clearing s_scanning so this branch stops running.
+    if (s_scan_complete) {
+        refresh_list_ui();
+        if (s_list) {
+            char row[32];
+            snprintf(row, sizeof(row), "Scan complete (%d devices)", s_device_count);
+            lv_list_add_text(s_list, row);
+        }
+        s_scanning = false;
+        s_scan_complete = false;
+        return;
+    }
+
     if (!s_devices_dirty) return;
     uint32_t now = millis();
     if (now - s_last_refresh_ms < kRefreshIntervalMs) return;

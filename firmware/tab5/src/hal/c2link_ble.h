@@ -35,8 +35,18 @@ public:
 uint32_t c2link_ble_last_recv_ms();
 
 // True once the NimBLE host and (remote C6) controller have synced and
-// on_sync() has run (i.e. this device is actively advertising as a GATT
-// server). Task 7: features that also need the BLE host for a central/
-// observer-role call (e.g. ble_gap_disc() scanning) check this first --
-// calling into NimBLE before sync leaves the host in an undefined state.
+// on_sync() has run. Task 7: features that also need the BLE host for a
+// central/observer-role call (e.g. ble_gap_disc() scanning) check this
+// first -- calling into NimBLE before sync leaves the host in an undefined
+// state.
+//
+// Final whole-branch review finding M7 (2026-08-13): this used to
+// parenthetically claim sync also means "this device is actively
+// advertising as a GATT server" -- true only until Task 8 (BLE Spam) runs,
+// which stops that advertisement in favor of its own (see ble_spam.cpp's
+// file-level comment for the single-advertisement-instance constraint).
+// The actual, still-correct contract this function's two real callers rely
+// on is narrower: the host is synced, so central/observer calls are safe.
+// Dropped the parenthetical rather than qualify it, since nothing consumes
+// the advertising-state claim.
 bool c2link_ble_host_synced();

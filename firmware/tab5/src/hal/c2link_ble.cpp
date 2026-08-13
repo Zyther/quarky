@@ -90,10 +90,24 @@ static uint8_t s_own_addr_type = 0;
 // c2link_ble_last_recv_ms() is read from in main.cpp's loop() -- no portMUX
 // needed for this one word, unlike s_rx_head/s_rx_tail above.
 static uint32_t s_last_recv_ms = 0;
-// Task 7: set from on_sync() below; read by c2link_ble_host_synced() so
-// central/observer-role features (BLE scan) know it's safe to call into the
-// NimBLE host.
-static bool s_host_synced = false;
+// Task 7: set from on_sync() below (NimBLE host task) and read by
+// c2link_ble_host_synced() (main task) so central/observer-role features
+// (BLE scan) know it's safe to call into the NimBLE host. volatile per the
+// house rule below -- final whole-branch review finding M5 (2026-08-13)
+// caught this one missing it, inconsistent with s_connected/s_subscribed
+// just above in this same block.
+static volatile bool s_host_synced = false;
+
+// House rule this file has followed since Task 13 but never stated
+// (whole-branch review finding M5, 2026-08-13, written here once so it
+// stops drifting across features that copy this file's patterns): any
+// scalar written on one task and read on another is `volatile`
+// (s_connected, s_subscribed, s_host_synced above; s_rx_head/s_rx_tail
+// below are also volatile for the same reason, on top of the portMUX).
+// Anything multi-word or multi-field crossing that same boundary needs the
+// portMUX_TYPE/portENTER_CRITICAL/portEXIT_CRITICAL pattern below, not just
+// volatile -- volatile alone doesn't make a multi-field struct copy atomic
+// (see ble_scan.cpp's s_devices for the real bug this distinction caught).
 
 // Inbound frames are decoded on NimBLE's host task (in rx_access_cb) and handed
 // to the main task via this single-producer/single-consumer ring, drained by

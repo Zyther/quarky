@@ -90,9 +90,26 @@ static lv_obj_t *build_screen() {
     // click handler, covers every path that can destroy it (not just a tap
     // on Back) -- same pattern ble_scan.cpp uses for its own s_list/
     // s_scanning teardown.
+    //
+    // Final whole-branch review finding I1 (2026-08-13): this used to clear
+    // only s_active/s_status_label, leaving the last ble_gap_adv_start(...,
+    // BLE_HS_FOREVER, ...) issued by send_one_advertisement() still live --
+    // the Tab5 kept broadcasting the spoofed AirPods payload indefinitely
+    // after Back was tapped, with no UI indicating it, matching neither
+    // wifi_pmkid.cpp's nor ble_scan.cpp's precedent (both stop their radio
+    // activity from this exact handler). Fixed by adding ble_gap_adv_stop()
+    // here, symmetric with those two.
+    //
+    // This does NOT restore c2link_ble's C2 advertisement -- that remains
+    // the disclosed, explicitly out-of-scope follow-up (a
+    // c2link_ble_rearm_advertising() call, per the file-level comment
+    // above). Stopping the transmitter is the part that must not wait;
+    // re-arming the C2 link is real follow-up work, not a one-line fix.
     lv_obj_add_event_cb(s_status_label, [](lv_event_t *e) {
         s_active = false;
         s_status_label = nullptr;
+        int rc = ble_gap_adv_stop();
+        Serial.printf("quarky-tab5: [ble-spam] ble_gap_adv_stop rc=%d\n", rc);
     }, LV_EVENT_DELETE, nullptr);
 
     s_active = true;

@@ -139,9 +139,18 @@ static void ring_push(const uint8_t *data, size_t len) {
     portEXIT_CRITICAL(&s_ring_mux);
 }
 
-static bool s_active = false;
+// s_active and s_packet_count cross the same driver-task/main-task boundary
+// s_ring_head/s_ring_tail/s_dropped_count above do (s_active is read inside
+// promiscuous_rx_cb and written from the main task; s_packet_count is
+// incremented in the callback and read in poll()), so both are volatile for
+// the same reason -- final whole-branch review finding M5 (2026-08-13)
+// caught these as inconsistent with s_dropped_count three lines above.
+// s_path/s_header_written are touched only from the main task (start()/
+// poll()/the LV_EVENT_DELETE handler), never from promiscuous_rx_cb, so
+// they correctly stay plain.
+static volatile bool s_active = false;
 static char s_path[64];
-static uint32_t s_packet_count = 0;
+static volatile uint32_t s_packet_count = 0;
 static bool s_header_written = false;
 
 static void IRAM_ATTR promiscuous_rx_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
@@ -236,31 +245,47 @@ void start() {
 
     ScreenStack::push(build_screen());
 
-    snprintf(s_path, sizeof(s_path), "/quarky/captures/wifi/capture_%lu.pcap", millis());
     s_packet_count = 0;
     s_dropped_count = 0;
     s_ring_head = 0;
     s_ring_tail = 0;
     s_header_written = false;
 
+    // Final whole-branch review finding I3 (2026-08-13): this used to
+    // create and write the pcap file BEFORE checking whether promiscuous
+    // mode is even available -- on hardware where it isn't (confirmed:
+    // it's a hard esp-hosted limitation, see the file-level comment above),
+    // every single call created a permanently-empty capture file with
+    // nothing ever cleaning it up. Reordered so the capability check comes
+    // first; no file is created at all unless there's something to write
+    // into it. This tile is no longer registered in the launcher
+    // (main.cpp), but the ordering is fixed here too since it would be
+    // just as wrong on the native-radio target this code is kept as
+    // reference for.
+    esp_err_t cb_err = esp_wifi_set_promiscuous_rx_cb(&promiscuous_rx_cb);
+    esp_err_t en_err = esp_wifi_set_promiscuous(true);
+    Serial.printf("quarky-tab5: wifi_pmkid promiscuous rx_cb_err=%d set_err=%d\n",
+                  (int)cb_err, (int)en_err);
+
+    if (cb_err != ESP_OK || en_err != ESP_OK) {
+        s_active = false;
+        if (en_err == ESP_OK) esp_wifi_set_promiscuous(false); // don't leave it half-enabled
+        if (s_status_label) lv_label_set_text(s_status_label, "Promiscuous mode failed to start");
+        return;
+    }
+
+    snprintf(s_path, sizeof(s_path), "/quarky/captures/wifi/capture_%lu.pcap", millis());
     PcapGlobalHeader ghdr;
     ghdr.snaplen = (uint32_t)kSnapLen;
     if (!storage.write_capture_file(s_path, (const uint8_t *)&ghdr, sizeof(ghdr))) {
         Serial.println("quarky-tab5: wifi_pmkid capture file header write FAILED");
+        esp_wifi_set_promiscuous(false); // don't capture into a file that doesn't exist
+        s_active = false;
         if (s_status_label) lv_label_set_text(s_status_label, "SD write failed, capture not started");
-        return; // don't enable promiscuous mode against a file we couldn't create
+        return;
     }
     s_header_written = true;
-
-    esp_err_t cb_err = esp_wifi_set_promiscuous_rx_cb(&promiscuous_rx_cb);
-    esp_err_t en_err = esp_wifi_set_promiscuous(true);
-    Serial.printf("quarky-tab5: wifi_pmkid promiscuous rx_cb_err=%d set_err=%d path=%s\n",
-                  (int)cb_err, (int)en_err, s_path);
-
-    s_active = (cb_err == ESP_OK && en_err == ESP_OK);
-    if (!s_active && s_status_label) {
-        lv_label_set_text(s_status_label, "Promiscuous mode failed to start");
-    }
+    s_active = true;
 }
 
 void poll() {
