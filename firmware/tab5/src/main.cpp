@@ -20,6 +20,9 @@
 #include "features/wifi/wifi_pmkid.h"
 #include "features/ble/ble_scan.h"
 #include "features/ble/ble_spam.h"
+#include "features/ble/ble_central_spike.h" // Task 1 (2nd Phase 2 plan): spike
+                                             // only -- no register_module(), no
+                                             // launcher tile; serial-trigger 'c'
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -243,6 +246,9 @@ void loop() {
                                   // NOTE: while active this STOPS c2link_ble's C2
                                   // advertisement (legacy BLE adv is single-instance,
                                   // system-wide) -- disclosed tradeoff, see ble_spam.cpp
+    BleCentralSpike::poll();     // no-ops unless the central-connect spike is in
+                                  // flight; only enforces the spike's own timeout so
+                                  // a stalled connection can't be left dangling
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
@@ -326,6 +332,24 @@ void loop() {
             // ble_spam.cpp's disclosed single-advertisement-instance note).
             Serial.println("quarky-tab5: [debug] BleSpamFeature::start() via serial trigger");
             BleSpamFeature::start();
+        } else if (c == 'c') {
+            // Task 1 of the second Phase 2 plan: the BLE central/
+            // client-connect SPIKE. Unlike every other trigger above this one
+            // has NO launcher tile at all -- it is a one-shot experiment, not
+            // a feature, so serial is its only entry point by design (not
+            // just for headless convenience).
+            //
+            // Connects to the FIRST device the most recent BLE Scan found, so
+            // run BLE Scan ('g') first and let it populate. See
+            // ble_central_spike.h for exactly what this tests and why a
+            // negative result matters.
+            Serial.println("quarky-tab5: [debug] BleCentralSpike::run() via serial trigger");
+            const uint8_t *addr = BleScanFeature::first_device_addr();
+            if (addr) {
+                BleCentralSpike::run(addr, BleScanFeature::first_device_addr_type());
+            } else {
+                Serial.println("quarky-tab5: [debug] no scanned device available -- run BLE Scan ('g') first");
+            }
         }
     }
     // --- end debug aid ---

@@ -87,6 +87,8 @@ static int gap_scan_event_cb(struct ble_gap_event *event, void *arg) {
 
     BleDeviceInfo d{};
     memcpy(d.addr, event->disc.addr.val, 6);
+    d.addr_type = event->disc.addr.type; // needed by the Task 1 central-connect
+                                          // spike; see BleDeviceInfo's comment
     ble_addr_to_str(d.addr, d.addr_str);
     d.rssi = event->disc.rssi;
 
@@ -246,6 +248,36 @@ void poll() {
     refresh_list_ui();
     s_devices_dirty = false;
     s_last_refresh_ms = now;
+}
+
+// Added for the second Phase 2 plan's Task 1 central-connect spike -- it needs
+// a real, recently-seen peripheral to connect to, and the BLE Scan screen's
+// device list is the only source of one in this firmware. Takes s_devices_mux
+// like every other reader of s_devices/s_device_count (see that variable's
+// comment above): this is called from the main task while gap_scan_event_cb
+// may still be writing on the NimBLE host task.
+static uint8_t s_first_addr[6];
+static uint8_t s_first_addr_type = 0;
+
+const uint8_t *first_device_addr() {
+    portENTER_CRITICAL(&s_devices_mux);
+    bool has_one = s_device_count > 0;
+    if (has_one) {
+        memcpy(s_first_addr, s_devices[0].addr, 6);
+        s_first_addr_type = s_devices[0].addr_type;
+    }
+    portEXIT_CRITICAL(&s_devices_mux);
+    return has_one ? s_first_addr : nullptr;
+}
+
+uint8_t first_device_addr_type() {
+    // Populated by first_device_addr() above, which callers always invoke
+    // first (it is the null check). Re-read under the lock anyway so a
+    // standalone call still returns a real value rather than a stale one.
+    portENTER_CRITICAL(&s_devices_mux);
+    if (s_device_count > 0) s_first_addr_type = s_devices[0].addr_type;
+    portEXIT_CRITICAL(&s_devices_mux);
+    return s_first_addr_type;
 }
 
 } // namespace BleScanFeature
