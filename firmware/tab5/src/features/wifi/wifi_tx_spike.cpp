@@ -38,9 +38,17 @@ void run(uint8_t channel) {
     esp_err_t rc2 = esp_wifi_80211_tx(WIFI_IF_STA, frame, sizeof(frame), false);
     Serial.printf("quarky-tab5: [wifi-tx-spike] spoofed-MAC deauth tx rc=0x%x (%s)\n",
                   rc2, rc2 == ESP_OK ? "OK" : "FAILED");
-    Serial.println("quarky-tab5: [wifi-tx-spike] done -- check an external monitor-mode "
-                    "capture or WiFi analyzer on this channel to confirm which frame(s), "
-                    "if any, actually reached the air");
+    // Real hardware (2026-08-10): both rc1 and rc2 above are
+    // ESP_ERR_NOT_SUPPORTED (0x106), always -- the call fails synchronously
+    // before any transmission is attempted, so no external monitor-mode
+    // confirmation is needed or would change the answer. See wifi_tx_spike.h
+    // for the full, current result; this message is stale runtime advice
+    // from before that was known and is unreachable since run() is never
+    // called (kept for whoever eventually re-wires this on native-radio
+    // hardware, where the answer may differ).
+    Serial.println("quarky-tab5: [wifi-tx-spike] done -- rc != ESP_OK on this hardware means "
+                    "the transport rejected the call before any transmission was attempted "
+                    "(see wifi_tx_spike.h); only re-check externally if this target's rc is OK");
 }
 
 } // namespace WifiTxSpike
