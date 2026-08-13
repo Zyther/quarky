@@ -23,6 +23,9 @@
 #include "features/ble/ble_central_spike.h" // Task 1 (2nd Phase 2 plan): spike
                                              // only -- no register_module(), no
                                              // launcher tile; serial-trigger 'c'
+#include "features/ble/ble_hid_spike.h" // Task 2 (2nd Phase 2 plan): spike only
+                                         // -- no register_module(), no launcher
+                                         // tile; serial-triggers 'h' and 'j'
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -350,6 +353,26 @@ void loop() {
             } else {
                 Serial.println("quarky-tab5: [debug] no scanned device available -- run BLE Scan ('g') first");
             }
+        } else if (c == 'h') {
+            // Task 2 of the second Phase 2 plan: the BLE HID / Bad-KB SPIKE.
+            // Like 'c' above this has NO launcher tile -- it is a one-shot
+            // experiment, not a feature.
+            //
+            // NOTE, disclosed: this STOPS c2link_ble's C2 advertisement and
+            // restarts the whole local GATT server to register the HID
+            // service (see ble_hid_spike.h/.cpp). Reboot to get the C2
+            // advertisement back. Must not be run while a C2 BLE peer is
+            // connected.
+            Serial.println("quarky-tab5: [debug] BleHidSpike::start() via serial trigger");
+            BleHidSpike::start();
+        } else if (c == 'j') {
+            // Second half of the Task 2 spike: send one 'a' keystroke to the
+            // paired host. The brief suggested 'k' for this, but 'k' is the
+            // pairing-screen trigger (and 'a'/'c'/'g'/'s' -- the other obvious
+            // mnemonics for "a", "hid", "keystroke", "send" -- are all taken
+            // too), so 'j' it is.
+            Serial.println("quarky-tab5: [debug] BleHidSpike::send_test_keystroke() via serial trigger");
+            BleHidSpike::send_test_keystroke();
         }
     }
     // --- end debug aid ---
