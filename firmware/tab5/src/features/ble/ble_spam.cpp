@@ -1,4 +1,5 @@
 #include "ble_spam.h"
+#include "ble_common.h"
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
 #include <Arduino.h> // Serial (real NimBLE return-code logging, same as c2link_ble.cpp/ble_scan.cpp)
@@ -96,6 +97,21 @@ static lv_obj_t *build_screen() {
 
     s_active = true;
     s_last_rotate_ms = 0; // force an immediate first send in poll()
+
+    // Real-hardware verification diagnostic (2026-08-13): logging the exact
+    // address this advertisement broadcasts under, so it can be searched for
+    // by MAC in a real BLE scanner's results -- distinguishing "not
+    // broadcasting at all" from "broadcasting, but not recognized/shown as
+    // an AirPods popup" (the latter is a known, common outcome on iOS
+    // versions that have hardened against this class of Continuity spoof;
+    // not a code defect if the address IS found broadcasting the expected
+    // payload).
+    uint8_t own_addr_val[6];
+    if (ble_hs_id_copy_addr(BLE_ADDR_PUBLIC, own_addr_val, nullptr) == 0) {
+        char addr_str[18];
+        ble_addr_to_str(own_addr_val, addr_str);
+        Serial.printf("quarky-tab5: [ble-spam] broadcasting under address %s\n", addr_str);
+    }
 
     return screen;
 }
