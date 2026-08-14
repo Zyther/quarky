@@ -103,14 +103,28 @@ static volatile bool s_advertising = false;
 static bool s_svc_queued = false;
 static char s_prev_device_name[32] = {0};
 
-// Both are written on the main task and read on the NimBLE host task without
-// volatile, unlike the scalars above. Deliberate, and safe by publication
-// order rather than by luck: s_report_val_handle is filled in during the
-// boot-time GATT registration and s_own_addr_type during start(), and both are
-// only ever read from gap_event_cb/start_advertising, which cannot run until
-// after start() has put an advertisement on the air. s_report_val_handle also
-// cannot be volatile even if we wanted it to be -- ble_gatt_chr_def::val_handle
-// is a plain uint16_t*, which a volatile uint16_t* does not convert to.
+// Neither is volatile, unlike the scalars above -- deliberate, safe by
+// publication order rather than by luck, but the two run in OPPOSITE
+// directions and shouldn't be read as a matched pair:
+//   - s_report_val_handle is written on the NimBLE HOST task, during the
+//     boot-time GATT registration (ble_gatts_start(), which the automatic
+//     ble_hs_start() runs before ble_hs_sync() fires) and read on the MAIN
+//     task, in start()/send_test_keystroke(). Safe because every reader
+//     gates on c2link_ble_host_synced() (volatile bool, set only after
+//     on_sync() runs, which is itself only after ble_gatts_start() returns)
+//     -- so a read can never observe the handle before it's been written.
+//     It also cannot be volatile even if we wanted it to be:
+//     ble_gatt_chr_def::val_handle is a plain uint16_t*, which a
+//     volatile uint16_t* does not convert to.
+//   - s_own_addr_type is written on the MAIN task, in start(), and read on
+//     the HOST task, from gap_event_cb/start_advertising -- which cannot
+//     run until after that same start() call has put an advertisement on
+//     the air, so the write always precedes any read.
+// (task-2-review.md re-review finding N1, 2026-08-14: an earlier version of
+// this comment attributed both variables' write to the main task, which was
+// true for s_report_val_handle before this file's C1 fix moved GATT
+// registration to boot time -- flagged because Task 15's Bad-KB feature is
+// expected to copy this file's pattern.)
 static uint16_t s_report_val_handle = 0;
 static uint8_t s_own_addr_type = 0;
 
