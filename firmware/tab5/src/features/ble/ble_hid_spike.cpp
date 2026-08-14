@@ -19,22 +19,34 @@
 // host). This file only adds its own GATT service and its own advertisement on
 // top of that already-running host -- it never calls nimble_port_init().
 //
-// SECOND DISCLOSED SIDE EFFECT (beyond the advertisement takeover documented in
-// ble_hid_spike.h): NimBLE's ble_gatts_add_svcs() only QUEUES a service; queued
-// services are not actually in the ATT database until ble_gatts_start() runs.
-// The host already started at boot, so this spike must call ble_gatts_start()
-// itself -- and that call resets and re-registers the WHOLE local GATT server,
-// c2link_ble's Nordic-UART service included. That is safe here (every service
-// def in this project is a file-scope static whose val_handle pointers are
-// simply refilled by the re-registration) but it is a real, global action, it
-// requires no peer to be connected and no GAP procedure in flight, and it is
-// the reason start() stops advertising before touching the server.
+// WHERE THE SERVICE GETS REGISTERED, and why it is not here in start().
 //
-// The brief's sketch for this task called ble_gatts_count_cfg() +
-// ble_gatts_add_svcs() with no ble_gatts_start(), which would have left the HID
-// service permanently absent from the ATT database -- a guaranteed FALSE
-// NEGATIVE for a spike whose entire question is "does a host see our HID
-// service". Deviation made deliberately; see task-2-report.md.
+// NimBLE's ble_gatts_add_svcs() only QUEUES a service definition; the queue is
+// drained exactly once, by the ble_gatts_start() that ble_hs_start() runs
+// automatically when the host task comes up. So the brief's sketch (count_cfg +
+// add_svcs from a runtime trigger, no start) would have left the HID service
+// permanently absent from the ATT database -- a guaranteed FALSE NEGATIVE for a
+// spike whose entire question is "does a host see our HID service".
+//
+// The first fix for that -- calling ble_gatts_start() from start() -- was WORSE,
+// and is the mistake this file most wants to stop anyone repeating.
+// ble_gatts_start() does not re-register the other services: it drains a queue
+// that by then contains only the newly-added one, while ble_att_svr_start() ->
+// ble_att_svr_free_start_mem() frees the heap block every already-registered ATT
+// attribute (GAP 0x1800, GATT 0x1801, c2link_ble's NUS) lives in. ble_att_svr_list
+// is never cleared, so it is left holding ~15 dangling pointers -- which
+// ble_gatts_start()'s own CCCD-cache loop then walks and dereferences before it
+// even returns. Use-after-free of the live GATT server, verified against the
+// shipped esp32p4 libbt.a by disassembly (task-2-review.md finding C1), not
+// inferred from headers.
+//
+// So registration happens at BOOT instead, via register_service() installed as a
+// c2link_ble GATT hook from main.cpp -- queued alongside c2link_ble's own service
+// and registered by the same single automatic ble_gatts_start(). start() only
+// advertises. Nothing in this file calls ble_gatts_start(); nothing should.
+//
+// Beyond the advertisement takeover documented in ble_hid_spike.h, that leaves
+// this spike with no side effects on c2link_ble's GATT server at all.
 //
 // Also note ESP-IDF's own NimBLE HID service helper (services/hid/ble_svc_hid.h)
 // is NOT usable here: the header ships, but libbt.a's ble_svc_hid.c.obj exports
@@ -74,15 +86,33 @@ static const char kDeviceName[] = "QuarkyKB";
 // stated in c2link_ble.cpp (and followed by ble_central_spike.cpp).
 static volatile uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static volatile bool s_notify_enabled = false;
+// "The spike is armed", not "a packet is going out right now": true from a
+// successful start() until stop(), including while a host is connected (a
+// connectable-undirected advertisement ends on connect, and the disconnect
+// handler re-arms it). Crosses the boundary the other way -- written on the
+// main task in start()/stop(), read on the host task in gap_event_cb to decide
+// whether a disconnect should resume advertising -- so volatile for the same
+// reason. Without that read, stop() would not stop: ble_gap_terminate()'s
+// asynchronous BLE_GAP_EVENT_DISCONNECT used to re-advertise unconditionally,
+// putting "QuarkyKB" back on the air milliseconds after stop() returned
+// (task-2-review.md finding I1).
+static volatile bool s_advertising = false;
 
-// Main-task-only state: both are read/written exclusively from start()/stop(),
-// which only ever run from main.cpp's serial-trigger path.
-static bool s_svc_registered = false;
-static bool s_advertising = false;
+// Main-task-only: read/written exclusively from start()/stop(), which only ever
+// run from main.cpp's serial-trigger path.
+static bool s_svc_queued = false;
 static char s_prev_device_name[32] = {0};
 
-// Filled in by ble_gatts_start()'s registration pass.
+// Both are written on the main task and read on the NimBLE host task without
+// volatile, unlike the scalars above. Deliberate, and safe by publication
+// order rather than by luck: s_report_val_handle is filled in during the
+// boot-time GATT registration and s_own_addr_type during start(), and both are
+// only ever read from gap_event_cb/start_advertising, which cannot run until
+// after start() has put an advertisement on the air. s_report_val_handle also
+// cannot be volatile even if we wanted it to be -- ble_gatt_chr_def::val_handle
+// is a plain uint16_t*, which a volatile uint16_t* does not convert to.
 static uint16_t s_report_val_handle = 0;
+static uint8_t s_own_addr_type = 0;
 
 // Report Protocol (1) vs Boot Protocol (0). We only implement Report Protocol;
 // the characteristic exists because hosts read it, and a write is accepted and
@@ -227,7 +257,7 @@ static const struct ble_gatt_svc_def s_hid_svcs[] = {
 
 // ---- Advertising + GAP ------------------------------------------------------
 
-static void start_advertising();
+static int start_advertising();
 
 static int gap_event_cb(struct ble_gap_event *event, void *) {
     switch (event->type) {
@@ -240,7 +270,9 @@ static int gap_event_cb(struct ble_gap_event *event, void *) {
         } else {
             Serial.printf("quarky-tab5: [ble-hid-spike] connect failed (status=%d)\n",
                           event->connect.status);
-            start_advertising(); // stay discoverable after a failed attempt
+            // Stay discoverable after a failed attempt -- unless stop() has
+            // already disarmed the spike (see s_advertising's comment).
+            if (s_advertising) start_advertising();
         }
         return 0;
     case BLE_GAP_EVENT_DISCONNECT:
@@ -248,7 +280,10 @@ static int gap_event_cb(struct ble_gap_event *event, void *) {
                       event->disconnect.reason);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_notify_enabled = false;
-        start_advertising(); // let the host reconnect without a re-trigger
+        // Let the host reconnect without a re-trigger -- but only if this
+        // disconnect wasn't stop()'s own ble_gap_terminate(). stop() clears
+        // s_advertising before terminating precisely so this check sees it.
+        if (s_advertising) start_advertising();
         return 0;
     case BLE_GAP_EVENT_SUBSCRIBE:
         // The single most informative event in this whole spike: a host that
@@ -270,9 +305,15 @@ static int gap_event_cb(struct ble_gap_event *event, void *) {
         Serial.printf("quarky-tab5: [ble-hid-spike] MTU now %u\n", event->mtu.value);
         return 0;
     case BLE_GAP_EVENT_REPEAT_PAIRING: {
-        // A host that bonded during an earlier run will re-pair on reconnect.
+        // Necessary, not merely defensive: this build has bonding ON
+        // (MYNEWT_VAL_BLE_SM_BONDING defaults to 1) with NVS persistence
+        // (CONFIG_BT_NIMBLE_NVS_PERSIST=1) and the bond store auto-installed by
+        // ble_hs_startup_go() -> ble_store_config_init(), so a host that bonded
+        // in an earlier run really does come back holding keys, across reboots.
         // Dropping the stale bond and retrying turns an otherwise-confusing
-        // silent failure into a normal pairing.
+        // silent failure into a normal pairing. Note the store caps at 3 bonds
+        // (CONFIG_BT_NIMBLE_MAX_BONDS=3) -- repeated spike runs against several
+        // hosts can fill it.
         struct ble_gap_conn_desc desc;
         if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0) {
             ble_store_util_delete_peer(&desc.peer_id_addr);
@@ -285,7 +326,9 @@ static int gap_event_cb(struct ble_gap_event *event, void *) {
     }
 }
 
-static void start_advertising() {
+// Returns the ble_gap_adv_start() return code (or the earlier failure's), so
+// start() can keep s_advertising honest instead of assuming success.
+static int start_advertising() {
     // Budget check against the 31-byte legacy advertisement limit:
     //   flags 3 + appearance 4 + one 16-bit UUID 4 + "QuarkyKB" 10 = 21 bytes.
     // The 0x1812 UUID is what makes an OS classify the device as HID BEFORE
@@ -306,7 +349,7 @@ static void start_advertising() {
     int rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
         Serial.printf("quarky-tab5: [ble-hid-spike] adv_set_fields rc=%d\n", rc);
-        return;
+        return rc;
     }
 
     struct ble_gap_adv_params adv_params;
@@ -314,18 +357,53 @@ static void start_advertising() {
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND; // connectable, undirected
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
-    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
+    // s_own_addr_type comes from ble_hs_id_infer_auto() in start(), matching
+    // c2link_ble.cpp's on_sync() -- the only advertising path this project has
+    // ever proven on hardware. A hardcoded BLE_OWN_ADDR_PUBLIC (what the
+    // brief's sketch used) returns BLE_HS_ENOADDR if the C6's controller has no
+    // usable public identity address, and the spike would silently never
+    // advertise: a false negative with nothing to do with HID, which is exactly
+    // the failure class this task exists to avoid (review finding I2).
+    rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER,
                            &adv_params, gap_event_cb, nullptr);
-    Serial.printf("quarky-tab5: [ble-hid-spike] ble_gap_adv_start rc=%d%s\n", rc,
-                  rc == 0 ? " -- advertising as \"QuarkyKB\"" : "");
+    Serial.printf("quarky-tab5: [ble-hid-spike] ble_gap_adv_start rc=%d (own addr type=%u)%s\n",
+                  rc, s_own_addr_type, rc == 0 ? " -- advertising as \"QuarkyKB\"" : "");
+    return rc;
 }
 
 // ---- Public API -------------------------------------------------------------
+
+void register_service() {
+    // Runs from c2link_ble.init(), on the main task, before the NimBLE host
+    // task exists. count_cfg + add_svcs ONLY -- see the file-level comment for
+    // what calling ble_gatts_start() here (or anywhere) would destroy.
+    int rc = ble_gatts_count_cfg(s_hid_svcs);
+    if (rc != 0) {
+        Serial.printf("quarky-tab5: [ble-hid-spike] gatts_count_cfg rc=%d\n", rc);
+        return;
+    }
+    rc = ble_gatts_add_svcs(s_hid_svcs);
+    if (rc != 0) {
+        Serial.printf("quarky-tab5: [ble-hid-spike] gatts_add_svcs rc=%d\n", rc);
+        return;
+    }
+    s_svc_queued = true;
+    Serial.println("quarky-tab5: [ble-hid-spike] HID service queued for boot-time registration");
+}
 
 void start() {
     if (!c2link_ble_host_synced()) {
         Serial.println("quarky-tab5: [ble-hid-spike] NimBLE host not synced "
                        "(C6 link down, or c2link_ble init failed) -- cannot start");
+        return;
+    }
+    if (!s_svc_queued) {
+        // register_service() never ran, so the HID service is not in the ATT
+        // database and nothing can be registered now. Advertising anyway would
+        // manufacture the exact false negative this spike must not produce.
+        Serial.println("quarky-tab5: [ble-hid-spike] HID service was never registered "
+                       "-- rebuild with -DQUARKY_SERIAL_DEBUG so main.cpp installs the "
+                       "boot-time c2link_ble GATT hook; not advertising");
         return;
     }
     if (s_advertising) {
@@ -337,57 +415,46 @@ void start() {
         return;
     }
 
-    // Stop whatever is currently advertising -- c2link_ble's C2 advertisement
-    // at minimum. Required twice over: legacy advertising is single-instance,
-    // and ble_gatts_start() below refuses to run (BLE_HS_EBUSY) while any GAP
-    // procedure is in flight.
+    // Legacy BLE advertising is single-instance system-wide, so take over from
+    // c2link_ble's C2 advertisement. This is the spike's only remaining side
+    // effect on c2link_ble; the GATT server is untouched.
     int rc = ble_gap_adv_stop();
     Serial.printf("quarky-tab5: [ble-hid-spike] ble_gap_adv_stop rc=%d "
                   "(c2link_ble's C2 advertisement is now down for this boot)\n", rc);
 
-    if (!s_svc_registered) {
-        // Snapshot the GAP device name so stop() can put it back -- the
-        // characteristic is global to the host, shared with c2link_ble.
-        const char *prev = ble_svc_gap_device_name();
-        if (prev != nullptr) {
-            strncpy(s_prev_device_name, prev, sizeof(s_prev_device_name) - 1);
-            s_prev_device_name[sizeof(s_prev_device_name) - 1] = '\0';
-        }
-        rc = ble_svc_gap_device_name_set(kDeviceName);
-        if (rc != 0) {
-            Serial.printf("quarky-tab5: [ble-hid-spike] device_name_set rc=%d\n", rc);
-        }
-
-        rc = ble_gatts_count_cfg(s_hid_svcs);
-        if (rc != 0) {
-            Serial.printf("quarky-tab5: [ble-hid-spike] gatts_count_cfg rc=%d\n", rc);
-            return;
-        }
-        rc = ble_gatts_add_svcs(s_hid_svcs);
-        if (rc != 0) {
-            Serial.printf("quarky-tab5: [ble-hid-spike] gatts_add_svcs rc=%d\n", rc);
-            return;
-        }
-        // Queued != registered. This is what actually puts the HID service in
-        // the ATT database, and it re-registers every other local service too
-        // (see the file-level comment). BLE_HS_EBUSY here means something was
-        // still connected or a GAP procedure was still running.
-        rc = ble_gatts_start();
-        if (rc != 0) {
-            Serial.printf("quarky-tab5: [ble-hid-spike] ble_gatts_start rc=%d "
-                          "-- HID service NOT registered%s\n", rc,
-                          rc == BLE_HS_EBUSY ? " (BLE_HS_EBUSY: a peer is connected "
-                                               "or a GAP procedure is active)" : "");
-            return;
-        }
-        s_svc_registered = true;
-        Serial.printf("quarky-tab5: [ble-hid-spike] HID service registered, "
-                      "input report value handle=%u (CCCD at %u)\n",
-                      s_report_val_handle, (unsigned)(s_report_val_handle + 1));
+    // Same derivation c2link_ble.cpp's on_sync() uses. Done here rather than
+    // once at registration time because register_service() runs before the
+    // controller has synced, when no identity address exists yet.
+    rc = ble_hs_id_infer_auto(0, &s_own_addr_type);
+    if (rc != 0) {
+        Serial.printf("quarky-tab5: [ble-hid-spike] ble_hs_id_infer_auto rc=%d "
+                      "-- no usable own address, not advertising\n", rc);
+        return;
     }
 
-    start_advertising();
-    s_advertising = true;
+    // Point the GAP Device Name characteristic at "QuarkyKB" too. Unconditional
+    // (not gated on first-run state) so a stop() -> start() cycle cannot leave
+    // the device advertising as "QuarkyKB" while 0x1800 still reads
+    // c2link_ble's name -- the post-connect mismatch this call exists to
+    // prevent (review finding M2). The strcmp guard keeps a repeated start()
+    // from snapshotting our own name as the one to restore.
+    const char *prev = ble_svc_gap_device_name();
+    if (prev != nullptr && strcmp(prev, kDeviceName) != 0) {
+        strncpy(s_prev_device_name, prev, sizeof(s_prev_device_name) - 1);
+        s_prev_device_name[sizeof(s_prev_device_name) - 1] = '\0';
+    }
+    rc = ble_svc_gap_device_name_set(kDeviceName);
+    if (rc != 0) {
+        Serial.printf("quarky-tab5: [ble-hid-spike] device_name_set rc=%d\n", rc);
+    }
+
+    Serial.printf("quarky-tab5: [ble-hid-spike] input report value handle=%u (CCCD at %u)\n",
+                  s_report_val_handle, (unsigned)(s_report_val_handle + 1));
+
+    // Only claim to be armed if the radio actually accepted the advertisement.
+    // Setting this unconditionally would both lie in the log and make the
+    // "already started" check above block a legitimate retry (finding M1).
+    s_advertising = (start_advertising() == 0);
 }
 
 void send_test_keystroke() {
@@ -398,12 +465,15 @@ void send_test_keystroke() {
         return;
     }
     if (!s_notify_enabled) {
-        // Refuse rather than lie: ble_gatts_notify_custom() returns 0 for an
-        // unsubscribed characteristic, so sending here would log rc=0 while
-        // delivering nothing at all.
+        // Refuse rather than lie. ble_gatts_notify_custom() performs no CCCD or
+        // subscription check whatsoever -- it hands the PDU to
+        // ble_att_clt_tx_notify() unconditionally and returns 0, and an
+        // unsubscribed host discards it on receipt. So sending here would log
+        // rc=0 twice while the keystroke goes nowhere, turning the spike's
+        // primary failure mode into an apparent success.
         Serial.println("quarky-tab5: [ble-hid-spike] host has NOT enabled input-report "
                        "notifications -- it did not bind a keyboard driver; not sending "
-                       "(a notify here would silently succeed and deliver nothing)");
+                       "(the notify would return rc=0 and the host would discard it)");
         return;
     }
 
@@ -437,18 +507,29 @@ void send_test_keystroke() {
 }
 
 void stop() {
+    // Disarm FIRST. gap_event_cb's disconnect path checks this flag, and the
+    // ble_gap_terminate() below raises that event asynchronously -- clearing
+    // the flag afterwards would let the spike re-advertise itself back to life
+    // milliseconds after stop() returned (finding I1).
+    s_advertising = false;
+
     int rc = ble_gap_adv_stop();
     Serial.printf("quarky-tab5: [ble-hid-spike] ble_gap_adv_stop rc=%d\n", rc);
-    s_advertising = false;
 
     uint16_t conn = s_conn_handle;
     if (conn != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
     }
 
-    // Put the GAP device name back. The HID service itself stays registered --
-    // removing it would mean another full ble_gatts_start() cycle, and leaving
-    // it costs nothing while nothing advertises it.
+    // Put the GAP device name back. The HID service stays in the ATT database
+    // for the life of the boot -- there is no safe runtime way to remove it
+    // (ble_gatts_reset()/ble_gatts_start() is the same hazard the file-level
+    // comment describes). That is not free: ATT service discovery enumerates
+    // the whole database regardless of what is being advertised, so any
+    // connected central -- a real Cardputer-ADV C2 peer included -- can still
+    // discover 0x1812 and subscribe to the input report. Acceptable for a
+    // QUARKY_SERIAL_DEBUG-only spike; not something a shipped feature should
+    // inherit uncritically.
     if (s_prev_device_name[0] != '\0') {
         ble_svc_gap_device_name_set(s_prev_device_name);
     }

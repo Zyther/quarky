@@ -121,6 +121,14 @@ static volatile size_t s_rx_head = 0; // producer writes here (host task)
 static volatile size_t s_rx_tail = 0; // consumer reads here (main task)
 static portMUX_TYPE s_rx_mux = portMUX_INITIALIZER_UNLOCKED;
 
+// Extra GATT services other modules want registered into this project's single
+// shared GATT server. Drained once, in init(), before the host task starts --
+// see c2link_ble.h's C2LinkBleGattHook comment for why registering a service
+// any later than that is a use-after-free rather than merely unsupported.
+static constexpr size_t kMaxGattHooks = 4;
+static C2LinkBleGattHook s_gatt_hooks[kMaxGattHooks] = {nullptr};
+static size_t s_gatt_hook_count = 0;
+
 static void start_advertising();
 
 // GATT access callback for the write (Rx) characteristic: peer -> Tab5.
@@ -358,6 +366,16 @@ bool C2LinkBle::init(const uint8_t psk[16], const char *device_name) {
         return false;
     }
 
+    // Last chance for anyone else to get a service into the GATT server: the
+    // nimble_port_freertos_init() below starts the host task, whose
+    // ble_hs_start() runs the one and only ble_gatts_start() that drains the
+    // queue these hooks add to.
+    for (size_t i = 0; i < s_gatt_hook_count; i++) {
+        Serial.printf("quarky-tab5: c2link_ble invoking GATT service hook %u/%u\n",
+                      (unsigned)(i + 1), (unsigned)s_gatt_hook_count);
+        s_gatt_hooks[i]();
+    }
+
     ble_hs_cfg.sync_cb = on_sync;
 
     nimble_port_freertos_init(host_task);
@@ -428,6 +446,12 @@ void C2LinkBle::poll() {
         s_last_recv_ms = millis();
         if (s_handler) s_handler(frame);
     }
+}
+
+bool c2link_ble_add_gatt_hook(C2LinkBleGattHook hook) {
+    if (hook == nullptr || s_gatt_hook_count >= kMaxGattHooks) return false;
+    s_gatt_hooks[s_gatt_hook_count++] = hook;
+    return true;
 }
 
 uint32_t c2link_ble_last_recv_ms() {

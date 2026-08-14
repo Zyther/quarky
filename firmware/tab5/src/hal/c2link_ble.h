@@ -28,6 +28,38 @@ public:
     void poll();
 };
 
+// Hook invoked from init(), after c2link_ble has queued its own GATT service
+// and BEFORE the NimBLE host task starts. Register additional GATT services
+// here and nowhere else.
+//
+// Why this exists (task-2-review.md finding C1, 2026-08-14): NimBLE's
+// ble_gatts_add_svcs() only QUEUES a service definition; the queue is drained
+// exactly once, by the ble_gatts_start() that ble_hs_start() runs
+// automatically when the host task comes up. Queuing a service after that
+// point and calling ble_gatts_start() a second time by hand is a
+// use-after-free: ble_gatts_start() -> ble_att_svr_start() ->
+// ble_att_svr_free_start_mem() frees the heap block every already-registered
+// ATT attribute (GAP, GATT, this file's own NUS service) lives in, without
+// ever clearing ble_att_svr_list -- which is left holding dangling pointers
+// that ble_gatts_start()'s own CCCD-cache loop then walks. Verified against
+// the shipped esp32p4 libbt.a by disassembly, not inferred.
+//
+// So: any module that wants its own service in this project's single shared
+// GATT server registers a hook here before c2link_ble.init() runs, and does
+// only ble_gatts_count_cfg() + ble_gatts_add_svcs() inside it.
+//
+// Deliberately a hook rather than a direct #include of the feature module in
+// c2link_ble.cpp: nothing in hal/ depends on features/ today (only ui/ does),
+// and a hardware-abstraction layer reaching up into feature code to hardcode
+// a spike's registration would be the wrong direction. main.cpp -- which
+// already owns wiring hal to features -- installs the hook instead.
+//
+// Returns false if the hook table is full. Hooks must be added before
+// init(); ones added afterwards are never invoked (and would be too late to
+// be safe anyway).
+using C2LinkBleGattHook = void (*)();
+bool c2link_ble_add_gatt_hook(C2LinkBleGattHook hook);
+
 // millis() timestamp of the last frame successfully dequeued and dispatched
 // by poll() (0 if none yet). Free function, mirroring
 // c2link_wifi_last_recv_ms() -- see Task 19 (devices_panel.cpp polls this to

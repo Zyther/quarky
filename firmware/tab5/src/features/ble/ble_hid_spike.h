@@ -37,19 +37,41 @@
 // advertising is single-instance system-wide, so start() STOPS
 // c2link_ble.cpp's always-on C2 advertisement and replaces it with the HID
 // keyboard advertisement. The C2 advertisement does not come back by itself;
-// reboot to restore it. See ble_hid_spike.cpp's file-level comment for the
-// second, larger side effect (a GATT-server restart).
+// reboot to restore it. Nothing else about c2link_ble is disturbed -- the
+// shared GATT server is never rebuilt at runtime (see register_service()).
 // -----------------------------------------------------------------------------
 namespace BleHidSpike {
 
-// Registers the HID GATT service (once) and begins advertising as "QuarkyKB"
-// with the HID appearance and the 0x1812 service UUID. Safe to call twice --
-// the second call is a no-op while already advertising or connected.
+// Queues the HID GATT service for registration. Does ONLY
+// ble_gatts_count_cfg() + ble_gatts_add_svcs() -- never ble_gatts_start().
 //
-// Must not be called while a C2 BLE connection is open: registering a service
-// into an already-running GATT server requires ble_gatts_start(), which
-// NimBLE refuses (BLE_HS_EBUSY) while any peer is connected. The failure is
-// logged plainly rather than worked around.
+// Must be installed as a c2link_ble GATT hook (c2link_ble_add_gatt_hook, see
+// main.cpp) so it runs inside c2link_ble.init() before the NimBLE host task
+// starts. That timing is not a style preference: NimBLE drains the queued
+// service-def list exactly once, in the ble_gatts_start() that ble_hs_start()
+// performs automatically at host startup, and calling ble_gatts_start() again
+// afterwards frees the heap block every already-registered ATT attribute
+// lives in while leaving them linked -- a use-after-free of the live GATT
+// server. Task 2's first implementation did exactly that; see
+// task-2-review.md finding C1 and c2link_ble.h's hook comment for the
+// disassembly-backed mechanism.
+//
+// Registration is gated behind QUARKY_SERIAL_DEBUG at the call site in
+// main.cpp: this is spike-only structure, and a default build should not
+// carry a HID keyboard service in its ATT database where any connected
+// central can discover it.
+void register_service();
+
+// Begins advertising as "QuarkyKB" with the HID appearance and the 0x1812
+// service UUID, and points the GAP Device Name characteristic at "QuarkyKB"
+// too (several host stacks read it post-connect rather than trusting the
+// advertised name). Safe to call twice -- the second call is a no-op while
+// already advertising or connected.
+//
+// No-ops with a logged explanation if the NimBLE host has not synced, or if
+// register_service() never ran (i.e. this is not a QUARKY_SERIAL_DEBUG
+// build), since advertising a HID service that is not in the ATT database
+// would produce a false negative.
 void start();
 
 // Sends one 'a' key-down report followed 50ms later by a key-up (all-zero)
@@ -57,14 +79,18 @@ void start();
 //
 // Does nothing (and says so) unless a host is connected AND has enabled
 // notifications on the report's CCCD. That guard matters: NimBLE's
-// ble_gatts_notify_custom() returns 0 for an unsubscribed characteristic, so
-// without it a completely undelivered keystroke would log as a success and
-// produce a FALSE POSITIVE for the exact question this spike exists to
-// answer.
+// ble_gatts_notify_custom() performs no subscription check at all -- it
+// transmits the PDU unconditionally and returns 0, and an unsubscribed host
+// simply discards it. Without the guard, the spike's primary failure mode
+// (host never bound a keyboard driver) would log rc=0 twice and read as a
+// success.
 void send_test_keystroke();
 
-// Stops the HID advertisement and terminates any open connection. Does NOT
-// restore c2link_ble's C2 advertisement (see the header comment above).
+// Stops the HID advertisement, terminates any open connection, and restores
+// the previous GAP device name. Does NOT restore c2link_ble's C2
+// advertisement (see the header comment above), and does not unregister the
+// HID service -- there is no safe runtime way to do that (same finding C1),
+// and the service is registered for the life of the boot regardless.
 void stop();
 
 } // namespace BleHidSpike

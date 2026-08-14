@@ -207,6 +207,20 @@ void setup() {
         // already-flagged, deferred concern from Task 11 is that
         // WiFi.mode(WIFI_AP) (above) and BLE together touch the same C6
         // co-processor radio at runtime.
+#ifdef QUARKY_SERIAL_DEBUG
+        // Second Phase 2 plan, Task 2: queue the HID keyboard service into the
+        // one shared GATT server before c2link_ble.init() starts the NimBLE
+        // host task. It MUST happen here and not from the spike's own 'h'
+        // trigger -- NimBLE drains the queued service-def list exactly once, at
+        // host startup, and a second hand-rolled ble_gatts_start() later is a
+        // use-after-free of the live ATT database (task-2-review.md C1).
+        //
+        // Gated with the serial triggers themselves: a default build should not
+        // carry a BLE HID keyboard service that any connected central could
+        // discover and subscribe to, for a spike it cannot even trigger.
+        c2link_ble_add_gatt_hook(BleHidSpike::register_service);
+#endif
+
         bool c2_ble_ok = c2link_ble.init(provisioned_psk, "Quarky-Tab5");
         Serial.printf("quarky-tab5: c2link_ble init %s\n", c2_ble_ok ? "OK" : "FAILED");
 
@@ -358,11 +372,12 @@ void loop() {
             // Like 'c' above this has NO launcher tile -- it is a one-shot
             // experiment, not a feature.
             //
-            // NOTE, disclosed: this STOPS c2link_ble's C2 advertisement and
-            // restarts the whole local GATT server to register the HID
-            // service (see ble_hid_spike.h/.cpp). Reboot to get the C2
-            // advertisement back. Must not be run while a C2 BLE peer is
-            // connected.
+            // NOTE, disclosed: this STOPS c2link_ble's C2 advertisement --
+            // legacy BLE advertising is single-instance system-wide, same
+            // constraint ble_spam.cpp documents. Reboot to get the C2
+            // advertisement back. The GATT server itself is NOT disturbed:
+            // the HID service was registered at boot by the hook installed in
+            // setup() above, not here.
             Serial.println("quarky-tab5: [debug] BleHidSpike::start() via serial trigger");
             BleHidSpike::start();
         } else if (c == 'j') {
