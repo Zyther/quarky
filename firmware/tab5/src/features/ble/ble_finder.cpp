@@ -49,7 +49,65 @@ static bool s_locked = false;
 static uint8_t s_locked_addr[6];
 static volatile int8_t s_locked_rssi = -128;
 static volatile uint32_t s_locked_last_ms = 0;
+// Single mux for ALL of this file's cross-task state (locked-target RSSI,
+// the unlocked-tracker list below, and the lock/last-seen bookkeeping) --
+// deliberately not split into per-state muxes. Contention is negligible
+// (one producer task, one consumer task, short critical sections) and one
+// mux is simpler to reason about correctly than juggling which lock guards
+// which field.
 static portMUX_TYPE s_lock_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// Task-review fix (post-merge finding): gap_scan_event_cb runs on the
+// NimBLE host task, not the main/LVGL task. This project's LVGL port has no
+// OS/mutex integration (LV_USE_OS is LV_OS_NONE, see ui/lvgl_port.cpp) --
+// calling lv_list_add_button()/lv_obj_clean() directly from the host task
+// (as an earlier version of this file did, transcribed verbatim from the
+// brief) is a real thread-safety bug, not just a data race: heap corruption
+// or an LVGL assert crash is a real risk, exactly the class of bug
+// ble_scan.cpp's s_devices/add_or_update()/refresh_list_ui() split already
+// exists to avoid. Mirrors that same pattern here: gap_scan_event_cb only
+// ever writes into this plain, mux-guarded array and sets a dirty flag; all
+// actual LVGL calls happen in refresh_tracker_list_ui(), called from
+// poll() on the main/LVGL task.
+static constexpr int kMaxTrackers = 16;
+struct TrackerEntry {
+    uint8_t addr[6];
+    char addr_str[18];
+    char kind[16];
+    int8_t rssi;
+};
+static TrackerEntry s_trackers[kMaxTrackers];
+static int s_tracker_count = 0;
+// Single bool, same class as ble_scan.cpp's s_devices_dirty -- set (under
+// the lock) whenever add_or_update_tracker() adds or updates an entry;
+// cleared by poll() after a refresh so unchanged loop() ticks are cheap.
+static volatile bool s_trackers_dirty = false;
+
+// Same shape as ble_scan.cpp's add_or_update(): dedupe by address under the
+// lock (fast, bounded array scan + memcpy), no LVGL involved.
+static void add_or_update_tracker(const uint8_t addr[6], const char *addr_str,
+                                   const char *kind, int8_t rssi) {
+    portENTER_CRITICAL(&s_lock_mux);
+    for (int i = 0; i < s_tracker_count; i++) {
+        if (memcmp(s_trackers[i].addr, addr, 6) == 0) {
+            s_trackers[i].rssi = rssi;
+            s_trackers_dirty = true;
+            portEXIT_CRITICAL(&s_lock_mux);
+            return;
+        }
+    }
+    if (s_tracker_count < kMaxTrackers) {
+        TrackerEntry &e = s_trackers[s_tracker_count++];
+        memcpy(e.addr, addr, 6);
+        strncpy(e.addr_str, addr_str, sizeof(e.addr_str) - 1);
+        e.addr_str[sizeof(e.addr_str) - 1] = '\0';
+        strncpy(e.kind, kind, sizeof(e.kind) - 1);
+        e.kind[sizeof(e.kind) - 1] = '\0';
+        e.rssi = rssi;
+        s_trackers_dirty = true;
+    }
+    portEXIT_CRITICAL(&s_lock_mux);
+}
 
 // Controller-resolution addition (see ble_finder.h's comment on
 // lock_last_seen() and this task's report for the full gap writeup): as
@@ -95,12 +153,14 @@ static int gap_scan_event_cb(struct ble_gap_event *event, void *arg) {
         return 0;
     }
 
-    if (!locked && s_list) {
+    if (!locked) {
         char addr_str[18];
         ble_addr_to_str(event->disc.addr.val, addr_str);
-        char row[48];
-        snprintf(row, sizeof(row), "%s  (%s)  %ddBm", kind, addr_str, event->disc.rssi);
-        lv_list_add_button(s_list, LV_SYMBOL_GPS, row);
+        // No LVGL calls here -- see add_or_update_tracker()/TrackerEntry's
+        // comment above for why. This just records the sighting; the actual
+        // list rebuild happens in refresh_tracker_list_ui() on the main/LVGL
+        // task, driven by poll().
+        add_or_update_tracker(event->disc.addr.val, addr_str, kind, event->disc.rssi);
         // Real target-lock UI (tap a row to lock onto it) is a reasonable
         // near-future addition using lv_list's per-button click callback
         // with the row's own addr stashed in user_data -- kept out of this
@@ -109,7 +169,7 @@ static int gap_scan_event_cb(struct ble_gap_event *event, void *arg) {
         // filtering. Locking is demonstrated here via main.cpp's 'f' serial
         // trigger (BleFinderFeature::lock_last_seen()) instead, which locks
         // onto whichever tracker was seen most recently -- recorded right
-        // here, every time a not-yet-locked row is added.
+        // here, every time a not-yet-locked sighting is recorded.
         portENTER_CRITICAL(&s_lock_mux);
         memcpy(s_last_seen_addr, event->disc.addr.val, 6);
         s_have_last_seen = true;
@@ -118,7 +178,38 @@ static int gap_scan_event_cb(struct ble_gap_event *event, void *arg) {
     return 0;
 }
 
+// Snapshots s_trackers/s_tracker_count under the lock (a fast, bounded
+// memcpy) and does the actual LVGL rebuild -- lv_obj_clean() plus up to
+// kMaxTrackers lv_list_add_button() calls -- outside it, so the NimBLE host
+// task is never blocked for longer than a plain array copy. Same "copy
+// under the lock, do the real work outside it" shape ble_scan.cpp's own
+// refresh_list_ui() already uses.
+static void refresh_tracker_list_ui() {
+    if (!s_list) return;
+
+    static TrackerEntry snapshot[kMaxTrackers];
+    int count;
+    portENTER_CRITICAL(&s_lock_mux);
+    count = s_tracker_count;
+    memcpy(snapshot, s_trackers, sizeof(TrackerEntry) * count);
+    portEXIT_CRITICAL(&s_lock_mux);
+
+    lv_obj_clean(s_list);
+    for (int i = 0; i < count; i++) {
+        char row[48];
+        snprintf(row, sizeof(row), "%s  (%s)  %ddBm", snapshot[i].kind, snapshot[i].addr_str, snapshot[i].rssi);
+        lv_list_add_button(s_list, LV_SYMBOL_GPS, row);
+    }
+}
+
 static void update_geiger_ui() {
+    // s_locked read here is unprotected by design, not oversight: every
+    // writer of s_locked (build_screen(), the LV_EVENT_DELETE handler, and
+    // lock_last_seen()) runs on this same main/LVGL task that
+    // update_geiger_ui() runs on (called from poll()) -- a same-task
+    // read/write is not a cross-task race. Only gap_scan_event_cb (a
+    // different task) reads s_locked, and it does so under s_lock_mux (see
+    // above), which is what actually matters for correctness there.
     if (!s_list || !s_locked) return;
     portENTER_CRITICAL(&s_lock_mux);
     int8_t rssi = s_locked_rssi;
@@ -149,11 +240,33 @@ static lv_obj_t *build_screen() {
 
     lv_obj_add_event_cb(s_list, [](lv_event_t *e) {
         if (s_scanning) {
-            ble_gap_disc_cancel();
+            // ble_gap_disc_cancel() only REQUESTS cancellation -- an
+            // in-flight discovery event can still be queued and processed
+            // on the NimBLE host task after this returns (ble_scan.cpp's
+            // own ble_gap_disc_cancel() call documents this same window).
+            // Logged for the same diagnostic-completeness reason
+            // ble_scan.cpp logs its rc: a non-zero return here is a normal,
+            // harmless no-op (scan already ended on its own), not a
+            // functional problem.
+            int rc = ble_gap_disc_cancel();
+            Serial.printf("quarky-tab5: [ble-finder] ble_gap_disc_cancel rc=%d\n", rc);
             s_scanning = false;
         }
+        // Task-review fix: s_locked is read under s_lock_mux by
+        // gap_scan_event_cb on the NimBLE host task (see its snapshot at the
+        // top of that function). Because of the in-flight-event window
+        // noted above, that callback can still run concurrently with this
+        // handler even after ble_gap_disc_cancel() returns -- so this write
+        // must take the same mux, not just the ones lock_last_seen() and
+        // gap_scan_event_cb already coordinate between themselves. s_list =
+        // nullptr doesn't strictly need the lock (only ever touched on the
+        // main task), but it's simplest to wrap both assignments in one
+        // critical section rather than split hairs over which half needs
+        // it.
+        portENTER_CRITICAL(&s_lock_mux);
         s_list = nullptr;
         s_locked = false;
+        portEXIT_CRITICAL(&s_lock_mux);
     }, LV_EVENT_DELETE, nullptr);
 
     if (!c2link_ble_host_synced()) {
@@ -162,6 +275,15 @@ static lv_obj_t *build_screen() {
     }
 
     s_locked = false;
+    // Reset the unlocked-tracker list before (re-)starting a scan -- locked
+    // for uniformity with every other touch of s_trackers/s_tracker_count,
+    // even though it's safe by construction here too (no producer task
+    // exists until ble_gap_disc() below actually runs), same reasoning
+    // ble_scan.cpp's own s_device_count reset uses.
+    portENTER_CRITICAL(&s_lock_mux);
+    s_tracker_count = 0;
+    portEXIT_CRITICAL(&s_lock_mux);
+    s_trackers_dirty = false;
     struct ble_gap_disc_params params{};
     params.passive = 1; // passive is fine here -- tracker mfr-data/service-data
                           // is in the primary advertisement, not scan-response
@@ -185,7 +307,16 @@ void start() {
 
 void poll() {
     if (!s_scanning) return;
-    update_geiger_ui();
+    if (s_locked) {
+        update_geiger_ui();
+        return;
+    }
+    // Same dirty-flag gating as ble_scan.cpp's poll(): only rebuild the
+    // list on loop() ticks where gap_scan_event_cb actually added or
+    // updated an entry, not on every ~5-10ms tick.
+    if (!s_trackers_dirty) return;
+    refresh_tracker_list_ui();
+    s_trackers_dirty = false;
 }
 
 // Controller-resolution addition: the serial-trigger-only ('f' in main.cpp,
