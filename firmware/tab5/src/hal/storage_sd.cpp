@@ -219,10 +219,21 @@ int StorageSD::list_files(const char *dir, const char *ext_filter, char names_ou
     File d = SD_MMC.open(dir);
     if (!d || !d.isDirectory()) return 0;
 
+    // Task review finding (2026-08-15, Minor): the loop used to stop only
+    // once max_names MATCHES were found, so a directory containing many
+    // non-matching entries (no reasonable real-world limit) made this scan
+    // unbounded -- called synchronously from build_screen(), itself run
+    // from the launcher tile's click handler inside a single loop()
+    // iteration, against this project's own ~50ms loop() budget
+    // constraint. kMaxEntriesScanned bounds total directory entries visited
+    // regardless of match count, independent of max_names.
+    constexpr int kMaxEntriesScanned = 256;
     size_t ext_len = strlen(ext_filter);
     int count = 0;
+    int visited = 0;
     File entry = d.openNextFile();
-    while (entry && count < max_names) {
+    while (entry && count < max_names && visited < kMaxEntriesScanned) {
+        visited++;
         if (!entry.isDirectory()) {
             const char *name = entry.name(); // basename, not full path (FS.h)
             size_t name_len = strlen(name);
