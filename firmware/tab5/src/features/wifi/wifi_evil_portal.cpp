@@ -107,6 +107,20 @@ static size_t s_active_template_len = 0;
 // response-owned buffer. Once this function returns, nothing async holds a
 // pointer into s_active_template anymore, no matter when Stop/Back fires.
 static void handle_root(AsyncWebServerRequest *request) {
+    // Unlocked peek to skip the scratch allocation entirely on the common
+    // no-custom-template path -- a single pointer read is atomic on this
+    // target, so the worst case is one stale/missed peek (we'd allocate
+    // once when we didn't strictly need to, or vice versa); the real,
+    // length-safe read that actually decides what gets served is the
+    // locked snapshot below, same as before.
+    if (s_active_template == nullptr) {
+        request->send(200, "text/html", kPortalHtml);
+        return;
+    }
+
+    // new/delete while holding a portMUX critical section is unsafe (the
+    // heap allocator has its own locking) -- allocate the fixed-max-size
+    // scratch buffer OUTSIDE the lock, then memcpy INSIDE a short lock.
     uint8_t *scratch = new uint8_t[kMaxTemplateBytes];
     size_t len = 0;
     bool has_template;
@@ -119,6 +133,18 @@ static void handle_root(AsyncWebServerRequest *request) {
     portEXIT_CRITICAL(&s_cross_task_mux);
 
     if (has_template) {
+        // NOTE: routes through AsyncBasicResponse's String-based content,
+        // which loses byte-exact length (String::operator=(const char*)
+        // strlen()s internally) -- a literal embedded NUL in a custom
+        // template would silently truncate the served page at that byte.
+        // Deliberately left as-is: hand-authored HTML essentially never
+        // contains raw NULs, this is the same risk profile the built-in
+        // kPortalHtml branch below already has, and the alternative (the
+        // raw uint8_t*/len send() overload) builds an AsyncProgmemResponse
+        // that streams from this function's `scratch` by reference instead
+        // of copying it -- since scratch is freed when this function
+        // returns while AsyncTCP may still be mid-stream, that would
+        // reintroduce the exact use-after-free class this fix round closed.
         String content((const char *)scratch, len);
         request->send(200, "text/html", content);
     } else {
