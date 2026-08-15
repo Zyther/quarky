@@ -205,3 +205,34 @@ bool StorageSD::append_capture_file(const char *path, const uint8_t *data, size_
     f.close();
     return written == len;
 }
+
+bool StorageSD::read_file(const char *path, uint8_t *out, size_t max_len, size_t *out_len) {
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f) return false;
+    size_t n = f.read(out, max_len);
+    f.close();
+    if (out_len) *out_len = n;
+    return true;
+}
+
+int StorageSD::list_files(const char *dir, const char *ext_filter, char names_out[][64], int max_names) {
+    File d = SD_MMC.open(dir);
+    if (!d || !d.isDirectory()) return 0;
+
+    size_t ext_len = strlen(ext_filter);
+    int count = 0;
+    File entry = d.openNextFile();
+    while (entry && count < max_names) {
+        if (!entry.isDirectory()) {
+            const char *name = entry.name(); // basename, not full path (FS.h)
+            size_t name_len = strlen(name);
+            if (name_len > ext_len && strcmp(name + name_len - ext_len, ext_filter) == 0) {
+                strncpy(names_out[count], name, 63);
+                names_out[count][63] = '\0';
+                count++;
+            }
+        }
+        entry = d.openNextFile();
+    }
+    return count;
+}
