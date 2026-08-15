@@ -22,6 +22,7 @@
 #include "features/wifi/wifi_evil_portal.h"
 #include "features/ble/ble_scan.h"
 #include "features/ble/ble_spam.h"
+#include "features/ble/ble_finder.h"
 #include "features/ble/ble_central_spike.h" // Task 1 (2nd Phase 2 plan): spike
                                              // only -- no register_module(), no
                                              // launcher tile; serial-trigger 'c'
@@ -135,6 +136,10 @@ void setup() {
     BleSpamFeature::register_module(); // Task 8: fake AirPods Continuity
                                         // advertisement, same reason --
                                         // must run before Shell::build below
+    BleFinderFeature::register_module(); // Task 6 (2nd Phase 2 plan): AirTag/
+                                          // SmartTag/Tile detect + geiger-mode
+                                          // finder, same reason -- must run
+                                          // before Shell::build below
 
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
@@ -281,6 +286,9 @@ void loop() {
     BleCentralSpike::poll();     // no-ops unless the central-connect spike is in
                                   // flight; only enforces the spike's own timeout so
                                   // a stalled connection can't be left dangling
+    BleFinderFeature::poll();    // no-ops unless the BLE Tracker Finder screen is
+                                  // open AND locked ('f' trigger below); drives
+                                  // update_geiger_ui()'s proximity-tier readout
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
@@ -403,6 +411,21 @@ void loop() {
             // too), so 'j' it is.
             Serial.println("quarky-tab5: [debug] BleHidSpike::send_test_keystroke() via serial trigger");
             BleHidSpike::send_test_keystroke();
+        } else if (c == 'f') {
+            // Task 6 (2nd Phase 2 plan): BLE Tracker Finder's geiger-mode
+            // lock. As brief-written this feature's target-lock UI is
+            // deferred (tap-a-row-to-lock is a documented future addition in
+            // ble_finder.cpp) -- without SOME trigger to set s_locked = true,
+            // update_geiger_ui() (called every poll() tick) would be
+            // permanently unreachable dead code with no way to verify it on
+            // real hardware. 'f' (mnemonic: finder-lock) locks onto whichever
+            // tracker BLE Tracker Finder's scan most recently added to its
+            // list -- open the screen ('BLE Tracker Finder' tile, or drive it
+            // manually the same way 'g' drives BLE Scan) and let at least one
+            // real tracker show up first, same "run the scan trigger before
+            // the dependent trigger" pattern 'c' uses with 'g'.
+            Serial.println("quarky-tab5: [debug] BleFinderFeature::lock_last_seen() via serial trigger");
+            BleFinderFeature::lock_last_seen();
         }
     }
     // --- end debug aid ---
