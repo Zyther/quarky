@@ -1,4 +1,5 @@
 #include "ble_hid_spike.h"
+#include "ble_common.h" // ble_addr_to_str() -- real-hardware verification diagnostic
 #include "../../hal/c2link_ble.h" // c2link_ble_host_synced()
 #include <Arduino.h>              // Serial + delay()
 #include <host/ble_hs.h>
@@ -8,6 +9,7 @@
 #include <host/ble_att.h>  // BLE_ATT_F_READ (descriptor permissions)
 #include <host/ble_hs_mbuf.h>
 #include <host/ble_store.h> // ble_store_util_delete_peer() (repeat-pairing path)
+#include <host/ble_sm.h>    // BLE_SM_IO_CAP_NO_IO, BLE_SM_ERR_* (real-hardware pairing fix)
 #include <host/ble_uuid.h>
 #include <os/os_mbuf.h> // os_mbuf_append()
 #include <services/gap/ble_svc_gap.h>
@@ -236,7 +238,17 @@ static const struct ble_gatt_chr_def s_hid_chrs[] = {
     {
         .uuid = &kUuidReportMap.u, // Report Map
         .access_cb = report_map_access_cb,
-        .flags = BLE_GATT_CHR_F_READ,
+        // BLE_GATT_CHR_F_READ_ENC: real-hardware finding (2026-08-14). Without
+        // this, nothing in the GATT permission model tells a central it needs
+        // to pair before touching this service -- macOS connected, read the
+        // Report Map, and enabled notifications entirely over an
+        // UNENCRYPTED link (confirmed: no BLE_GAP_EVENT_ENC_CHANGE ever
+        // fired), and then silently declined to actually inject the
+        // keystroke. The HID-over-GATT profile (HOGP) requires the Report
+        // Map and Report characteristics to be read-encrypted for exactly
+        // this reason -- without it, a host has no signal to initiate
+        // Security Manager pairing at all.
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC,
     },
     {
         .uuid = &kUuidReport.u, // Report (Input)
@@ -244,7 +256,16 @@ static const struct ble_gatt_chr_def s_hid_chrs[] = {
         .descriptors = s_report_dscs,
         // NOTIFY makes NimBLE add the CCCD automatically (it must NOT be listed
         // in s_report_dscs -- see ble_gatt_chr_def's own doc comment).
-        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+        // BLE_GATT_CHR_F_READ_ENC (read) + BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC
+        // (CCCD write) -- same real-hardware finding as Report Map above.
+        // NOTIFY_INDICATE_ENC is the flag that actually matters here: it
+        // requires the link to be encrypted before a host can write the
+        // auto-added CCCD, i.e. before it can enable notifications at all --
+        // forcing pairing to happen before subscribe succeeds, rather than
+        // subscribe silently succeeding over plaintext and the keystroke
+        // then being dropped somewhere in the host's own HID input pipeline.
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC |
+                 BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC,
         .val_handle = &s_report_val_handle,
     },
     {
@@ -382,12 +403,51 @@ static int start_advertising() {
                            &adv_params, gap_event_cb, nullptr);
     Serial.printf("quarky-tab5: [ble-hid-spike] ble_gap_adv_start rc=%d (own addr type=%u)%s\n",
                   rc, s_own_addr_type, rc == 0 ? " -- advertising as \"QuarkyKB\"" : "");
+
+    // Real-hardware verification diagnostic: log the exact address this
+    // advertises under, same reasoning as ble_spam.cpp's equivalent -- lets a
+    // real scan result be matched to this device by MAC, independent of
+    // whether the host OS's own Bluetooth UI chooses to surface it as a
+    // keyboard (or at all).
+    if (rc == 0) {
+        uint8_t addr_val[6];
+        if (ble_hs_id_copy_addr(s_own_addr_type == BLE_OWN_ADDR_PUBLIC ? BLE_ADDR_PUBLIC : BLE_ADDR_RANDOM,
+                                 addr_val, nullptr) == 0) {
+            char addr_str[18];
+            ble_addr_to_str(addr_val, addr_str);
+            Serial.printf("quarky-tab5: [ble-hid-spike] broadcasting under address %s\n", addr_str);
+        }
+    }
     return rc;
 }
 
 // ---- Public API -------------------------------------------------------------
 
 void register_service() {
+    // Real-hardware finding (2026-08-14): with encryption required on the
+    // Report/Report-Map characteristics (added above, same finding), macOS
+    // DID initiate real pairing -- BLE_GAP_EVENT_ENC_CHANGE fired, where
+    // before it never did -- but the pairing itself failed with
+    // BLE_HS_ERR_SM_US_BASE + BLE_SM_ERR_DHKEY (a local LE Secure
+    // Connections DHKey-check failure). SC pairing does an ECDH public-key
+    // exchange this device has no display/keyboard to confirm on anyway, so
+    // rather than chase the DHKey failure itself, force legacy pairing
+    // (no ECDH, no DHKey check at all) with "Just Works" -- Just Works is
+    // the only honest choice given this device's actual IO capability (it
+    // *emulates* a keyboard over BLE, it doesn't have a physical one a user
+    // can type a passkey on). This is a global ble_hs_cfg change, shared
+    // with c2link_ble's own service -- safe for it too, since its peer
+    // (Cardputer-ADV) never initiates pairing today and NO_IO/no-SC only
+    // changes what happens IF a peer starts a Security Manager procedure.
+    // Set here (called before nimble_port_freertos_init(), i.e. before
+    // ble_hs_start() and any pairing can possibly occur) for the same
+    // "must land before the host task exists" timing reason GATT
+    // registration does.
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
+    ble_hs_cfg.sm_sc = 0;
+    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_mitm = 0;
+
     // Runs from c2link_ble.init(), on the main task, before the NimBLE host
     // task exists. count_cfg + add_svcs ONLY -- see the file-level comment for
     // what calling ble_gatts_start() here (or anywhere) would destroy.
