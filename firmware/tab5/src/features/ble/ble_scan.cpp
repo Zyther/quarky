@@ -1,5 +1,6 @@
 #include "ble_scan.h"
 #include "ble_common.h"
+#include "ble_classify.h"
 #include "../../hal/c2link_ble.h"
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
@@ -101,6 +102,14 @@ static int gap_scan_event_cb(struct ble_gap_event *event, void *arg) {
         }
     }
 
+    const char *label = BleClassify::classify(event->disc.data, event->disc.length_data);
+    if (label != nullptr) {
+        strncpy(d.label, label, sizeof(d.label) - 1);
+        d.label[sizeof(d.label) - 1] = '\0';
+    } else {
+        d.label[0] = '\0';
+    }
+
     add_or_update(d);
     return 0;
 }
@@ -124,8 +133,12 @@ static void refresh_list_ui() {
     lv_obj_clean(s_list);
     for (int i = 0; i < count; i++) {
         char row[64];
-        const char *label = snapshot[i].name[0] ? snapshot[i].name : snapshot[i].addr_str;
-        snprintf(row, sizeof(row), "%s  %ddBm", label, snapshot[i].rssi);
+        const char *name_or_addr = snapshot[i].name[0] ? snapshot[i].name : snapshot[i].addr_str;
+        if (snapshot[i].label[0]) {
+            snprintf(row, sizeof(row), "%s  [%s]  %ddBm", name_or_addr, snapshot[i].label, snapshot[i].rssi);
+        } else {
+            snprintf(row, sizeof(row), "%s  %ddBm", name_or_addr, snapshot[i].rssi);
+        }
         lv_list_add_button(s_list, LV_SYMBOL_BLUETOOTH, row);
     }
 }

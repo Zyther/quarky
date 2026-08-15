@@ -16,6 +16,10 @@ struct BleDeviceInfo {
     char addr_str[18];
     int8_t rssi;
     char name[32]; // empty string if no AD_TYPE_NAME field present
+    // Classification label from BleClassify::classify() (e.g. "iBeacon",
+    // "AirPods (Continuity)") -- empty string if nothing recognized. Added
+    // for the second Phase 2 plan's Task 5 (BLE scan classification).
+    char label[24];
 };
 
 void ble_addr_to_str(const uint8_t addr[6], char out[18]);
