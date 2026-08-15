@@ -260,6 +260,10 @@ void loop() {
     c2link_wifi.poll(); // no-ops when the AP never came up
     c2link_ble.poll();  // drains BLE frames received on the NimBLE host task
     WifiSpectrumFeature::poll(); // no-ops unless the WiFi Spectrum screen is open
+    WifiConnectFeature::poll();  // no-ops unless a connect is in flight; drains the
+                                  // background connect_task()'s result -- real-hardware
+                                  // fix (2026-08-14), see wifi_connect.cpp for why
+                                  // connect_wifi() cannot run on this task directly
     WifiPmkidFeature::poll();    // no-ops unless the PMKID capture screen is open;
                                   // drains the promiscuous-mode ring buffer to SD
     BleScanFeature::poll();      // no-ops unless the BLE Scan screen is open;
