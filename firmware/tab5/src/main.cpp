@@ -18,6 +18,7 @@
 #include "features/wifi/wifi_scan.h"
 #include "features/wifi/wifi_spectrum.h"
 #include "features/wifi/wifi_pmkid.h"
+#include "features/wifi/wifi_connect.h"
 #include "features/ble/ble_scan.h"
 #include "features/ble/ble_spam.h"
 #include "features/ble/ble_central_spike.h" // Task 1 (2nd Phase 2 plan): spike
@@ -106,6 +107,11 @@ void setup() {
     WifiSpectrumFeature::register_module(); // Task 5: live per-channel RSSI
                                              // bar chart, same reason --
                                              // must run before Shell::build below
+    WifiConnectFeature::register_module(); // Task 3 (2nd Phase 2 plan): thin
+                                            // UI wrapper over Phase 1's
+                                            // proven connect_wifi(), same
+                                            // reason -- must run before
+                                            // Shell::build below
     // Task 6's WifiPmkidFeature::register_module() is deliberately NOT
     // called. Final whole-branch review finding I3 (2026-08-13): real
     // hardware confirmed promiscuous mode is a hard esp-hosted limitation
