@@ -62,6 +62,26 @@ static void handle_submit(AsyncWebServerRequest *request) {
     request->send(200, "text/html", "<html><body>Thank you.</body></html>");
 }
 
+// Task review finding (2026-08-14, Critical): tears down everything start()
+// brings up. Previously nothing stopped on Back -- s_server/s_dns/s_active
+// were untouched by LV_EVENT_DELETE, unlike every other feature in this plan
+// (wifi_scan.cpp/wifi_pmkid.cpp/ble_spam.cpp all stop their own background
+// activity from this exact handler). Worse than "keeps running silently":
+// reopening the screen called `s_server = new AsyncWebServer(80)` again with
+// no guard, overwriting the pointer to the still-live previous instance
+// (still bound to port 80) with no delete/end() -- a real leak, and a
+// plausible second-open bind failure. delete s_server runs AsyncWebServer's
+// destructor, which calls its own internal end() (WebServer.cpp) and
+// actually releases the TCP listener, not just the LVGL-side state.
+static void stop_portal() {
+    if (!s_active) return;
+    s_dns.stop();
+    delete s_server;
+    s_server = nullptr;
+    WiFi.softAPdisconnect(true); // actually stop the AP, not just the app-level servers
+    s_active = false;
+}
+
 static lv_obj_t *build_screen() {
     lv_obj_t *content = nullptr;
     lv_obj_t *screen = build_sub_screen("Evil Portal", &content);
@@ -75,6 +95,7 @@ static lv_obj_t *build_screen() {
 
     lv_obj_add_event_cb(s_log_list, [](lv_event_t *e) {
         s_log_list = nullptr;
+        stop_portal();
     }, LV_EVENT_DELETE, nullptr);
 
     return screen;
@@ -116,17 +137,36 @@ void register_module() {
 // esp-hosted/SDIO to the C6, not a local radio) still needs to confirm it,
 // per this task's real-hardware verification step.
 void start() {
+    // Task review finding (2026-08-14, part of the same Critical fix as
+    // stop_portal() above): guards against the reopen-leak, checked before
+    // pushing a screen so a spurious re-entry can't leave a duplicate,
+    // unbacked screen on the stack either. Without this, Back-then-reopen
+    // ran this whole body again and overwrote s_server with a new
+    // AsyncWebServer while the old one (and its bound TCP listener) was
+    // still alive. stop_portal() clearing s_active on Back means a fresh
+    // open always starts from a genuinely torn-down state, so this guard
+    // only ever fires if start() is somehow re-entered without going through
+    // Back first (defensive -- the launcher tile that calls this is only
+    // reachable once the portal screen is closed, so this isn't expected in
+    // normal use).
+    if (s_active) return;
+
     ScreenStack::push(build_screen());
 
-    // Deliberate WIFI_AP_STA, not a bare WIFI_AP -- preserves c2link_wifi's
-    // existing SoftAP the same way wifi_common.cpp/wifi_spectrum.cpp do,
-    // per this plan's Global Constraints. The portal's own AP is a SECOND,
-    // independent SoftAP instance -- ESP32 WiFi supports exactly one AP
+    // NOT "WIFI_AP_STA" -- corrected task-review comment (was previously
+    // inaccurate): this never calls WiFi.mode() directly. WiFi.softAP()
+    // internally calls WiFiGenericClass::enableAP(true), which ORs
+    // WIFI_MODE_AP into whatever mode is already active -- preserving
+    // WIFI_MODE_STA if c2link_wifi (or Task 3's WiFi Connect) already set
+    // it, without forcing STA on if nothing did. Same practical effect as
+    // wifi_common.cpp/wifi_spectrum.cpp's explicit getMode()-then-mode()
+    // pattern, achieved differently. The portal's own AP is a SECOND,
+    // independent SoftAP identity -- ESP32 WiFi supports exactly one AP
     // config at a time system-wide, same single-instance constraint
     // ble_spam.cpp hit for BLE advertising, so starting this DOES take over
-    // c2link_wifi's AP identity/SSID while the portal runs. Documented here
-    // rather than silently shipped: closing this screen does not currently
-    // restore c2link_wifi's own AP config -- same class of disclosed,
+    // c2link_wifi's AP identity/SSID while the portal runs. stop_portal()
+    // (LV_EVENT_DELETE) releases the portal's own AP on Back, but does not
+    // restore c2link_wifi's prior AP config -- same class of disclosed,
     // scoped-out follow-up as ble_spam.cpp's C2-advertising re-arm gap.
     WiFi.softAP("QuarkyPortal");
 
@@ -136,13 +176,19 @@ void start() {
     s_server->onNotFound(handle_root); // captive-portal catch-all
     s_server->begin();
 
+    // Task review finding (2026-08-14, Minor): this project's bundled
+    // DNSServer (~/.platformio/packages/framework-arduinoespressif32/
+    // libraries/DNSServer) is NOT the classic synchronous-poll DNS server
+    // the donor codebases' processNextRequest() shape suggests. In this
+    // framework version DNSServer::start() wires an AsyncUDP::onPacket
+    // callback internally and the wildcard redirect is fully event-driven
+    // from there; DNSServer::processNextRequest() is a literal no-op stub
+    // ("does nothing actually", DNSServer.h). There used to be a poll()
+    // here calling it every loop() tick -- removed rather than kept as
+    // documented dead code, since it never did anything with this
+    // dependency version. The redirect works from this start() call alone.
     s_dns.start(53, "*", WiFi.softAPIP());
     s_active = true;
-}
-
-void poll() {
-    if (!s_active) return;
-    s_dns.processNextRequest();
 }
 
 } // namespace WifiEvilPortalFeature

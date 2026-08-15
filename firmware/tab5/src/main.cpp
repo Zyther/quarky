@@ -271,9 +271,6 @@ void loop() {
                                   // connect_wifi() cannot run on this task directly
     WifiPmkidFeature::poll();    // no-ops unless the PMKID capture screen is open;
                                   // drains the promiscuous-mode ring buffer to SD
-    WifiEvilPortalFeature::poll(); // no-ops unless the Evil Portal screen is
-                                    // open; drains DNSServer's wildcard-redirect
-                                    // request queue
     BleScanFeature::poll();      // no-ops unless the BLE Scan screen is open;
                                   // pushes gap_scan_event_cb's discoveries to the list
     BleSpamFeature::poll();      // no-ops unless the BLE Spam screen is open;
