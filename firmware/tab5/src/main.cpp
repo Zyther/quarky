@@ -19,6 +19,7 @@
 #include "features/wifi/wifi_spectrum.h"
 #include "features/wifi/wifi_pmkid.h"
 #include "features/wifi/wifi_connect.h"
+#include "features/wifi/wifi_evil_portal.h"
 #include "features/ble/ble_scan.h"
 #include "features/ble/ble_spam.h"
 #include "features/ble/ble_central_spike.h" // Task 1 (2nd Phase 2 plan): spike
@@ -112,6 +113,10 @@ void setup() {
                                             // proven connect_wifi(), same
                                             // reason -- must run before
                                             // Shell::build below
+    WifiEvilPortalFeature::register_module(); // Task 4 (2nd Phase 2 plan):
+                                               // softAP + captive HTTP form,
+                                               // same reason -- must run
+                                               // before Shell::build below
     // Task 6's WifiPmkidFeature::register_module() is deliberately NOT
     // called. Final whole-branch review finding I3 (2026-08-13): real
     // hardware confirmed promiscuous mode is a hard esp-hosted limitation
@@ -266,6 +271,9 @@ void loop() {
                                   // connect_wifi() cannot run on this task directly
     WifiPmkidFeature::poll();    // no-ops unless the PMKID capture screen is open;
                                   // drains the promiscuous-mode ring buffer to SD
+    WifiEvilPortalFeature::poll(); // no-ops unless the Evil Portal screen is
+                                    // open; drains DNSServer's wildcard-redirect
+                                    // request queue
     BleScanFeature::poll();      // no-ops unless the BLE Scan screen is open;
                                   // pushes gap_scan_event_cb's discoveries to the list
     BleSpamFeature::poll();      // no-ops unless the BLE Spam screen is open;
