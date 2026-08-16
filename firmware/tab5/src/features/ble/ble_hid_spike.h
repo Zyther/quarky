@@ -85,10 +85,25 @@ void register_service();
 // start() call site for the one residual, pre-existing timing note (an
 // in-flight async disconnect can make an immediate reopen no-op once).
 //
+// Returns true iff advertising actually started (i.e. the radio genuinely
+// accepted ble_gap_adv_start()); false on any of its four early-return
+// failure paths -- NimBLE host not synced (this project explicitly supports
+// a "radios disabled for this boot" mode), register_service() never queued
+// the service, already advertising, or a host is already connected -- or if
+// ble_hs_id_infer_auto()/start_advertising() itself fails. Added (Task 15,
+// 2nd Phase 2 plan review round) after a real finding: the caller previously
+// had no way to distinguish "genuinely advertising" from "silently did
+// nothing", so ble_bad_kb.cpp's status label was asserting "Advertising..."
+// even when nothing was on the air -- exactly the "false negative reads as
+// success" outcome send_key()'s own "refuse rather than lie" guard exists to
+// prevent at the transport layer, reintroduced one level up in the UI.
+// Callers that only care about the previous fire-and-forget behavior (the
+// 'h' serial-debug trigger) may still ignore the return value.
+//
 // No-ops with a logged explanation if the NimBLE host has not synced, or if
 // register_service() never ran, since advertising a HID service that is not
 // in the ATT database would produce a false negative.
-void start();
+bool start();
 
 // Sends one 'a' key-down report followed 50ms later by a key-up (all-zero)
 // report, as GATT notifications on the Input Report characteristic.

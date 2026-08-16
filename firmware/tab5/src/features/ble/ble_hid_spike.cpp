@@ -88,6 +88,15 @@ static const char kDeviceName[] = "QuarkyKB";
 // stated in c2link_ble.cpp (and followed by ble_central_spike.cpp).
 static volatile uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static volatile bool s_notify_enabled = false;
+// Latches true once send_key()'s "host has NOT enabled input-report
+// notifications" warning has been logged for the CURRENT connection attempt,
+// so a poll()-driven caller (ble_bad_kb.cpp) sending one character per tick
+// to a connected-but-not-yet-subscribed host logs the warning once instead of
+// once per character. Read/written on the main task in send_key() AND
+// written on the NimBLE host task in gap_event_cb (reset on CONNECT/
+// SUBSCRIBE, same cross-task shape as s_notify_enabled just above) --
+// volatile for the same reason.
+static volatile bool s_notify_warn_logged = false;
 // "The spike is armed", not "a packet is going out right now": true from a
 // successful start() until stop(), including while a host is connected (a
 // connectable-undirected advertisement ends on connect, and the disconnect
@@ -300,6 +309,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *) {
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
             s_notify_enabled = false; // host has not written the report CCCD yet
+            s_notify_warn_logged = false; // fresh connection -- allow one re-warn
             Serial.printf("quarky-tab5: [ble-hid-spike] host CONNECTED (handle=%u)\n",
                           event->connect.conn_handle);
         } else {
@@ -327,6 +337,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *) {
         // device, and no keystroke can possibly be delivered.
         if (event->subscribe.attr_handle == s_report_val_handle) {
             s_notify_enabled = event->subscribe.cur_notify;
+            s_notify_warn_logged = false; // subscription state changed -- allow one re-warn
             Serial.printf("quarky-tab5: [ble-hid-spike] host %s input-report notifications\n",
                           s_notify_enabled ? "ENABLED" : "disabled");
         }
@@ -465,28 +476,31 @@ void register_service() {
     Serial.println("quarky-tab5: [ble-hid-spike] HID service queued for boot-time registration");
 }
 
-void start() {
+bool start() {
     if (!c2link_ble_host_synced()) {
         Serial.println("quarky-tab5: [ble-hid-spike] NimBLE host not synced "
                        "(C6 link down, or c2link_ble init failed) -- cannot start");
-        return;
+        return false;
     }
     if (!s_svc_queued) {
         // register_service() never ran, so the HID service is not in the ATT
         // database and nothing can be registered now. Advertising anyway would
         // manufacture the exact false negative this spike must not produce.
+        // (register_service() is called unconditionally from main.cpp's
+        // setup() as of Task 15 -- this branch should only be reachable if
+        // that call itself failed, e.g. ble_gatts_count_cfg()/add_svcs()
+        // returned an error; it's no longer a build-flag gating question.)
         Serial.println("quarky-tab5: [ble-hid-spike] HID service was never registered "
-                       "-- rebuild with -DQUARKY_SERIAL_DEBUG so main.cpp installs the "
-                       "boot-time c2link_ble GATT hook; not advertising");
-        return;
+                       "(register_service() did not run, or failed) -- not advertising");
+        return false;
     }
     if (s_advertising) {
         Serial.println("quarky-tab5: [ble-hid-spike] already started");
-        return;
+        return true; // genuinely already advertising -- not a failure
     }
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         Serial.println("quarky-tab5: [ble-hid-spike] a host is already connected");
-        return;
+        return false;
     }
 
     // Legacy BLE advertising is single-instance system-wide, so take over from
@@ -526,7 +540,7 @@ void start() {
     if (rc != 0) {
         Serial.printf("quarky-tab5: [ble-hid-spike] ble_hs_id_infer_auto rc=%d "
                       "-- no usable own address, not advertising\n", rc);
-        return;
+        return false;
     }
 
     // Point the GAP Device Name characteristic at "QuarkyKB" too. Unconditional
@@ -551,7 +565,11 @@ void start() {
     // Only claim to be armed if the radio actually accepted the advertisement.
     // Setting this unconditionally would both lie in the log and make the
     // "already started" check above block a legitimate retry (finding M1).
+    // Also the function's real return value now (Task 15 review round): a
+    // caller (ble_bad_kb.cpp) needs to know this exact same fact to keep its
+    // own status label truthful.
     s_advertising = (start_advertising() == 0);
+    return s_advertising;
 }
 
 void send_test_keystroke() {
@@ -615,9 +633,14 @@ void send_key(uint8_t keycode) {
         return;
     }
     if (!s_notify_enabled) {
-        Serial.println("quarky-tab5: [ble-hid-spike] host has NOT enabled input-report "
-                       "notifications -- not sending (see send_test_keystroke()'s comment "
-                       "for why this guard exists)");
+        if (!s_notify_warn_logged) {
+            Serial.println("quarky-tab5: [ble-hid-spike] host has NOT enabled input-report "
+                           "notifications -- not sending (see send_test_keystroke()'s comment "
+                           "for why this guard exists; logged once per connection/subscription "
+                           "state, not once per call -- a poll()-driven caller can call this "
+                           "once per character)");
+            s_notify_warn_logged = true;
+        }
         return;
     }
 
@@ -687,9 +710,17 @@ void stop() {
     // comment describes). That is not free: ATT service discovery enumerates
     // the whole database regardless of what is being advertised, so any
     // connected central -- a real Cardputer-ADV C2 peer included -- can still
-    // discover 0x1812 and subscribe to the input report. Acceptable for a
-    // QUARKY_SERIAL_DEBUG-only spike; not something a shipped feature should
-    // inherit uncritically.
+    // discover 0x1812 and subscribe to the input report. This is no longer a
+    // spike-only caveat -- Task 15 shipped BleBadKbFeature as a real,
+    // always-present feature (see ble_hid_spike.h's file comment), so this
+    // exposure is now permanent for every build, not just a debug run. It
+    // remains an acceptable exposure, not a defect to fix here: both the
+    // Report Map (0x2A4B) and Report (0x2A4D) characteristics already require
+    // BLE_GATT_CHR_F_READ_ENC/NOTIFY_INDICATE_ENC (see s_hid_chrs above), so
+    // a peer must complete pairing/encryption before it can read the report
+    // descriptor or subscribe to keystrokes at all -- an unauthenticated
+    // Cardputer-ADV C2 peer discovering the *existence* of 0x1812 costs it
+    // nothing actionable.
     if (s_prev_device_name[0] != '\0') {
         ble_svc_gap_device_name_set(s_prev_device_name);
     }

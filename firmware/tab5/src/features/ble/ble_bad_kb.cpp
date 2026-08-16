@@ -60,6 +60,40 @@ static lv_obj_t *s_status_label = nullptr;
 static lv_obj_t *s_script_input = nullptr;
 static lv_obj_t *s_keyboard = nullptr;
 static bool s_last_connected = false;
+// True iff BleHidSpike::start() reported real success (see build_screen()).
+// Task 15 review-round finding (Important): build_screen() used to set the
+// status label to "Advertising as QuarkyKB..." UNCONDITIONALLY, before even
+// checking start()'s outcome -- but start() has four real early-return
+// failure paths (NimBLE host not synced, e.g. this project's own "radios
+// disabled for this boot" mode; the HID service never got queued; already
+// advertising; a host is already connected from a still-live prior session,
+// see the reopen-race note at the start() call site below). Two of those are
+// reachable in normal use, and the label was lying in both -- exactly the
+// "false negative reads as success" outcome ble_hid_spike.cpp's own
+// send_key() "refuse rather than lie" guard exists to prevent at the
+// transport layer, reintroduced one level up in this UI. update_status_label()
+// now derives the label from s_last_connected/s_advertise_ok together instead
+// of asserting one fixed string.
+static bool s_advertise_ok = false;
+
+// Single source of truth for the status label's text, called both once (at
+// screen build, after BleHidSpike::start()'s real result is known) and on
+// every subsequent connection-state change from poll(). Connected always
+// wins (a host being connected is true regardless of why start() itself
+// returned false -- see the "already connected" case in start()'s own
+// comment: that failure path means a PRIOR session's connection is still
+// live, which is still a real, working pairing from this label's point of
+// view).
+static void update_status_label() {
+    if (!s_status_label) return;
+    if (s_last_connected) {
+        lv_label_set_text(s_status_label, "Paired");
+    } else if (s_advertise_ok) {
+        lv_label_set_text(s_status_label, "Advertising as QuarkyKB...");
+    } else {
+        lv_label_set_text(s_status_label, "Not paired -- cannot send");
+    }
+}
 
 // Script-typing state, all main-task-only (written from the "Send" button's
 // LV_EVENT_CLICKED handler, read/advanced from poll() -- both run on the main
@@ -140,8 +174,18 @@ static lv_obj_t *build_screen() {
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
 
     s_status_label = lv_label_create(content);
-    lv_label_set_text(s_status_label, "Advertising as QuarkyKB...");
-    s_last_connected = false;
+    lv_label_set_text(s_status_label, "..."); // corrected below, right after
+                                               // BleHidSpike::start()'s real
+                                               // result is known -- never
+                                               // asserted as "Advertising"
+                                               // ahead of that (see
+                                               // s_advertise_ok's comment)
+    s_last_connected = BleHidSpike::is_connected(); // a prior session's
+                                                      // connection can already
+                                                      // be live here (the
+                                                      // reopen-race case) --
+                                                      // check reality, don't
+                                                      // assume false
 
     s_script_input = lv_textarea_create(content);
     lv_textarea_set_placeholder_text(s_script_input, "STRING hello world\nENTER");
@@ -158,20 +202,42 @@ static lv_obj_t *build_screen() {
     lv_obj_t *send_label = lv_label_create(send_btn);
     lv_label_set_text(send_label, "Send");
     lv_obj_add_event_cb(send_btn, [](lv_event_t *) {
+        // Review-round finding (Important): tapping Send while genuinely
+        // unconnected used to drain the whole script through send_key()'s
+        // deliberately-silent "not connected" early return -- no UI change,
+        // no serial output, just the status label getting rewritten to the
+        // same string it already showed. Same "false negative reads as
+        // success" class as the label bug above, one layer further in.
+        // Refuse up front instead, with real feedback, rather than silently
+        // no-opping through the whole script one character at a time.
+        if (!BleHidSpike::is_connected()) {
+            Serial.println("quarky-tab5: [ble-bad-kb] Send tapped while not paired -- ignoring");
+            update_status_label(); // re-assert the true current state, in
+                                    // case the user tapped Send before
+                                    // noticing the label
+            return;
+        }
+
+        const char *text = lv_textarea_get_text(s_script_input);
+        if (text == nullptr || text[0] == '\0') {
+            // Minimal feedback for the empty-script case rather than silence
+            // (the original code would set s_typing=false and do nothing
+            // visible at all).
+            Serial.println("quarky-tab5: [ble-bad-kb] Send tapped with an empty script -- nothing to type");
+            return;
+        }
+
         // No NimBLE calls here -- just copy the text and arm the parser.
         // poll() does all the actual (blocking-per-tick, not blocking-total)
         // sending. See this file's header comment for why.
-        const char *text = lv_textarea_get_text(s_script_input);
         strncpy(s_script_buf, text, kScriptBufLen - 1);
         s_script_buf[kScriptBufLen - 1] = '\0';
         s_script_len = strlen(s_script_buf);
         s_cursor = 0;
         s_in_string_mode = false;
-        s_typing = (s_script_len > 0);
-        if (s_typing) {
-            Serial.printf("quarky-tab5: [ble-bad-kb] typing script, %u bytes, poll()-driven\n",
-                          (unsigned)s_script_len);
-        }
+        s_typing = true;
+        Serial.printf("quarky-tab5: [ble-bad-kb] typing script, %u bytes, poll()-driven\n",
+                      (unsigned)s_script_len);
     }, LV_EVENT_CLICKED, nullptr);
 
     s_keyboard = lv_keyboard_create(screen);
@@ -189,6 +255,7 @@ static lv_obj_t *build_screen() {
         s_script_input = nullptr;
         s_keyboard = nullptr;
         s_typing = false;
+        s_advertise_ok = false;
     }, LV_EVENT_DELETE, nullptr);
 
     // Reuses BleHidSpike's own proven advertise path (Task 2, real-hardware
@@ -199,16 +266,23 @@ static lv_obj_t *build_screen() {
     // guards on c2link_ble_host_synced(), the service having been queued at
     // boot, already-advertising, and an existing connection, and only claims
     // s_advertising=true if ble_gap_adv_start() actually returned 0 (finding
-    // M1's fix). The one residual, pre-existing timing note (not introduced
-    // by this feature): stop()'s ble_gap_terminate() raises
+    // M1's fix).
+    //
+    // Its bool return is now checked (Task 15 review-round finding, Important):
+    // previously this file ignored it entirely and hardcoded the label to
+    // "Advertising as QuarkyKB...", which lied whenever any of start()'s four
+    // early-return paths fired. The one residual, pre-existing timing note
+    // (not introduced by this feature): stop()'s ble_gap_terminate() raises
     // BLE_GAP_EVENT_DISCONNECT asynchronously, so reopening this screen
     // immediately after closing it while a previous connection's disconnect
     // is still in flight can hit start()'s "a host is already connected"
-    // guard and no-op once; retrying (closing and reopening again) clears it
-    // once the disconnect event lands. Same narrow, disclosed race as any
-    // other start()/stop() consumer of this file -- not a new hazard Task 15
-    // introduces.
-    BleHidSpike::start();
+    // guard and return false here -- but s_last_connected (set above, before
+    // this call) already reflects that a host IS in fact still connected in
+    // that exact case, so update_status_label() below correctly shows
+    // "Paired" rather than the stale, uninformative label this used to show;
+    // there is no separate fix needed for that race beyond this one.
+    s_advertise_ok = BleHidSpike::start();
+    update_status_label();
 
     return screen;
 }
@@ -223,22 +297,38 @@ void start() {
 }
 
 void poll() {
-    if (s_status_label) {
-        bool connected = BleHidSpike::is_connected();
-        if (connected != s_last_connected) {
-            lv_label_set_text(s_status_label, connected ? "Paired" : "Advertising as QuarkyKB...");
-            s_last_connected = connected;
-        }
+    bool connected = BleHidSpike::is_connected();
+    if (connected != s_last_connected) {
+        s_last_connected = connected;
+        if (s_status_label) update_status_label();
     }
 
     if (!s_typing) return;
+
+    if (!connected) {
+        // Host disconnected mid-script. Without this, the remaining buffer
+        // would keep draining through send_key()'s silent not-connected
+        // no-op, one wasted poll() tick per character, with the label above
+        // already showing the truth but the "Send" action itself never
+        // visibly concluding. Stop here instead -- consistent with this
+        // review round's broader theme of the UI reflecting real transport
+        // state rather than silently doing nothing.
+        s_typing = false;
+        Serial.println("quarky-tab5: [ble-bad-kb] host disconnected mid-script -- aborting remaining keystrokes");
+        return;
+    }
 
     if (!type_script_step()) {
         s_typing = false;
         Serial.println("quarky-tab5: [ble-bad-kb] script finished");
         if (s_status_label) {
+            // Direct set (not update_status_label()) since this is a
+            // one-time "just finished" message distinct from the label's
+            // steady-state text -- only meaningful in the connected case;
+            // the disconnected case falls back to the same truthful
+            // steady-state label update_status_label() would produce.
             lv_label_set_text(s_status_label,
-                               s_last_connected ? "Paired -- script sent" : "Advertising as QuarkyKB...");
+                               s_last_connected ? "Paired -- script sent" : "Not paired -- cannot send");
         }
     }
 }
