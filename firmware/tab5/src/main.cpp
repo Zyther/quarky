@@ -27,6 +27,10 @@
 #include "features/ble/ble_clone.h" // Task 9 (2nd Phase 2 plan): scan random-address
                                      // peripherals, set own BLE identity to a
                                      // captured target's MAC, advertise under its name
+#include "features/ble/ble_karma.h" // Task 10 (2nd Phase 2 plan): passive scan +
+                                     // rotate own BLE identity/name every 2s while
+                                     // nearby traffic is present ("air activity"
+                                     // gimmick, not true per-target karma)
 #include "features/ble/ble_central_spike.h" // Task 1 (2nd Phase 2 plan): spike
                                              // only -- no register_module(), no
                                              // launcher tile; serial-trigger 'c'
@@ -151,6 +155,10 @@ void setup() {
     BleCloneFeature::register_module(); // Task 9 (2nd Phase 2 plan): capture +
                                          // replay a random-address target's BLE
                                          // identity, same reason -- must run
+                                         // before Shell::build below
+    BleKarmaFeature::register_module(); // Task 10 (2nd Phase 2 plan): rotate own
+                                         // identity/name while nearby BLE traffic
+                                         // is present, same reason -- must run
                                          // before Shell::build below
 
     lv_obj_t *root = Shell::build(g_registry);
@@ -313,6 +321,15 @@ void loop() {
                                   // identity change -- see ble_clone.cpp's
                                   // clone_target() comment for the cross-feature
                                   // side effect this leaves for ble_hid_spike.cpp
+    BleKarmaFeature::poll();     // no-ops unless the BLE Karma screen is open;
+                                  // rotates identity/name every 2s while nearby
+                                  // BLE traffic is present. NOTE: also calls
+                                  // ble_hs_id_set_rnd() repeatedly, each time
+                                  // with a fresh random address -- see
+                                  // ble_karma.cpp's rotate_identity() comment
+                                  // for how this differs from ble_clone.cpp's
+                                  // one-time version of the same persistent,
+                                  // host-wide identity side effect
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
