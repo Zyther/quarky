@@ -23,6 +23,7 @@
 #include "features/ble/ble_scan.h"
 #include "features/ble/ble_spam.h"
 #include "features/ble/ble_finder.h"
+#include "features/ble/ble_sniffer.h"
 #include "features/ble/ble_central_spike.h" // Task 1 (2nd Phase 2 plan): spike
                                              // only -- no register_module(), no
                                              // launcher tile; serial-trigger 'c'
@@ -140,6 +141,10 @@ void setup() {
                                           // SmartTag/Tile detect + geiger-mode
                                           // finder, same reason -- must run
                                           // before Shell::build below
+    BleSnifferFeature::register_module(); // Task 7 (2nd Phase 2 plan): passive
+                                           // BLE scan -> CSV export, same
+                                           // reason -- must run before
+                                           // Shell::build below
 
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
@@ -289,6 +294,11 @@ void loop() {
     BleFinderFeature::poll();    // no-ops unless the BLE Tracker Finder screen is
                                   // open AND locked ('f' trigger below); drives
                                   // update_geiger_ui()'s proximity-tier readout
+    BleSnifferFeature::poll();   // no-ops unless the BLE Sniffer screen is open;
+                                  // drains gap_scan_event_cb's ring buffer to SD
+                                  // (buffered, not written synchronously on the
+                                  // NimBLE host task -- see ble_sniffer.cpp's
+                                  // file-level comment for why)
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
