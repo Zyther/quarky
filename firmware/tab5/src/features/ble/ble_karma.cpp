@@ -92,7 +92,28 @@ static void rotate_identity() {
     int rc = ble_hs_id_set_rnd(addr);
     Serial.printf("quarky-tab5: [ble-karma] ble_hs_id_set_rnd rc=%d\n", rc);
 
-    ble_gap_adv_stop();
+    ble_gap_adv_stop(); // no-op (returns an error this ignores) if nothing is currently advertising
+
+    // Defensive 5ms settle delay between stop and ble_gap_adv_set_fields()
+    // below. Same async stop/set-data race fixed in ble_sourapple.cpp's
+    // send_one() (donor-documented hardware bug: the BLE controller can
+    // still be asynchronously processing the previous ble_gap_adv_stop()
+    // when a "set advertisement data" call arrives immediately after, and
+    // silently fails, leaving the radio broadcasting the PREVIOUS payload)
+    // and confirmed for real on this project's own hardware in ble_spam.cpp's
+    // send_one_advertisement() (2026-08-16 finding: the vendor-picker
+    // dropdown appeared not to change the broadcast payload -- root cause
+    // was this exact race, not a picker bug). rotate_identity() has the
+    // identical stop-then-set_fields shape and the identical symptom class
+    // this would produce if hit: a rotated name/MAC that appears not to take
+    // effect on some rotations. Same fix, same value, for the same reason.
+    //
+    // This call site is, if anything, less exposed than ble_spam.cpp's: this
+    // rotates every 2000ms (poll()'s 2000ms gate below) vs. ble_spam.cpp's
+    // 200ms cadence, so a 5ms delay here is more negligible still against
+    // both the ~50ms main-loop() budget and the 2000ms rotation cadence.
+    delay(5);
+
     struct ble_hs_adv_fields fields{};
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     const char *name = kNames[s_name_idx];

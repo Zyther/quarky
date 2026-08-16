@@ -407,16 +407,24 @@ static void send_one() {
     // timing, not packet size -- discovered because the donor's larger
     // packets (the 31-byte AirTag template) consistently failed while
     // shorter ones passed; the donor's fix was a 5ms delay between
-    // adv->stop() and setAdvertisementData(). This project's other BLE
-    // features (ble_spam.cpp/ble_karma.cpp) don't need a delay here at their
-    // proven-on-real-hardware 200ms send cadence, but their payloads are
-    // also smaller than Sour Apple's largest templates (up to 30-31 bytes,
-    // the same AirTag-sized case that triggered this on the donor's
-    // hardware), and this project advertises over a different BLE transport
-    // (esp-hosted over the C6, not the donor's native ESP32-S3 NimBLE) with
-    // unverified timing characteristics for this specific case -- cheap
-    // insurance against a real, previously-encountered, hard-to-diagnose
-    // failure mode.
+    // adv->stop() and setAdvertisementData(). UPDATE (2026-08-16): this
+    // comment previously claimed this project's other BLE features
+    // (ble_spam.cpp/ble_karma.cpp) don't need a delay here at their
+    // proven-on-real-hardware 200ms/2000ms send cadences -- that claim did
+    // not hold up. ble_spam.cpp hit this exact race for real (the
+    // vendor-picker dropdown appeared not to change the broadcast payload;
+    // root cause was ble_gap_adv_set_data()/ble_gap_adv_set_fields() being
+    // called immediately after ble_gap_adv_stop(), same as here) and was
+    // fixed with the identical delay(5) in send_one_advertisement().
+    // ble_karma.cpp's rotate_identity() has the identical stop-then-set_fields
+    // shape and received the same fix as a preventive follow-up. Smaller
+    // payload size does not make a call site immune to this race -- it is a
+    // controller-timing issue on the stop path, not a packet-size issue on
+    // the set-data path (this project's own bring-up confirmed timing, not
+    // size, as the trigger). Cheap insurance against a real,
+    // previously-encountered, hard-to-diagnose failure mode -- now applied to
+    // every call site in this project with this exact stop-then-set shape,
+    // not just this file.
     delay(5);
 
     uint8_t pkt[40]; // donor's own max buffer size for these builders (largest
