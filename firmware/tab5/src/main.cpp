@@ -31,6 +31,11 @@
                                      // rotate own BLE identity/name every 2s while
                                      // nearby traffic is present ("air activity"
                                      // gimmick, not true per-target karma)
+#include "features/ble/ble_sourapple.h" // Task 11 (2nd Phase 2 plan): rotating
+                                         // multi-vendor BLE advertisement flood
+                                         // (Apple ProximityPair/Nearby Action/
+                                         // AirTag, Samsung Buds/Watch, MS Swift
+                                         // Pair, Google Fast Pair), CVE-2023-42941
 #include "features/ble/ble_central_spike.h" // Task 1 (2nd Phase 2 plan): spike
                                              // only -- no register_module(), no
                                              // launcher tile; serial-trigger 'c'
@@ -160,6 +165,10 @@ void setup() {
                                          // identity/name while nearby BLE traffic
                                          // is present, same reason -- must run
                                          // before Shell::build below
+    BleSourAppleFeature::register_module(); // Task 11 (2nd Phase 2 plan): rotating
+                                             // multi-vendor BLE advertisement flood,
+                                             // same reason -- must run before
+                                             // Shell::build below
 
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
@@ -330,6 +339,12 @@ void loop() {
                                   // for how this differs from ble_clone.cpp's
                                   // one-time version of the same persistent,
                                   // host-wide identity side effect
+    BleSourAppleFeature::poll(); // no-ops unless the Sour Apple screen is open;
+                                  // sends one rotating vendor template every
+                                  // 200ms. NOTE: also calls ble_hs_id_set_rnd()
+                                  // every send, same persistent host-wide
+                                  // identity side effect as ble_clone.cpp/
+                                  // ble_karma.cpp above
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
