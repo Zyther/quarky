@@ -32,6 +32,12 @@ static int gap_scan_event_cb(struct ble_gap_event *event, void *arg) {
 
     BleDeviceInfo d{};
     memcpy(d.addr, event->disc.addr.val, 6);
+    d.addr_type = event->disc.addr.type; // always BLE_ADDR_RANDOM here (filtered
+                                          // above); clone_target() hardcodes
+                                          // BLE_ADDR_RANDOM too rather than reading
+                                          // this back, but recording it keeps
+                                          // BleDeviceInfo accurate for any future
+                                          // reader/feature that inspects it
     ble_addr_to_str(d.addr, d.addr_str);
     d.rssi = event->disc.rssi;
     struct ble_hs_adv_fields fields;
@@ -109,11 +115,20 @@ static void clone_target(int index) {
     fields.name = (const uint8_t *)target.name;
     fields.name_len = strlen(target.name);
     fields.name_is_complete = 1;
-    ble_gap_adv_set_fields(&fields);
+    rc = ble_gap_adv_set_fields(&fields);
+    Serial.printf("quarky-tab5: [ble-clone] ble_gap_adv_set_fields rc=%d\n", rc);
 
     struct ble_gap_adv_params adv_params{};
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND; // connectable, matches a real cloned peripheral
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    // IMPORTANT: same single-legacy-advertising-instance constraint ble_spam.cpp
+    // discloses for its own ble_gap_adv_start() call -- this project has not
+    // configured NimBLE Extended Advertising, so this STOPS c2link_ble's existing
+    // C2 advertisement rather than running alongside it. While cloning, the Tab5
+    // will not be discoverable/connectable as "Quarky-Tab5" for pairing. Teardown
+    // (the list's LV_EVENT_DELETE handler above) calls ble_gap_adv_stop(), but the
+    // C2 advertisement does NOT resume on its own when this screen closes -- same
+    // disclosed, non-bug behavior as ble_spam.cpp.
     rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER, &adv_params, nullptr, nullptr);
     Serial.printf("quarky-tab5: [ble-clone] cloning '%s' rc=%d\n", target.name, rc);
     s_cloning = true;
@@ -176,7 +191,9 @@ void poll() {
 
     lv_obj_clean(s_list);
     for (int i = 0; i < count; i++) {
-        char row[48];
+        char row[56]; // name (up to 31 chars) + "  " + addr_str (up to 17 chars) + NUL
+                       // can reach 51 bytes worst case; snprintf truncates safely
+                       // either way, this just gives the common case headroom
         snprintf(row, sizeof(row), "%s  %s", snapshot[i].name, snapshot[i].addr_str);
         // Tapping a row clones that target -- index stashed as user_data.
         lv_obj_t *btn = lv_list_add_button(s_list, LV_SYMBOL_COPY, row);
