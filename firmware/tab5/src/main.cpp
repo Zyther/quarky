@@ -24,6 +24,9 @@
 #include "features/ble/ble_spam.h"
 #include "features/ble/ble_finder.h"
 #include "features/ble/ble_sniffer.h"
+#include "features/ble/ble_clone.h" // Task 9 (2nd Phase 2 plan): scan random-address
+                                     // peripherals, set own BLE identity to a
+                                     // captured target's MAC, advertise under its name
 #include "features/ble/ble_central_spike.h" // Task 1 (2nd Phase 2 plan): spike
                                              // only -- no register_module(), no
                                              // launcher tile; serial-trigger 'c'
@@ -145,6 +148,10 @@ void setup() {
                                            // BLE scan -> CSV export, same
                                            // reason -- must run before
                                            // Shell::build below
+    BleCloneFeature::register_module(); // Task 9 (2nd Phase 2 plan): capture +
+                                         // replay a random-address target's BLE
+                                         // identity, same reason -- must run
+                                         // before Shell::build below
 
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
@@ -299,6 +306,13 @@ void loop() {
                                   // (buffered, not written synchronously on the
                                   // NimBLE host task -- see ble_sniffer.cpp's
                                   // file-level comment for why)
+    BleCloneFeature::poll();     // no-ops unless the BLE Clone screen is open;
+                                  // refreshes the pick-list every 500ms while
+                                  // scanning. NOTE: tapping a target calls
+                                  // ble_hs_id_set_rnd(), a persistent, host-wide
+                                  // identity change -- see ble_clone.cpp's
+                                  // clone_target() comment for the cross-feature
+                                  // side effect this leaves for ble_hid_spike.cpp
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
