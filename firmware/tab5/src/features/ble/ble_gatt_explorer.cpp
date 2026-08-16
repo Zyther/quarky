@@ -42,12 +42,15 @@ extern FeatureRegistry g_registry;
 // (s_targets, guarded by s_targets_mux, refreshed by refresh_target_list_ui())
 // and the post-connect discovery log (s_log_rows, guarded by its own
 // s_log_mux, refreshed by refresh_log_ui()) -- kept as two separate mutexes
-// rather than one shared lock, matching ble_scan.cpp's per-state-mux
-// precedent (as opposed to ble_finder.cpp's single-mux choice, which was
-// deliberate there because all of its cross-task state was one small,
-// tightly-related cluster; here the two arrays are unrelated and each is
-// already a natural "producer task writes, main task snapshots-and-clears"
-// unit on its own).
+// rather than one shared lock. This is NOT what ble_scan.cpp does (that file
+// has only one cross-task state cluster and one mutex, so it doesn't
+// demonstrate a multi-mutex pattern either way); it's closer in spirit to
+// ble_finder.cpp choosing a single shared mutex for ITS one tightly-related
+// state cluster -- the difference here is that s_targets and s_log_rows are
+// two unrelated arrays with non-overlapping lifetimes (the log only starts
+// filling once the target list is done being read), so splitting them keeps
+// each critical section scoped to the data it actually protects rather than
+// forcing an artificial relationship between them.
 // -----------------------------------------------------------------------------
 namespace BleGattExplorerFeature {
 
@@ -116,7 +119,8 @@ static int svc_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
         char row[64];
         snprintf(row, sizeof(row), "svc %s", uuid_str);
         append_log(row);
-        ble_gattc_disc_all_chrs(conn_handle, service->start_handle, service->end_handle, chr_disc_cb, nullptr);
+        int rc = ble_gattc_disc_all_chrs(conn_handle, service->start_handle, service->end_handle, chr_disc_cb, nullptr);
+        Serial.printf("quarky-tab5: [gatt-explorer] ble_gattc_disc_all_chrs rc=%d\n", rc);
     } else if (error->status == BLE_HS_EDONE) {
         append_log("-- discovery complete --");
     }
@@ -130,7 +134,8 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
             append_log("-- connected, discovering --");
-            ble_gattc_disc_all_svcs(s_conn_handle, svc_disc_cb, nullptr);
+            int rc = ble_gattc_disc_all_svcs(s_conn_handle, svc_disc_cb, nullptr);
+            Serial.printf("quarky-tab5: [gatt-explorer] ble_gattc_disc_all_svcs rc=%d\n", rc);
         } else {
             char row[32];
             snprintf(row, sizeof(row), "connect failed status=%d", event->connect.status);
