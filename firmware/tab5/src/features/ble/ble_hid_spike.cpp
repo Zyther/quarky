@@ -496,6 +496,29 @@ void start() {
     Serial.printf("quarky-tab5: [ble-hid-spike] ble_gap_adv_stop rc=%d "
                   "(c2link_ble's C2 advertisement is now down for this boot)\n", rc);
 
+    // Same async stop/set-data race documented in ble_sourapple.cpp's
+    // send_one() (the original real-hardware discovery: the controller can
+    // still be asynchronously processing the previous ble_gap_adv_stop()
+    // when a "set advertisement data" call arrives immediately after, and
+    // silently fails) and confirmed for real on this project's own hardware
+    // in ble_spam.cpp's send_one_advertisement() (vendor-picker dropdown
+    // appeared not to change the broadcast payload; root cause was this
+    // exact race), then hit a second time as a preventive fix in
+    // ble_karma.cpp's rotate_identity() (identical stop-then-set_fields
+    // shape). start_advertising() below (~line 384) calls
+    // ble_gap_adv_set_fields() after this stop, with only ble_hs_id_infer_auto()
+    // and a device-name set in between -- neither is a guaranteed settling
+    // delay, just incidental host-call time. This file's own real-hardware
+    // pairing test already succeeded end-to-end (a test keystroke registered
+    // on a real macOS host) without this delay, so unlike ble_spam.cpp this
+    // is NOT a confirmed bug here -- it's a preventive fix closing a race
+    // class this codebase has now proven real twice, before Task 15 (Bad-KB)
+    // builds more code on top of this start() path where an intermittent
+    // failure would be far harder to isolate. start() runs once per
+    // user-triggered pairing session, not on a polling cadence, so 5ms here
+    // is trivially negligible.
+    delay(5);
+
     // Same derivation c2link_ble.cpp's on_sync() uses. Done here rather than
     // once at registration time because register_service() runs before the
     // controller has synced, when no identity address exists yet.
