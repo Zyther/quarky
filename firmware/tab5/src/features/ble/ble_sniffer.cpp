@@ -153,7 +153,16 @@ static int gap_scan_event_cb(struct ble_gap_event *event, void *arg) {
     // omitted here since name requires a separate parse pass -- this row
     // keeps the raw bytes, which is the analytically useful part for
     // offline tooling, over a partially-duplicated name field).
-    char hex[62]; // up to 31 bytes * 2 hex chars, generous for legacy adv max
+    // Task review fix (Critical, 2026-08-15): was char hex[62] ("31 bytes * 2
+    // hex chars", inherited from the brief's own sample code) -- forgot the
+    // NUL terminator, which needs a 63rd byte. At the max legal legacy-adv
+    // payload (length_data == 31, not rare for a feature whose whole job is
+    // capturing real BLE traffic), the loop's last iteration wrote hex[60],
+    // hex[61], AND hex[62] (one past the end), and the following
+    // hex[len*2]='\0' (len*2==62) wrote the same out-of-bounds byte again --
+    // a real one-byte stack overflow. Sized to 64 (63 needed, rounded up for
+    // clarity) rather than the exact minimum.
+    char hex[64];
     uint8_t len = event->disc.length_data < 31 ? event->disc.length_data : 31;
     for (uint8_t i = 0; i < len; i++) {
         snprintf(hex + i * 2, 3, "%02X", event->disc.data[i]);
@@ -260,6 +269,19 @@ void poll() {
             Serial.println("quarky-tab5: [ble-sniffer] append_capture_file FAILED");
         }
     }
+
+    // Task review fix (Important, 2026-08-15): this used to update the status
+    // label unconditionally, which clobbered build_screen()'s own
+    // failure-message labels ("BLE host not ready yet, try again shortly",
+    // "Scan failed to start") one loop iteration after they were set --
+    // s_scanning stays false in both failure paths, so the screen would
+    // silently settle on "Capturing... 0 rows (0 dropped)" forever, reading
+    // as a healthy just-started capture instead of the failure it actually
+    // is. Same bug class wifi_pmkid.cpp's poll() was already fixed for
+    // (see its s_active gate and comment, ~line 321-329) -- gating on
+    // s_scanning makes a failure message persist until the screen closes or
+    // a new build_screen() supersedes it.
+    if (!s_scanning) return;
 
     char buf[64];
     snprintf(buf, sizeof(buf), "Capturing... %lu rows (%lu dropped)",
