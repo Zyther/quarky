@@ -253,7 +253,22 @@ static int build_apple_airtag(uint8_t *pkt)
 static int build_samsung_buds(uint8_t *pkt)
 {
     int i = 0;
-    pkt[i++] = 0x1B;       /* length 27 */
+    // Length byte fixed post-port (2026-08-16 review round): the donor's own
+    // value here was 0x1B (27), but the actual payload written below is only
+    // 26 bytes (type(1) + company(2) + prefix(10) + device-id triplet(3) +
+    // suffix(10) = 26) -- an off-by-one present verbatim in the donor
+    // source. Confirmed two ways: direct byte-counting of this exact
+    // payload, and cross-checking against a SECOND, independent Samsung
+    // EasySetup implementation in the same donor checkout
+    // (~/src/poseidon-tab5/src/features/ble_spam.cpp's build_samsung()),
+    // which uses the identical 10-byte prefix below (strong evidence it's
+    // the real signature) but has its OWN different off-by-one in the
+    // opposite direction -- so neither donor implementation is authoritative
+    // on the "true" total length, and there's no available reference that
+    // gets this arithmetic right. Rather than guess at unknown-but-plausible
+    // additional bytes to reach the donor's original 27, this declares the
+    // length that actually matches the real payload being sent (26 / 0x1A).
+    pkt[i++] = 0x1A;       /* length 26 (fixed, see comment above; donor had 0x1B/27) */
     pkt[i++] = 0xFF;
     pkt[i++] = 0x75; pkt[i++] = 0x00;  /* Samsung */
     /* prefix block */
@@ -275,7 +290,17 @@ static int build_samsung_buds(uint8_t *pkt)
 static int build_samsung_watch(uint8_t *pkt)
 {
     int i = 0;
-    pkt[i++] = 0x0F;       /* length 15 */
+    // Length byte fixed post-port (2026-08-16 review round): same class of
+    // off-by-one as build_samsung_buds() above, carried over verbatim from
+    // the donor. The donor's value was 0x0F (15), but the actual payload
+    // written below is only 14 bytes (type(1) + company(2) + prefix(10) +
+    // device-id(1) = 14). See build_samsung_buds()'s comment for the full
+    // cross-validation reasoning (a second, independent donor Samsung
+    // implementation shares this prefix's signature but has its own,
+    // differently-wrong length arithmetic, so there is no authoritative
+    // "true" total to guess toward -- the fix here just makes the declared
+    // length match the real payload).
+    pkt[i++] = 0x0E;       /* length 14 (fixed, see comment above; donor had 0x0F/15) */
     pkt[i++] = 0xFF;
     pkt[i++] = 0x75; pkt[i++] = 0x00;
     static const uint8_t prefix[] = {
