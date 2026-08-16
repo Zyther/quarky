@@ -50,6 +50,10 @@
                                              // connect (via Task 1's
                                              // BleCentral), enumerate GATT
                                              // services/characteristics
+#include "features/ble/ble_flood.h" // Task 14 (2nd Phase 2 plan): rapid
+                                     // connection-request flood (via Task 1's
+                                     // BleCentral) against the first
+                                     // BLE-scanned device
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -186,6 +190,10 @@ void setup() {
                                                 // explorer, same reason --
                                                 // must run before Shell::build
                                                 // below
+    BleFloodFeature::register_module(); // Task 14 (2nd Phase 2 plan): BLE
+                                         // connection-request flood, same
+                                         // reason -- must run before
+                                         // Shell::build below
 
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
@@ -377,6 +385,9 @@ void loop() {
                                      // discovery-log refresh (independent of
                                      // scan state) from buffered NimBLE
                                      // host-task callback output
+    BleFloodFeature::poll();     // no-ops unless the BLE Flood screen is
+                                  // open; drives the connect/cancel tick
+                                  // every 250ms and the attempt counter label
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
