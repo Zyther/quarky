@@ -46,6 +46,10 @@
                                       // offline-finding advertisement emulator
                                       // -- fake Find My tag, rotates identity
                                       // every 60s
+#include "features/ble/ble_gatt_explorer.h" // Task 13 (2nd Phase 2 plan): scan,
+                                             // connect (via Task 1's
+                                             // BleCentral), enumerate GATT
+                                             // services/characteristics
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -177,6 +181,11 @@ void setup() {
                                           // offline-finding advertisement
                                           // emulator, same reason -- must run
                                           // before Shell::build below
+    BleGattExplorerFeature::register_module(); // Task 13 (2nd Phase 2 plan):
+                                                // GATT service/characteristic
+                                                // explorer, same reason --
+                                                // must run before Shell::build
+                                                // below
 
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
@@ -361,6 +370,13 @@ void loop() {
                                   // persistent host-wide identity side effect
                                   // as ble_clone.cpp/ble_karma.cpp/
                                   // ble_sourapple.cpp above
+    BleGattExplorerFeature::poll(); // no-ops unless the GATT Explorer screen
+                                     // is open; drives both the pre-connect
+                                     // target-picker list refresh (while
+                                     // scanning) and the post-connect
+                                     // discovery-log refresh (independent of
+                                     // scan state) from buffered NimBLE
+                                     // host-task callback output
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
