@@ -89,7 +89,8 @@ static void rotate_identity() {
     // and inventing a fake reset mechanism not backed by a real NimBLE API
     // would be worse than leaving this documented. Only a device reboot, or
     // another feature's own ble_hs_id_set_rnd() call, clears it.
-    ble_hs_id_set_rnd(addr);
+    int rc = ble_hs_id_set_rnd(addr);
+    Serial.printf("quarky-tab5: [ble-karma] ble_hs_id_set_rnd rc=%d\n", rc);
 
     ble_gap_adv_stop();
     struct ble_hs_adv_fields fields{};
@@ -98,12 +99,13 @@ static void rotate_identity() {
     fields.name = (const uint8_t *)name;
     fields.name_len = strlen(name);
     fields.name_is_complete = 1;
-    ble_gap_adv_set_fields(&fields);
+    rc = ble_gap_adv_set_fields(&fields);
+    Serial.printf("quarky-tab5: [ble-karma] ble_gap_adv_set_fields rc=%d\n", rc);
 
     struct ble_gap_adv_params adv_params{};
     adv_params.conn_mode = BLE_GAP_CONN_MODE_NON;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-    int rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER, &adv_params, nullptr, nullptr);
+    rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER, &adv_params, nullptr, nullptr);
     Serial.printf("quarky-tab5: [ble-karma] advertising as '%s' rc=%d\n", name, rc);
 
     s_name_idx = (s_name_idx + 1) % kNameCount;
