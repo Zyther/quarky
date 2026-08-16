@@ -603,6 +603,69 @@ void send_test_keystroke() {
     Serial.printf("quarky-tab5: [ble-hid-spike] key-up notify rc=%d\n", rc);
 }
 
+void send_key(uint8_t keycode) {
+    uint16_t conn = s_conn_handle;
+    if (conn == BLE_HS_CONN_HANDLE_NONE || keycode == 0) {
+        // No host connected, or keycode_for()'s "unrecognized character"
+        // sentinel (ble_bad_kb.cpp) -- nothing to send. Deliberately silent
+        // (unlike send_test_keystroke()'s equivalent guard): this can be
+        // called once per poll() tick for every character of a real script,
+        // and an unrecognized character is an expected, disclosed outcome of
+        // this reduced Ducky-script subset, not worth a log line per tick.
+        return;
+    }
+    if (!s_notify_enabled) {
+        Serial.println("quarky-tab5: [ble-hid-spike] host has NOT enabled input-report "
+                       "notifications -- not sending (see send_test_keystroke()'s comment "
+                       "for why this guard exists)");
+        return;
+    }
+
+    // Report layout matches the 8-byte boot keyboard report the Report Map
+    // above declares: [modifier, reserved, key1..key6].
+    const uint8_t down[8] = {0, 0, keycode, 0, 0, 0, 0, 0};
+    const uint8_t up[8] = {0};
+
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(down, sizeof(down));
+    if (om == nullptr) {
+        Serial.println("quarky-tab5: [ble-hid-spike] mbuf alloc failed (key-down)");
+        return;
+    }
+    int rc = ble_gatts_notify_custom(conn, s_report_val_handle, om);
+    if (rc != 0) {
+        Serial.printf("quarky-tab5: [ble-hid-spike] key-down notify rc=%d (keycode=0x%02X)\n",
+                      rc, keycode);
+    }
+
+    // ~20ms, not send_test_keystroke()'s 50ms -- see this function's header
+    // comment (ble_hid_spike.h) for why: this runs once per loop() tick from
+    // ble_bad_kb.cpp's poll(), so its total blocking time must stay well
+    // under this project's ~50ms no-blocking-call-longer-than-this Global
+    // Constraint, leaving headroom for that same tick's other poll() calls
+    // and lvgl_port_tick().
+    delay(20);
+
+    om = ble_hs_mbuf_from_flat(up, sizeof(up));
+    if (om == nullptr) {
+        Serial.println("quarky-tab5: [ble-hid-spike] mbuf alloc failed (key-up) -- "
+                       "the key is now stuck down on the host");
+        return;
+    }
+    rc = ble_gatts_notify_custom(conn, s_report_val_handle, om);
+    if (rc != 0) {
+        Serial.printf("quarky-tab5: [ble-hid-spike] key-up notify rc=%d\n", rc);
+    }
+    delay(20);
+}
+
+bool is_connected() {
+    // Single-word volatile scalar read on the main task, written on the
+    // NimBLE host task in gap_event_cb -- same safe-by-existing-precedent
+    // pattern send_test_keystroke() already uses for the same variable (see
+    // the file-level comment's discussion of s_conn_handle/s_notify_enabled).
+    return s_conn_handle != BLE_HS_CONN_HANDLE_NONE;
+}
+
 void stop() {
     // Disarm FIRST. gap_event_cb's disconnect path checks this flag, and the
     // ble_gap_terminate() below raises that event asynchronously -- clearing

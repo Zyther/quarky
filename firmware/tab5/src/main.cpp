@@ -39,9 +39,14 @@
 #include "features/ble/ble_central_spike.h" // Task 1 (2nd Phase 2 plan): spike
                                              // only -- no register_module(), no
                                              // launcher tile; serial-trigger 'c'
-#include "features/ble/ble_hid_spike.h" // Task 2 (2nd Phase 2 plan): spike only
-                                         // -- no register_module(), no launcher
-                                         // tile; serial-triggers 'h' and 'j'
+#include "features/ble/ble_hid_spike.h" // Task 2 (2nd Phase 2 plan): the HID
+                                         // GATT service/advertising/keystroke
+                                         // transport Task 15's BLE Bad-KB tile
+                                         // is built on; still no
+                                         // register_module()/launcher tile of
+                                         // its own -- serial-triggers 'h'/'j'
+                                         // remain as a headless-verification
+                                         // convenience
 #include "features/ble/ble_findmy.h" // Task 12 (2nd Phase 2 plan): Apple
                                       // offline-finding advertisement emulator
                                       // -- fake Find My tag, rotates identity
@@ -54,6 +59,11 @@
                                      // connection-request flood (via Task 1's
                                      // BleCentral) against the first
                                      // BLE-scanned device
+#include "features/ble/ble_bad_kb.h" // Task 15 (2nd Phase 2 plan): BLE Bad-KB
+                                      // -- Ducky-script text-entry launcher
+                                      // tile built on Task 2's ble_hid_spike
+                                      // transport (no GATT service of its
+                                      // own; see ble_bad_kb.h)
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -194,6 +204,13 @@ void setup() {
                                          // connection-request flood, same
                                          // reason -- must run before
                                          // Shell::build below
+    BleBadKbFeature::register_module(); // Task 15 (2nd Phase 2 plan): BLE
+                                         // Bad-KB Ducky-script typer, same
+                                         // reason -- must run before
+                                         // Shell::build below. Drives Task 2's
+                                         // ble_hid_spike.cpp transport rather
+                                         // than owning any GATT service of
+                                         // its own -- see ble_bad_kb.h
 
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
@@ -277,19 +294,25 @@ void setup() {
         // already-flagged, deferred concern from Task 11 is that
         // WiFi.mode(WIFI_AP) (above) and BLE together touch the same C6
         // co-processor radio at runtime.
-#ifdef QUARKY_SERIAL_DEBUG
-        // Second Phase 2 plan, Task 2: queue the HID keyboard service into the
-        // one shared GATT server before c2link_ble.init() starts the NimBLE
-        // host task. It MUST happen here and not from the spike's own 'h'
-        // trigger -- NimBLE drains the queued service-def list exactly once, at
-        // host startup, and a second hand-rolled ble_gatts_start() later is a
-        // use-after-free of the live ATT database (task-2-review.md C1).
+        // Queue the HID keyboard service into the one shared GATT server
+        // before c2link_ble.init() starts the NimBLE host task. It MUST
+        // happen here, not from any runtime trigger -- NimBLE drains the
+        // queued service-def list exactly once, at host startup, and a
+        // second hand-rolled ble_gatts_start() later is a use-after-free of
+        // the live ATT database (task-2-review.md finding C1;
+        // ble_hid_spike.h's header comment has the full mechanism).
         //
-        // Gated with the serial triggers themselves: a default build should not
-        // carry a BLE HID keyboard service that any connected central could
-        // discover and subscribe to, for a spike it cannot even trigger.
+        // Unconditional as of Task 15 (2nd Phase 2 plan) -- previously gated
+        // behind QUARKY_SERIAL_DEBUG, which was correct while this was Task
+        // 2's spike (no launcher tile, no way for a default build to even
+        // trigger it). Task 15 promoted it into BleBadKbFeature, a real
+        // launcher tile any user can open in every build, so the HID service
+        // this feature drives must actually be present in the ATT database
+        // unconditionally too -- gating registration behind a debug-only
+        // build flag while the tile itself ships in every build would leave
+        // BleBadKbFeature's "Send" button permanently non-functional in a
+        // normal release build.
         c2link_ble_add_gatt_hook(BleHidSpike::register_service);
-#endif
 
         bool c2_ble_ok = c2link_ble.init(provisioned_psk, "Quarky-Tab5");
         Serial.printf("quarky-tab5: c2link_ble init %s\n", c2_ble_ok ? "OK" : "FAILED");
@@ -388,6 +411,17 @@ void loop() {
     BleFloodFeature::poll();     // no-ops unless the BLE Flood screen is
                                   // open; drives the connect/cancel tick
                                   // every 250ms and the attempt counter label
+    BleBadKbFeature::poll();     // no-ops unless the BLE Bad-KB screen is
+                                  // open; updates the Paired/Disconnected
+                                  // status label from BleHidSpike::is_connected(),
+                                  // and -- while a script is in flight --
+                                  // advances the Ducky-script parser by
+                                  // exactly one keystroke-or-bookkeeping
+                                  // action per tick (see ble_bad_kb.cpp's
+                                  // file comment for why this must not be a
+                                  // single blocking call: the same watchdog-
+                                  // starvation bug class wifi_connect.cpp
+                                  // hit for real)
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
