@@ -42,6 +42,10 @@
 #include "features/ble/ble_hid_spike.h" // Task 2 (2nd Phase 2 plan): spike only
                                          // -- no register_module(), no launcher
                                          // tile; serial-triggers 'h' and 'j'
+#include "features/ble/ble_findmy.h" // Task 12 (2nd Phase 2 plan): Apple
+                                      // offline-finding advertisement emulator
+                                      // -- fake Find My tag, rotates identity
+                                      // every 60s
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -169,6 +173,10 @@ void setup() {
                                              // multi-vendor BLE advertisement flood,
                                              // same reason -- must run before
                                              // Shell::build below
+    BleFindMyFeature::register_module(); // Task 12 (2nd Phase 2 plan): Apple
+                                          // offline-finding advertisement
+                                          // emulator, same reason -- must run
+                                          // before Shell::build below
 
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
@@ -345,6 +353,14 @@ void loop() {
                                   // every send, same persistent host-wide
                                   // identity side effect as ble_clone.cpp/
                                   // ble_karma.cpp above
+    BleFindMyFeature::poll();    // no-ops unless the Find My Emulator screen
+                                  // is open; rotates the fake tag's identity
+                                  // and Apple offline-finding advertisement
+                                  // every 60s. NOTE: also calls
+                                  // ble_hs_id_set_rnd() every rotation, same
+                                  // persistent host-wide identity side effect
+                                  // as ble_clone.cpp/ble_karma.cpp/
+                                  // ble_sourapple.cpp above
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
