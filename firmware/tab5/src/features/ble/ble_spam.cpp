@@ -101,6 +101,29 @@ static constexpr size_t kMaxServiceDataPayloadLen = 32;
 static void send_one_advertisement() {
     ble_gap_adv_stop(); // no-op (returns an error this ignores) if nothing is currently advertising
 
+    // Defensive 5ms settle delay between stop and the data-set call below
+    // (covers both branches -- ble_gap_adv_set_data() in the is_service_data
+    // branch and ble_gap_adv_set_fields() in the else branch -- since both
+    // follow the same ble_gap_adv_stop() above). Real-hardware bug fix
+    // (2026-08-16): the vendor-picker dropdown appeared to not change the
+    // active spam payload -- selecting a different vendor kept broadcasting
+    // whatever was previously configured. Root cause is the same async
+    // stop/set-data race documented and fixed in ble_sourapple.cpp's
+    // send_one() (see its comment, citing the donor's real hardware
+    // debugging at ~/src/poseidon-tab5/src/features/ble_sourapple.cpp,
+    // ~line 374-380): calling a NimBLE "set advertisement data" function
+    // immediately after ble_gap_adv_stop() can silently fail because the BLE
+    // controller is still asynchronously processing the previous stop, so
+    // the radio keeps transmitting the PREVIOUS payload's content. This file
+    // shipped and was real-hardware-verified back when it only ever
+    // broadcast one fixed payload (AirPods), where an intermittent
+    // set_fields() failure was indistinguishable from working correctly --
+    // now that there are 4 selectable payloads, a failure specifically on
+    // the cycle right after switching vendors reproduces exactly as "the
+    // dropdown doesn't change the active spam type." Same fix, same value,
+    // for the same reason: a 5ms delay here.
+    delay(5);
+
     struct ble_hs_adv_fields fields{};
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     const SpamPayload &p = kPayloads[s_selected_payload];
