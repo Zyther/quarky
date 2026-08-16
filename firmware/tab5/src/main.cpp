@@ -64,6 +64,13 @@
                                       // tile built on Task 2's ble_hid_spike
                                       // transport (no GATT service of its
                                       // own; see ble_bad_kb.h)
+#include "features/ble/ble_fastpair_exploit.h" // Task 16 (2nd Phase 2 plan):
+                                                // Google Fast Pair (0xFE2C)
+                                                // KBP-characteristic
+                                                // overflow/state-confusion
+                                                // write probe, via Task 1's
+                                                // BleCentral, against the first
+                                                // BLE-scanned device
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -211,6 +218,10 @@ void setup() {
                                          // ble_hid_spike.cpp transport rather
                                          // than owning any GATT service of
                                          // its own -- see ble_bad_kb.h
+    BleFastPairExploitFeature::register_module(); // Task 16 (2nd Phase 2 plan):
+                                                   // Fast Pair KBP write probe,
+                                                   // same reason -- must run
+                                                   // before Shell::build below
 
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
@@ -422,6 +433,14 @@ void loop() {
                                   // single blocking call: the same watchdog-
                                   // starvation bug class wifi_connect.cpp
                                   // hit for real)
+    BleFastPairExploitFeature::poll(); // no-ops unless the Fast Pair Exploit
+                                        // screen is open; renders the status
+                                        // line that connect/discovery/write
+                                        // callbacks buffered on the NimBLE
+                                        // host task -- those callbacks must
+                                        // never call lv_* themselves (same
+                                        // LV_OS_NONE constraint as
+                                        // ble_gatt_explorer.cpp)
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
