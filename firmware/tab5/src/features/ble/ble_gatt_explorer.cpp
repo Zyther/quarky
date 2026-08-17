@@ -61,7 +61,30 @@ static portMUX_TYPE s_targets_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static lv_obj_t *s_list = nullptr;
 static bool s_scanning = false;
-static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+
+// Written on the NimBLE host task (gap_event_cb's BLE_GAP_EVENT_CONNECT/
+// DISCONNECT branches), read on the main task (the LV_EVENT_DELETE teardown
+// handler below). Previously plain uint16_t -- safe while the only main-task
+// read was a single pre-loop snapshot, but the teardown fix below (see that
+// handler's comment) adds a loop that re-reads this value on every iteration,
+// specifically expecting to observe a host-task write land mid-loop -- the
+// same reason ble_fastpair_exploit.cpp's s_conn_handle needed volatile.
+static volatile uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+
+// Return code of the BleCentral::connect() call connect_to() makes, if any.
+// -1 (the initial/reset value, restored at the top of every build_screen())
+// means no connect attempt has been started this screen session -- the
+// teardown loop below can skip its cancel/disconnect work entirely. 0 means
+// an attempt really was started and may still be in flight; nonzero means
+// BleCentral::connect() itself failed synchronously, so nothing can ever
+// land. Mirrors ble_flood.cpp's s_last_connect_rc and
+// ble_fastpair_exploit.cpp's s_connect_rc, used for the same purpose. Written
+// and read only on the main task (connect_to() runs from the target list's
+// LV_EVENT_CLICKED handler, the teardown loop from LV_EVENT_DELETE, both
+// LVGL-dispatched on the main task) -- volatile per this file's existing
+// house style for these single-scalar connect-lifecycle flags rather than a
+// genuine cross-task requirement.
+static volatile int s_connect_rc = -1;
 
 // -----------------------------------------------------------------------------
 // Discovery log: an append-only, ordered row buffer covering connect status,
@@ -204,7 +227,11 @@ static void connect_to(int index) {
     portEXIT_CRITICAL(&s_log_mux);
     s_log_rows_rendered = 0;
 
-    BleCentral::connect(target, 5000, gap_event_cb, nullptr);
+    // Recorded for the LV_EVENT_DELETE teardown handler below: 0 means this
+    // attempt is genuinely in flight and must be cancelled/hung-up if the
+    // user backs out of the screen before it resolves.
+    int rc = BleCentral::connect(target, 5000, gap_event_cb, nullptr);
+    s_connect_rc = rc;
 }
 
 // Snapshots s_targets/s_target_count under the lock and does the actual LVGL
@@ -288,11 +315,67 @@ static lv_obj_t *build_screen() {
     // after this handler runs (e.g. a late BLE_GAP_EVENT_DISCONNECT) just
     // writes into s_log_rows/s_conn_handle harmlessly with nothing left to
     // render it.
+    //
+    // POS-AUDIT-220 / ble-004, the connect-in-flight variant (same hazard
+    // class already fixed in ble_flood.cpp/Task 14 and
+    // ble_fastpair_exploit.cpp/Task 16). The disconnect() call below only
+    // terminates a connection that had ALREADY fully landed by the time this
+    // handler starts running. connect_to() -- invoked when the user taps a
+    // scanned target in the picker list -- starts a connect attempt via
+    // BleCentral::connect(target, 5000, gap_event_cb, nullptr) that can stay
+    // in flight for up to 5 seconds. If the user backs out of this screen
+    // during that window and the attempt later succeeds, gap_event_cb's
+    // BLE_GAP_EVENT_CONNECT branch does NOT self-terminate the connection
+    // (unlike ble_flood.cpp's callback) -- it sets s_conn_handle and starts
+    // GATT discovery, so the connection stays joined for the rest of the
+    // session, exhausting a connection-table slot.
+    //
+    // s_connect_rc == 0 is the only safe skip for the loop below: it is a
+    // fact fixed at connect-attempt time (BleCentral::connect()'s own return
+    // code), not a sampled race -- -1 (no target ever tapped) and nonzero
+    // (the connect call itself failed to start) both mean nothing can ever
+    // land.
+    //
+    // Unconditional-deadline shape, ported verbatim from
+    // ble_flood.cpp/ble_fastpair_exploit.cpp: no early exit based on sampled
+    // state. ble_fastpair_exploit.cpp's teardown comment documents, via
+    // direct tracing of the real NimBLE source, why an early-exit version
+    // (breaking out once ble_gap_conn_cancel() reports nothing active AND
+    // s_conn_handle reads clear) is a genuine race -- the master-role
+    // connect-complete path inserts the connection into the host's
+    // connection table and reports BOTH of those signals as "settled" a full
+    // two deferred HCI round trips before gap_event_cb ever runs and sets
+    // s_conn_handle. Burning the full deadline unconditionally, and
+    // re-checking s_conn_handle on every iteration rather than only once, is
+    // what closes that race by construction.
     lv_obj_add_event_cb(s_list, [](lv_event_t *e) {
         if (s_scanning) { ble_gap_disc_cancel(); s_scanning = false; }
-        if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) BleCentral::disconnect(s_conn_handle);
+
+        uint16_t conn = s_conn_handle;
+        if (conn != BLE_HS_CONN_HANDLE_NONE) BleCentral::disconnect(conn);
+
+        if (s_connect_rc == 0) {
+            uint32_t deadline = millis() + 500;
+            do {
+                ble_gap_conn_cancel();
+
+                // A connection that landed in the last 50ms gap -- including
+                // one that was mid-deferred-HCI-round-trip when this loop
+                // started: hang it up.
+                conn = s_conn_handle;
+                if (conn != BLE_HS_CONN_HANDLE_NONE) BleCentral::disconnect(conn);
+
+                delay(50);
+            } while (millis() < deadline);
+        }
+
         s_list = nullptr;
     }, LV_EVENT_DELETE, nullptr);
+
+    // Reset before the host-sync early return below so the teardown handler
+    // above always sees a correct "nothing started yet" value even if this
+    // build_screen() call bails out early (host not ready).
+    s_connect_rc = -1;
 
     if (!c2link_ble_host_synced()) {
         lv_list_add_text(s_list, "BLE host not ready yet, try again shortly");
