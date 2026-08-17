@@ -71,6 +71,15 @@
                                                 // write probe, via Task 1's
                                                 // BleCentral, against the first
                                                 // BLE-scanned device
+#include "features/ble/ble_hfp_exploit.h" // Task 17 (2nd Phase 2 plan):
+                                           // Handsfree (0x111E) / Handsfree AG
+                                           // (0x111F) GATT service-leak
+                                           // foothold check, via Task 1's
+                                           // BleCentral, against the first
+                                           // BLE-scanned device. Named
+                                           // "exploit" after the donor; it is
+                                           // honestly just a leak check -- see
+                                           // ble_hfp_exploit.h
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -222,6 +231,11 @@ void setup() {
                                                    // Fast Pair KBP write probe,
                                                    // same reason -- must run
                                                    // before Shell::build below
+    BleHfpExploitFeature::register_module(); // Task 17 (2nd Phase 2 plan):
+                                              // HFP (0x111E/0x111F) GATT
+                                              // service-leak check, same
+                                              // reason -- must run before
+                                              // Shell::build below
 
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
@@ -441,6 +455,14 @@ void loop() {
                                         // never call lv_* themselves (same
                                         // LV_OS_NONE constraint as
                                         // ble_gatt_explorer.cpp)
+    BleHfpExploitFeature::poll();      // no-ops unless the HFP Exploit screen
+                                        // is open; renders the status line that
+                                        // the connect and the two service
+                                        // discoveries buffered on the NimBLE
+                                        // host task -- those callbacks must
+                                        // never call lv_* themselves (same
+                                        // LV_OS_NONE constraint as
+                                        // ble_fastpair_exploit.cpp)
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
