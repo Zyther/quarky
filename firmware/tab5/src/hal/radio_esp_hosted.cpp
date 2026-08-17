@@ -16,11 +16,30 @@ bool RadioEspHosted::connect_wifi(const char *ssid, const char *pass) {
         return false;
     }
 
-    // WiFi.mode() returns false when the low-level radio bring-up fails.
-    // Previously ignored, which meant a dead radio still cost the full 15s
-    // timeout below (and kept re-triggering bring-up from inside WiFi.status()).
-    if (!WiFi.mode(WIFI_STA)) {
-        Serial.println("quarky-tab5: radio WiFi.mode(WIFI_STA) failed");
+    // Mode-preserving station bring-up (whole-branch review finding I1,
+    // 2026-08-17). This used to be a bare WiFi.mode(WIFI_STA), which drops any
+    // existing WIFI_MODE_AP -- i.e. it silently killed c2link_wifi's SoftAP,
+    // the Cardputer-ADV's WiFi C2 transport. That was harmless while this
+    // function's only caller ran in setup() before c2link_wifi.init(), but the
+    // second Phase 2 plan's Task 3 turned it into a real launcher-tile action
+    // ("WiFi Connect"), so tapping Connect mid-session took the C2 link down
+    // with nothing to bring it back -- a direct violation of this plan's own
+    // Global Constraint ("never a bare WIFI_STA/WIFI_AP that drops the
+    // existing mode").
+    //
+    // Same idiom wifi_common.cpp, wifi_spectrum.cpp and wifi_pmkid.cpp all
+    // already use: only ever widen WIFI_AP to WIFI_AP_STA, and only set a bare
+    // WIFI_STA when there is no AP to preserve.
+    //
+    // The return value is checked because WiFi.mode() returns false when the
+    // low-level radio bring-up fails. Ignoring it (as this originally did)
+    // meant a dead radio still cost the full 15s timeout below, and kept
+    // re-triggering bring-up from inside WiFi.status().
+    wifi_mode_t current = WiFi.getMode();
+    wifi_mode_t wanted = (current == WIFI_AP || current == WIFI_AP_STA) ? WIFI_AP_STA : WIFI_STA;
+    if (!WiFi.mode(wanted)) {
+        Serial.printf("quarky-tab5: radio WiFi.mode(%s) failed\n",
+                      wanted == WIFI_AP_STA ? "WIFI_AP_STA" : "WIFI_STA");
         return false;
     }
     if (WiFi.begin(ssid, pass) == WL_CONNECT_FAILED) {
