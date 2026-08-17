@@ -114,6 +114,17 @@ static void rotate_identity() {
 
     ble_gap_adv_stop(); // no-op (returns an error this ignores) if nothing is currently advertising
 
+    // Scoped re-review finding (2026-08-17, Minor): this used to only flip
+    // s_advertised on a successful ble_gap_adv_start() below, matching
+    // ble_hid_spike.cpp's s_took_adv_slot in spirit but not in timing --
+    // the C2 advertisement is already stopped and gone the moment the call
+    // above returns, regardless of whether the replacement start succeeds.
+    // A failed start left s_advertised false, so teardown skipped
+    // c2link_ble_rearm_advertising() and C2 stayed down for the rest of the
+    // boot even though this function is exactly what took its slot. Set it
+    // here, unconditionally, at the point the slot actually changes hands.
+    s_advertised = true;
+
     // Defensive 5ms settle delay between stop and ble_gap_adv_set_fields()
     // below. Same async stop/set-data race fixed in ble_sourapple.cpp's
     // send_one() (donor-documented hardware bug: the BLE controller can
@@ -159,7 +170,6 @@ static void rotate_identity() {
     // stopping this advertisement, so C2 comes back on Back.
     rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER, &adv_params, nullptr, nullptr);
     Serial.printf("quarky-tab5: [ble-karma] advertising as '%s' rc=%d\n", name, rc);
-    if (rc == 0) s_advertised = true;
 
     s_name_idx = (s_name_idx + 1) % kNameCount;
 }
