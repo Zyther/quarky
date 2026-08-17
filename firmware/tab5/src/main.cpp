@@ -80,6 +80,17 @@
                                            // "exploit" after the donor; it is
                                            // honestly just a leak check -- see
                                            // ble_hfp_exploit.h
+#include "features/ble/ble_whisperpair.h" // Task 18 (2nd Phase 2 plan):
+                                           // WhisperPair CVE-2025-36911
+                                           // detector -- connect, find Fast
+                                           // Pair 0xFE2C + its KBP
+                                           // characteristic, subscribe via
+                                           // real CCCD discovery, write a real
+                                           // ECDH/AES-derived probe outside
+                                           // pairing mode and see whether the
+                                           // accessory replies. Via Task 1's
+                                           // BleCentral, against the first
+                                           // BLE-scanned device
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -236,6 +247,10 @@ void setup() {
                                               // service-leak check, same
                                               // reason -- must run before
                                               // Shell::build below
+    BleWhisperPairFeature::register_module(); // Task 18 (2nd Phase 2 plan):
+                                               // WhisperPair CVE-2025-36911
+                                               // detector, same reason -- must
+                                               // run before Shell::build below
 
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
@@ -463,6 +478,16 @@ void loop() {
                                         // never call lv_* themselves (same
                                         // LV_OS_NONE constraint as
                                         // ble_fastpair_exploit.cpp)
+    BleWhisperPairFeature::poll();     // no-ops unless the WhisperPair screen
+                                        // is open. Does three main-task-only
+                                        // jobs the NimBLE host task must not:
+                                        // renders the buffered status line,
+                                        // enables the Send Probe button once
+                                        // the KBP notify subscription is
+                                        // confirmed, and expires the
+                                        // post-probe notify wait window (which
+                                        // is what emits the "target stayed
+                                        // silent" verdict)
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
