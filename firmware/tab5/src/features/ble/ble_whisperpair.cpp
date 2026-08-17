@@ -1,5 +1,6 @@
 #include "ble_whisperpair.h"
 #include "ble_central.h"
+#include "ble_common.h" // ble_require_host_ready(), ble_push_message_screen()
 #include "ble_scan.h" // BleScanFeature::first_device_addr()/first_device_addr_type()
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
@@ -752,6 +753,18 @@ static lv_obj_t *build_screen(const uint8_t addr_val[6], uint8_t addr_type) {
     s_status_dirty = false;
     portEXIT_CRITICAL(&s_status_mux);
 
+    // Finding C1 (2026-08-17), defensive. This screen was only ACCIDENTALLY
+    // safe on a radios-disabled boot: start() bails when
+    // BleScanFeature::first_device_addr() is null, which happens to always be
+    // true there because BLE Scan could never have run -- a coincidence of
+    // call order, not a guarantee, and one that silently evaporates the day
+    // anything else populates that list (a C2-pushed target, a saved-target
+    // feature, a scan that ran before the C6 dropped). Placed after
+    // s_connect_rc's reset above so the teardown handler's
+    // `if (s_connect_rc != 0 ...) return` early-out sees a correct "nothing in
+    // flight" on this bail-out path.
+    if (!ble_require_host_ready(s_status_label)) return screen;
+
     ble_addr_t target{};
     target.type = addr_type; // Bug 2 fix: the peer's REAL advertised address
                               // type, not a hardcoded BLE_ADDR_PUBLIC. Most
@@ -783,6 +796,26 @@ void register_module() {
     // ble_fastpair_exploit.cpp (Task 16) and ble_hfp_exploit.cpp (Task 17),
     // this runs against the first BLE-scanned device, so BLE Scan must have
     // been run first.
+    //
+    // TARGET SELECTION -- real, considered, deferred work (whole-branch review
+    // finding I3, 2026-08-17). This detector is only meaningful against a
+    // Google Fast Pair accessory (0xFE2C), yet it connects to scan slot 0
+    // unconditionally. It matters more here than in ble_fastpair_exploit.cpp,
+    // because this file is a VULNERABILITY DETECTOR and the cost of aiming it
+    // at the wrong device is a result that a hurried reader can mistake for a
+    // security finding. See ble_fastpair_exploit.cpp's
+    // register_module() for the full write-up of the picker design (reuse
+    // ble_gatt_explorer.cpp's scan/list/tap structure, filter or rank with
+    // BleClassify's Fast Pair labels) and of why it was deferred rather than
+    // done in this fix round -- the same reasoning applies verbatim to this
+    // file, whose state machine is larger still (subscription gating, probe
+    // window expiry) and whose teardown loop carries the same
+    // no-early-exit race documentation.
+    //
+    // Until then, the mitigation is the verdict wording this file already
+    // uses and which must be kept that way: a target with no 0xFE2C service
+    // reports "not applicable to this target", never "patched" or "not
+    // vulnerable" -- see svc_disc_cb()'s log_status() call.
     g_registry.register_module({"ble_whisperpair", "WhisperPair CVE-2025-36911", Category::BLE,
                                 Affinity::TAB5_NATIVE, start, nullptr});
 }
@@ -790,7 +823,12 @@ void register_module() {
 void start() {
     const uint8_t *addr = BleScanFeature::first_device_addr();
     if (!addr) {
+        // Finding I3 (2026-08-17): this used to Serial.println() and return,
+        // so tapping the launcher tile on a cold session produced no visible
+        // reaction whatsoever on a touchscreen device. Push a screen that says
+        // what to do instead. See ble_common.h.
         Serial.println("quarky-tab5: [whisperpair] no scanned device available -- run BLE Scan first");
+        ble_push_message_screen("WhisperPair (CVE-2025-36911)", kBleNoScannedTargetMsg);
         return;
     }
     uint8_t addr_type = BleScanFeature::first_device_addr_type(); // Bug 2 fix

@@ -1,7 +1,6 @@
 #include "ble_gatt_explorer.h"
 #include "ble_central.h"
 #include "ble_common.h"
-#include "../../hal/c2link_ble.h"
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
 #include <Arduino.h> // Serial, millis() -- same as every other BLE feature file
@@ -377,10 +376,9 @@ static lv_obj_t *build_screen() {
     // build_screen() call bails out early (host not ready).
     s_connect_rc = -1;
 
-    if (!c2link_ble_host_synced()) {
-        lv_list_add_text(s_list, "BLE host not ready yet, try again shortly");
-        return screen;
-    }
+    // Finding C1 (2026-08-17): migrated from this file's own inline copy of
+    // the host-ready guard to the shared helper (see ble_common.h).
+    if (!ble_require_host_ready_list(s_list)) return screen;
 
     s_target_count = 0;
     s_log_rows_rendered = 0;

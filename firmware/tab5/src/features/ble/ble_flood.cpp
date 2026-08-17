@@ -134,6 +134,19 @@ static lv_obj_t *build_screen(const uint8_t addr_val[6], uint8_t addr_type) {
         } while (s_last_connect_rc == 0 && millis() < deadline);
     }, LV_EVENT_DELETE, nullptr);
 
+    // Finding C1 (2026-08-17), defensive. This screen was only ACCIDENTALLY
+    // safe on a radios-disabled boot: start() bails when
+    // BleScanFeature::first_device_addr() is null, which happens to always be
+    // true there because BLE Scan could never have run -- a coincidence of
+    // call order, not a guarantee, and one that evaporates the day anything
+    // else populates that list. s_last_connect_rc is set to a nonzero
+    // "nothing was ever in flight" value first so the teardown handler's
+    // do-while (which loops for 500ms while s_last_connect_rc == 0) exits
+    // after one iteration on this bail-out path instead of burning the full
+    // deadline for a connect that never happened.
+    s_last_connect_rc = -1;
+    if (!ble_require_host_ready(s_status_label)) return screen;
+
     s_target.type = addr_type; // Bug 1 fix: real peer address type, not a
                                 // hardcoded BLE_ADDR_PUBLIC assumption
     memcpy(s_target.val, addr_val, 6);
@@ -159,7 +172,11 @@ void register_module() {
 void start() {
     const uint8_t *addr = BleScanFeature::first_device_addr(); // from Task 1, Step 4
     if (!addr) {
+        // Finding I3 (2026-08-17): this used to Serial.println() and return,
+        // so tapping the launcher tile on a cold session produced no visible
+        // reaction whatsoever on a touchscreen device. See ble_common.h.
         Serial.println("quarky-tab5: [ble-flood] no scanned device available -- run BLE Scan first");
+        ble_push_message_screen("BLE Flood", kBleNoScannedTargetMsg);
         return;
     }
     uint8_t addr_type = BleScanFeature::first_device_addr_type(); // Bug 1 fix

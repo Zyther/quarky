@@ -1,6 +1,5 @@
 #include "ble_sniffer.h"
 #include "ble_common.h"
-#include "../../hal/c2link_ble.h"
 #include "../../hal/storage_sd.h"
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
@@ -208,10 +207,9 @@ static lv_obj_t *build_screen() {
         s_status_label = nullptr;
     }, LV_EVENT_DELETE, nullptr);
 
-    if (!c2link_ble_host_synced()) {
-        lv_label_set_text(s_status_label, "BLE host not ready yet, try again shortly");
-        return screen;
-    }
+    // Finding C1 (2026-08-17): migrated from this file's own inline copy of
+    // the host-ready guard to the shared helper (see ble_common.h).
+    if (!ble_require_host_ready(s_status_label)) return screen;
 
     snprintf(s_path, sizeof(s_path), "/quarky/captures/ble/sniff_%lu.csv", millis());
     s_row_count = 0;

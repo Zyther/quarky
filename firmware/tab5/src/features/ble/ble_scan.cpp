@@ -1,7 +1,6 @@
 #include "ble_scan.h"
 #include "ble_common.h"
 #include "ble_classify.h"
-#include "../../hal/c2link_ble.h"
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
 #include <Arduino.h> // Serial (spike-verification logging)
@@ -181,10 +180,10 @@ static lv_obj_t *build_screen() {
         s_list = nullptr;
     }, LV_EVENT_DELETE, nullptr);
 
-    if (!c2link_ble_host_synced()) {
-        lv_list_add_text(s_list, "BLE host not ready yet, try again shortly");
-        return screen;
-    }
+    // Finding C1 (2026-08-17): this file's own inline copy of the host-ready
+    // guard, migrated to the shared helper -- same check, same on-screen
+    // wording, one definition (see ble_common.h).
+    if (!ble_require_host_ready_list(s_list)) return screen;
 
     // Final whole-branch review finding M5 (2026-08-13): s_device_count's
     // reset used to run outside s_devices_mux, the one unlocked touch of an
