@@ -1,5 +1,6 @@
 #include "ble_karma.h"
-#include "../../hal/c2link_ble.h"
+#include "ble_common.h" // ble_require_host_ready() -- shared host-ready screen guard
+#include "../../hal/c2link_ble.h" // c2link_ble_rearm_advertising()
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
 #include <Arduino.h> // Serial, millis() -- needed the same way ble_scan.cpp/
@@ -39,6 +40,14 @@ static constexpr int kNameCount = sizeof(kNames) / sizeof(kNames[0]);
 
 static volatile bool s_traffic_seen = false;
 static bool s_active = false;
+// True once rotate_identity() has actually started an advertisement, i.e.
+// once this screen has taken over the radio's single legacy-advertising slot
+// from c2link_ble. Main-task only (set in rotate_identity(), which poll()
+// calls; read in the teardown handler). Finding I6: teardown uses this to
+// decide whether there is anything for c2link_ble_rearm_advertising() to
+// restore -- Karma only advertises once it has actually seen nearby BLE
+// traffic, so a screen opened in a quiet room never disturbed C2 at all.
+static bool s_advertised = false;
 static int s_name_idx = 0;
 static uint32_t s_last_rotate_ms = 0;
 static lv_obj_t *s_status_label = nullptr;
@@ -89,6 +98,17 @@ static void rotate_identity() {
     // and inventing a fake reset mechanism not backed by a real NimBLE API
     // would be worse than leaving this documented. Only a device reboot, or
     // another feature's own ble_hs_id_set_rnd() call, clears it.
+    //
+    // For the full downstream consequence chain -- leftover identity ->
+    // ble_hid_spike.cpp's inferred address -> BLE Bad-KB (ble_bad_kb.cpp)
+    // appearing as an unknown device to a host it had already bonded with,
+    // and churning a bond store capped at 3 -- see ble_clone.cpp's version of
+    // this disclosure, which is where that chain is written out in full
+    // (whole-branch review finding I5, 2026-08-17). It applies verbatim here,
+    // and arguably more often: Karma re-rolls the identity every 2 seconds
+    // for as long as its screen is open, so the odds that a Bad-KB session
+    // later in the same boot inherits a stale identity are near-certain
+    // rather than incidental.
     int rc = ble_hs_id_set_rnd(addr);
     Serial.printf("quarky-tab5: [ble-karma] ble_hs_id_set_rnd rc=%d\n", rc);
 
@@ -126,8 +146,20 @@ static void rotate_identity() {
     struct ble_gap_adv_params adv_params{};
     adv_params.conn_mode = BLE_GAP_CONN_MODE_NON;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    // IMPORTANT, same single-legacy-advertising-instance constraint
+    // ble_spam.cpp and ble_clone.cpp already disclose for their own
+    // ble_gap_adv_start() calls (whole-branch review finding I6, 2026-08-17 --
+    // this file did the identical thing with no disclosure at all): this
+    // project has not configured NimBLE Extended Advertising, so exactly one
+    // advertisement can be live system-wide and starting this one STOPS
+    // c2link_ble's C2 advertisement. While BLE Karma is open the Tab5 is not
+    // discoverable/connectable as "Quarky-Tab5" for BLE C2 pairing. Unlike
+    // when this was first written, that is now temporary: the teardown
+    // handler in build_screen() calls c2link_ble_rearm_advertising() after
+    // stopping this advertisement, so C2 comes back on Back.
     rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER, &adv_params, nullptr, nullptr);
     Serial.printf("quarky-tab5: [ble-karma] advertising as '%s' rc=%d\n", name, rc);
+    if (rc == 0) s_advertised = true;
 
     s_name_idx = (s_name_idx + 1) % kNameCount;
 }
@@ -141,16 +173,32 @@ static lv_obj_t *build_screen() {
     lv_label_set_text(s_status_label, "Starting...");
 
     lv_obj_add_event_cb(s_status_label, [](lv_event_t *e) {
-        ble_gap_disc_cancel();
-        ble_gap_adv_stop();
+        // Finding M1 (2026-08-17): capture and log both return codes, matching
+        // every other teardown handler in this plan's files. These are the two
+        // calls that decide whether the radio is actually quiet after Back --
+        // discarding their rc was the one place in this file where a silent
+        // failure would look identical to success.
+        int disc_rc = ble_gap_disc_cancel();
+        int adv_rc = ble_gap_adv_stop();
+        Serial.printf("quarky-tab5: [ble-karma] teardown ble_gap_disc_cancel rc=%d, "
+                      "ble_gap_adv_stop rc=%d\n", disc_rc, adv_rc);
+        bool was_advertising = s_advertised;
         s_active = false;
+        s_advertised = false;
         s_status_label = nullptr;
+        // Finding I6 (2026-08-17): hand the radio's single legacy-advertising
+        // slot back to the C2 link -- rotate_identity() took it over (see its
+        // disclosure comment), and before this call that takeover lasted for
+        // the rest of the boot.
+        if (was_advertising) c2link_ble_rearm_advertising();
     }, LV_EVENT_DELETE, nullptr);
 
-    if (!c2link_ble_host_synced()) {
-        lv_label_set_text(s_status_label, "BLE host not ready yet, try again shortly");
-        return screen;
-    }
+    // Finding C1 (2026-08-17): migrated from this file's own inline copy of
+    // the host-ready guard to the shared helper (see ble_common.h). This is
+    // the guard that keeps rotate_identity()'s ble_hs_id_set_rnd() -- which
+    // has NO internal host-readiness check and panics on a radios-disabled
+    // boot -- from ever being reached with no host behind it.
+    if (!ble_require_host_ready(s_status_label)) return screen;
 
     struct ble_gap_disc_params params{};
     params.passive = 1;

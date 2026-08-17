@@ -1,4 +1,6 @@
 #include "ble_sourapple.h"
+#include "ble_common.h" // ble_require_host_ready() -- shared host-ready screen guard
+#include "../../hal/c2link_ble.h" // c2link_ble_rearm_advertising()
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
 #include <Arduino.h> // Serial, millis(), delay() -- needed the same way ble_scan.cpp/
@@ -386,6 +388,35 @@ static void randomize_own_mac() {
     // matches this project's own already-correct precedent in
     // ble_clone.cpp/ble_karma.cpp.
     addr[5] |= 0xC0;
+
+    // IMPORTANT, real cross-feature side effect (whole-branch review finding
+    // I5, 2026-08-17 -- this file called the identical API with no disclosure
+    // at all, while ble_clone.cpp and ble_karma.cpp both documented it):
+    // ble_hs_id_set_rnd() sets NimBLE's host-wide random *identity* address.
+    // It is not scoped to this screen, this advertisement, or this call --
+    // and this project's NimBLE exposes no way to unset it (ble_hs_id.h
+    // declares only ble_hs_id_gen_rnd/ble_hs_id_set_rnd/ble_hs_id_copy_addr/
+    // ble_hs_id_infer_auto; the private ble_hs_id_reset() in the underlying
+    // .c is not public). Whatever address was current when this screen closed
+    // is what every later ble_hs_id_infer_auto() caller inherits, until the
+    // device reboots or another feature overwrites it.
+    //
+    // What is DIFFERENT about this file's version of the problem, and why it
+    // is the worst of the four: Clone sets the identity once, to one chosen
+    // MAC; Karma re-rolls every 2 seconds; Find My every 60. Sour Apple calls
+    // this from send_one(), on poll()'s 200ms cadence -- FIVE fresh random
+    // identities per second, the most aggressive identity churn of any
+    // feature in this project. A one-minute Sour Apple run leaves ~300
+    // discarded host identities behind it, of which the arbitrary last one
+    // sticks.
+    //
+    // For the full downstream consequence chain -- leftover identity ->
+    // ble_hid_spike.cpp's ble_hs_id_infer_auto() -> BLE Bad-KB advertising
+    // under an address a previously-bonded macOS/Windows host does not
+    // recognise, forcing a re-pair and churning a bond store capped at 3 --
+    // see ble_clone.cpp's version of this disclosure, where that chain is
+    // written out in full. Reboot before a Bad-KB session that depends on an
+    // existing bond.
     int rc = ble_hs_id_set_rnd(addr);
     if (rc != 0) {
         Serial.printf("quarky-tab5: [ble-sourapple] ble_hs_id_set_rnd rc=%d\n", rc);
@@ -439,6 +470,16 @@ static void send_one() {
         struct ble_gap_adv_params adv_params{};
         adv_params.conn_mode = BLE_GAP_CONN_MODE_NON;
         adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+        // IMPORTANT, same single-legacy-advertising-instance constraint
+        // ble_spam.cpp and ble_clone.cpp disclose for their own
+        // ble_gap_adv_start() calls (whole-branch review finding I6,
+        // 2026-08-17 -- this file did the identical thing undisclosed): this
+        // project has not configured NimBLE Extended Advertising, so exactly
+        // one advertisement is live system-wide and starting this one stops
+        // c2link_ble's C2 advertisement. While Sour Apple is open the Tab5 is
+        // not discoverable as "Quarky-Tab5" for BLE C2 pairing. The teardown
+        // handler in build_screen() calls c2link_ble_rearm_advertising(), so
+        // C2 comes back on Back rather than staying down for the boot.
         rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER, &adv_params, nullptr, nullptr);
         if (rc != 0) {
             Serial.printf("quarky-tab5: [ble-sourapple] adv_start rc=%d (mode=%s)\n",
@@ -457,11 +498,27 @@ static lv_obj_t *build_screen() {
     lv_label_set_text(s_status_label, "Flooding...");
 
     lv_obj_add_event_cb(s_status_label, [](lv_event_t *e) {
+        bool was_advertising = s_active;
         s_active = false;
         s_status_label = nullptr;
         int rc = ble_gap_adv_stop();
         Serial.printf("quarky-tab5: [ble-sourapple] ble_gap_adv_stop rc=%d\n", rc);
+        // Finding I6 (2026-08-17): give the C2 link its advertisement back --
+        // send_one() took over the radio's single legacy-advertising slot
+        // (see its disclosure above). Stop ours first, then re-arm, or the
+        // re-arm's ble_gap_adv_start() returns BLE_HS_EALREADY and leaves the
+        // spoofed payload broadcasting.
+        if (was_advertising) c2link_ble_rearm_advertising();
     }, LV_EVENT_DELETE, nullptr);
+
+    // Finding C1 (2026-08-17, the crash this fix round exists for). Without
+    // this guard, opening this screen on a radios-disabled boot panics the
+    // device within ~200ms: poll() calls send_one() -> randomize_own_mac() ->
+    // ble_hs_id_set_rnd(), which -- unlike ble_gap_adv_start/stop/set_data --
+    // has NO internal ble_hs_is_enabled() check and dereferences a NULL
+    // npl_funcs table pointer (LoadProhibited). See ble_common.h for the full
+    // disassembly-verified writeup. Must come before s_active is armed.
+    if (!ble_require_host_ready(s_status_label)) return screen;
 
     s_active = true;
     s_next_template = 0;

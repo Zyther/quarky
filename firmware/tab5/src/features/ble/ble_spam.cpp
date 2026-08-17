@@ -1,5 +1,6 @@
 #include "ble_spam.h"
-#include "ble_common.h"
+#include "ble_common.h" // ble_addr_to_str(), ble_require_host_ready()
+#include "../../hal/c2link_ble.h" // c2link_ble_rearm_advertising()
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
 #include <Arduino.h> // Serial (real NimBLE return-code logging, same as c2link_ble.cpp/ble_scan.cpp)
@@ -82,14 +83,18 @@ static lv_obj_t *s_status_label = nullptr;
 // time, system-wide. Starting this spam advertisement STOPS c2link_ble's
 // existing C2 advertisement rather than running alongside it -- while BLE
 // Spam is open, the Tab5 will not be discoverable/connectable as
-// "Quarky-Tab5" for pairing. This is a real, disclosed tradeoff -- restoring
-// the C2 advertisement when this screen closes is a reasonable follow-up
-// (would need a small addition to c2link_ble.h/.cpp exposing a "re-arm
-// advertising" call) but is left out of this task's scope; noted here and in
-// the task report rather than silently shipping it undocumented. The C2
-// advertisement does NOT resume on its own when this screen closes -- that
-// is expected, disclosed behavior, not a bug to chase during hardware
-// verification.
+// "Quarky-Tab5" for pairing. This is a real, disclosed tradeoff.
+//
+// RESOLVED (whole-branch review finding I6, 2026-08-17): the "restoring the
+// C2 advertisement when this screen closes is a reasonable follow-up (would
+// need a small addition to c2link_ble.h/.cpp exposing a re-arm call)" note
+// that used to live here had been carried unimplemented since the first
+// Phase 2 plan, and by this plan's end six features were taking the
+// advertising slot over permanently. c2link_ble_rearm_advertising() now
+// exists (hal/c2link_ble.h) and this file's LV_EVENT_DELETE teardown calls
+// it, so the C2 advertisement DOES come back when this screen closes. The
+// takeover while the screen is open remains unavoidable -- that is the
+// single-instance radio constraint itself, not a missing feature.
 
 // Largest service-data AD payload this table can plausibly grow to hold,
 // used to size the fixed adv[] buffer below. Fast Pair's 10 bytes is the
@@ -225,17 +230,29 @@ static lv_obj_t *build_screen() {
     // activity from this exact handler). Fixed by adding ble_gap_adv_stop()
     // here, symmetric with those two.
     //
-    // This does NOT restore c2link_ble's C2 advertisement -- that remains
-    // the disclosed, explicitly out-of-scope follow-up (a
-    // c2link_ble_rearm_advertising() call, per the file-level comment
-    // above). Stopping the transmitter is the part that must not wait;
-    // re-arming the C2 link is real follow-up work, not a one-line fix.
+    // Finding I6 (2026-08-17): this handler now also restores c2link_ble's C2
+    // advertisement, which the spam advertisement took over (see the
+    // file-level comment). Order matters -- stop ours first, then re-arm C2,
+    // or ble_gap_adv_start() inside the re-arm would just return
+    // BLE_HS_EALREADY and leave the spoofed payload on the air.
     lv_obj_add_event_cb(s_status_label, [](lv_event_t *e) {
+        bool was_advertising = s_active;
         s_active = false;
         s_status_label = nullptr;
         int rc = ble_gap_adv_stop();
         Serial.printf("quarky-tab5: [ble-spam] ble_gap_adv_stop rc=%d\n", rc);
+        if (was_advertising) c2link_ble_rearm_advertising();
     }, LV_EVENT_DELETE, nullptr);
+
+    // Finding C1 (2026-08-17): the host-ready guard this file never had. It
+    // is the same pre-existing gap the eight sibling BLE features closed
+    // during the first Phase 2 plan; ble_spam.cpp was missed. Reachable for
+    // real: ble_hs_id_copy_addr() below, and send_one_advertisement() on the
+    // very first poll() tick, both call into a NimBLE host that does not
+    // exist on a radios-disabled boot. Must come after the teardown handler
+    // registration above (so teardown state stays consistent on this path)
+    // and before s_active is armed.
+    if (!ble_require_host_ready(s_status_label)) return screen;
 
     s_active = true;
     s_last_rotate_ms = 0; // force an immediate first send in poll()

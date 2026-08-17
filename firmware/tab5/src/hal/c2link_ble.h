@@ -82,3 +82,42 @@ uint32_t c2link_ble_last_recv_ms();
 // Dropped the parenthetical rather than qualify it, since nothing consumes
 // the advertising-state claim.
 bool c2link_ble_host_synced();
+
+// Restart this link's own C2 advertisement after some other feature took the
+// radio's single legacy-advertising slot.
+//
+// Why this exists (whole-branch review finding I6, 2026-08-17). Legacy BLE
+// advertising is single-instance system-wide -- this project has not
+// configured NimBLE Extended Advertising -- so ANY feature that calls
+// ble_gap_adv_start() (BLE Spam, Clone, Karma, Sour Apple, Find My, and the
+// HID/Bad-KB path) implicitly stops the C2 advertisement this file started
+// in on_sync(). That is an unavoidable radio constraint. What was NOT
+// unavoidable is that it used to be permanent: six features stopped their
+// own advertisement on teardown but nothing ever restarted C2's, so opening
+// any of those six screens once killed the Tab5's BLE C2 link for the rest
+// of the boot. ble_spam.cpp had cited a "c2link_ble_rearm_advertising()"
+// call as the intended fix since the first Phase 2 plan; this is that
+// function, finally written.
+//
+// Implementation is deliberately thin: it re-runs the same
+// ble_gap_adv_set_fields()/ble_gap_adv_rsp_set_fields()/ble_gap_adv_start()
+// sequence on_sync() runs, from the same stored device name and service
+// UUID, so there is exactly one definition of what the C2 advertisement
+// looks like. It is safe to call repeatedly and from any feature's
+// LV_EVENT_DELETE teardown.
+//
+// Returns true if the advertisement is (or already was) up afterwards.
+// Returns false, harmlessly and without touching NimBLE, when:
+//   * the host never synced (radios-disabled boot) -- same guard every
+//     feature screen needs, see c2link_ble_host_synced();
+//   * a C2 peer is already CONNECTED, in which case there is deliberately
+//     no advertisement to restore (this file only advertises while
+//     unconnected; its own gap_event_cb re-arms on disconnect).
+//
+// Note on identity: features like Clone/Karma/Sour Apple/Find My leave a
+// host-wide random identity behind via ble_hs_id_set_rnd() (see those files'
+// disclosure comments). This re-arm keeps using the own-address type
+// on_sync() inferred at boot, so the C2 advertisement returns under the same
+// address the Cardputer-ADV saw at boot rather than under a leftover spoofed
+// identity -- which is the behaviour the C2 link wants.
+bool c2link_ble_rearm_advertising();

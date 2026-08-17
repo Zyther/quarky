@@ -107,6 +107,36 @@ static void clone_target(int index) {
     // fake reset mechanism not backed by a real NimBLE API would be worse
     // than leaving this documented. Only a device reboot, or another
     // feature's own ble_hs_id_set_rnd() call, clears it.
+    //
+    // THE FULL CONSEQUENCE CHAIN (whole-branch review finding I5, 2026-08-17
+    // -- documented here, the oldest and most-referenced of this project's
+    // four identity-churn disclosures, and pointed at from the other three in
+    // ble_karma.cpp / ble_sourapple.cpp / ble_findmy.cpp). Every disclosure
+    // in this codebase used to stop at "this affects the address
+    // ble_hid_spike.cpp advertises under", which undersells it. Follow it one
+    // step further:
+    //
+    //   1. This call leaves a host-wide random identity behind.
+    //   2. ble_hid_spike.cpp's start() calls ble_hs_id_infer_auto() and
+    //      therefore advertises "QuarkyKB" under that leftover identity.
+    //   3. That spike is no longer spike-only -- Task 15 shipped BLE Bad-KB
+    //      (ble_bad_kb.cpp) as a real user-facing feature built directly on
+    //      it, and it BONDS: this build has sm_bonding=1 with NVS-persisted
+    //      bonds (CONFIG_BT_NIMBLE_NVS_PERSIST=1).
+    //   4. A macOS/Windows host that previously bonded with Bad-KB stored
+    //      that bond against the identity address Bad-KB used at the time.
+    //      Coming back under a DIFFERENT leftover identity means the host
+    //      does not recognise it as the paired keyboard -- it appears as a
+    //      brand-new device needing pairing again, and each fresh pairing
+    //      consumes another slot in a bond store capped at 3
+    //      (CONFIG_BT_NIMBLE_MAX_BONDS=3, see ble_hid_spike.cpp's
+    //      repeat-pairing path).
+    //
+    // So the practical, real-world statement is: running Clone (or Karma /
+    // Sour Apple / Find My) and then using Bad-KB in the same boot can force
+    // a re-pair on a host that was already paired, and churn through the
+    // 3-bond cap if repeated. Reboot to get a clean identity before a Bad-KB
+    // session that depends on an existing bond.
     int rc = ble_hs_id_set_rnd(addr.val);
     Serial.printf("quarky-tab5: [ble-clone] ble_hs_id_set_rnd rc=%d\n", rc);
 
@@ -125,10 +155,13 @@ static void clone_target(int index) {
     // discloses for its own ble_gap_adv_start() call -- this project has not
     // configured NimBLE Extended Advertising, so this STOPS c2link_ble's existing
     // C2 advertisement rather than running alongside it. While cloning, the Tab5
-    // will not be discoverable/connectable as "Quarky-Tab5" for pairing. Teardown
-    // (the list's LV_EVENT_DELETE handler above) calls ble_gap_adv_stop(), but the
-    // C2 advertisement does NOT resume on its own when this screen closes -- same
-    // disclosed, non-bug behavior as ble_spam.cpp.
+    // will not be discoverable/connectable as "Quarky-Tab5" for pairing.
+    // UPDATE (finding I6, 2026-08-17): that takeover is now temporary rather
+    // than permanent -- teardown (the list's LV_EVENT_DELETE handler above)
+    // stops this advertisement and then calls c2link_ble_rearm_advertising(),
+    // so the C2 advertisement comes back when this screen closes. It is still
+    // down for as long as the screen is open; that part is the unavoidable
+    // single-instance radio constraint, not something a re-arm can fix.
     rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER, &adv_params, nullptr, nullptr);
     Serial.printf("quarky-tab5: [ble-clone] cloning '%s' rc=%d\n", target.name, rc);
     s_cloning = true;
@@ -144,14 +177,24 @@ static lv_obj_t *build_screen() {
 
     lv_obj_add_event_cb(s_list, [](lv_event_t *e) {
         if (s_scanning) { ble_gap_disc_cancel(); s_scanning = false; }
-        if (s_cloning) { ble_gap_adv_stop(); s_cloning = false; }
+        if (s_cloning) {
+            ble_gap_adv_stop();
+            s_cloning = false;
+            // Whole-branch review finding I6 (2026-08-17): give the C2 link
+            // its advertisement back. Cloning took over the radio's single
+            // legacy-advertising slot (see clone_target()'s disclosure), and
+            // until this call existed that takeover was permanent for the
+            // rest of the boot. Only on the s_cloning path -- if this screen
+            // never actually advertised, c2link_ble's advertisement was never
+            // disturbed and re-arming would be a pointless radio restart.
+            c2link_ble_rearm_advertising();
+        }
         s_list = nullptr;
     }, LV_EVENT_DELETE, nullptr);
 
-    if (!c2link_ble_host_synced()) {
-        lv_list_add_text(s_list, "BLE host not ready yet, try again shortly");
-        return screen;
-    }
+    // Finding C1 (2026-08-17): migrated from this file's own inline copy of
+    // the host-ready guard to the shared helper (see ble_common.h).
+    if (!ble_require_host_ready_list(s_list)) return screen;
 
     s_target_count = 0;
     struct ble_gap_disc_params params{};

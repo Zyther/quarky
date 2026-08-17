@@ -129,7 +129,11 @@ static constexpr size_t kMaxGattHooks = 4;
 static C2LinkBleGattHook s_gatt_hooks[kMaxGattHooks] = {nullptr};
 static size_t s_gatt_hook_count = 0;
 
-static void start_advertising();
+// Returns true once the advertisement is actually live (every failure path
+// logs its own rc). The bool is ignored by the fire-and-forget callers below
+// (on_sync/gap_event_cb, which have nothing useful to do with a failure) and
+// consumed by c2link_ble_rearm_advertising().
+static bool start_advertising();
 
 // GATT access callback for the write (Rx) characteristic: peer -> Tab5.
 // Payload is [c2proto frame][32-byte HMAC-SHA256 trailer], mirroring the WiFi
@@ -250,7 +254,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *) {
     }
 }
 
-static void start_advertising() {
+static bool start_advertising() {
     // Advertisement payload: flags (3B) + the 128-bit service UUID (18B) = 21B,
     // fits inside the 31-byte limit. The device name is put in the scan
     // response instead, since name + 128-bit UUID together would overflow.
@@ -263,7 +267,7 @@ static void start_advertising() {
     int rc = ble_gap_adv_set_fields(&adv_fields);
     if (rc != 0) {
         Serial.printf("quarky-tab5: c2link_ble adv_set_fields failed (rc=%d)\n", rc);
-        return;
+        return false;
     }
 
     struct ble_hs_adv_fields rsp_fields;
@@ -274,7 +278,7 @@ static void start_advertising() {
     rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
     if (rc != 0) {
         Serial.printf("quarky-tab5: c2link_ble adv_rsp_set_fields failed (rc=%d)\n", rc);
-        return;
+        return false;
     }
 
     struct ble_gap_adv_params adv_params;
@@ -286,9 +290,10 @@ static void start_advertising() {
                            &adv_params, gap_event_cb, NULL);
     if (rc != 0) {
         Serial.printf("quarky-tab5: c2link_ble adv_start failed (rc=%d)\n", rc);
-        return;
+        return false;
     }
     Serial.printf("quarky-tab5: c2link_ble advertising as \"%s\"\n", s_device_name);
+    return true;
 }
 
 // Fires once the host and (remote C6) controller are synced and ready. This is
@@ -460,4 +465,47 @@ uint32_t c2link_ble_last_recv_ms() {
 
 bool c2link_ble_host_synced() {
     return s_host_synced;
+}
+
+bool c2link_ble_rearm_advertising() {
+    // Radios-disabled boot (or c2link_ble.init() failed): there is no host to
+    // talk to. Bail BEFORE any NimBLE call -- ble_gap_adv_stop() itself is
+    // safe when the host is down (it checks ble_hs_is_enabled() internally),
+    // but nothing in this file should model "call NimBLE and hope", and the
+    // six features that call this do so from teardown paths that also run on
+    // that boot. Same contract every BLE feature screen's own guard uses,
+    // see features/ble/ble_common.h's ble_require_host_ready().
+    if (!s_host_synced) return false;
+
+    // A connected C2 peer means there is deliberately nothing to advertise:
+    // this link only advertises while unconnected, and gap_event_cb already
+    // re-arms on disconnect. Reporting false here is "no advertisement was
+    // started", not an error -- the C2 link is in its best possible state.
+    if (s_connected) {
+        Serial.println("quarky-tab5: c2link_ble re-arm skipped, C2 peer already connected");
+        return false;
+    }
+
+    // The caller (a feature's LV_EVENT_DELETE teardown) has already stopped
+    // its OWN advertisement, but stop again rather than trust that: a stray
+    // still-live advertisement would make ble_gap_adv_start() below return
+    // BLE_HS_EALREADY and silently leave the feature's payload on the air
+    // under the guise of a restored C2 link -- the exact failure this
+    // function exists to prevent. The rc is deliberately not checked: it is
+    // an error precisely in the expected case where nothing was advertising.
+    ble_gap_adv_stop();
+
+    // The 5ms settle delay this codebase has now hit for real twice
+    // (ble_spam.cpp's vendor picker appearing not to change the broadcast
+    // payload; the donor's own Sour Apple bring-up): the controller can still
+    // be asynchronously processing a stop when the next "set advertisement
+    // data" call arrives, which then silently fails. Applied here for the
+    // same reason it is applied at every other stop-then-set site in this
+    // project -- without it, a re-arm can leave the radio quiet while
+    // reporting success.
+    delay(5);
+
+    bool ok = start_advertising();
+    Serial.printf("quarky-tab5: c2link_ble re-arm advertising %s\n", ok ? "ok" : "FAILED");
+    return ok;
 }

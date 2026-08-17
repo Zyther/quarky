@@ -1,4 +1,6 @@
 #include "ble_findmy.h"
+#include "ble_common.h" // ble_require_host_ready() -- shared host-ready screen guard
+#include "../../hal/c2link_ble.h" // c2link_ble_rearm_advertising()
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
 #include <Arduino.h> // Serial, millis(), delay() -- needed explicitly here,
@@ -66,6 +68,35 @@ static void rotate() {
     uint8_t addr[6];
     for (int i = 0; i < 6; i++) addr[i] = (uint8_t)esp_random();
     addr[5] |= 0xC0;
+
+    // IMPORTANT, real cross-feature side effect (whole-branch review finding
+    // I5, 2026-08-17 -- this file called the identical API with no disclosure
+    // at all, while ble_clone.cpp and ble_karma.cpp both documented it):
+    // ble_hs_id_set_rnd() sets NimBLE's host-wide random *identity* address,
+    // not a per-advertisement one, and this project's NimBLE exposes no
+    // supported way to unset it (ble_hs_id.h declares only
+    // ble_hs_id_gen_rnd/ble_hs_id_set_rnd/ble_hs_id_copy_addr/
+    // ble_hs_id_infer_auto). Whichever tag identity happened to be current
+    // when this screen closed is what every later ble_hs_id_infer_auto()
+    // caller inherits, until reboot or the next feature that overwrites it.
+    //
+    // What is DIFFERENT about this file's version: rotation here is SLOW and
+    // deliberate -- one identity per s_dwell_ms (60s by default), because
+    // that is what makes the broadcast look like a real single Find My
+    // accessory rather than a swarm. So unlike Sour Apple's 5-per-second
+    // churn, the identity left behind by a Find My session is one specific
+    // address that a passing iPhone may well have already relayed to iCloud
+    // as a sighting. That is the intended behaviour of the feature, but it
+    // does mean the leftover host identity is one that has plausibly been
+    // reported to Apple's offline-finding network -- worth knowing before
+    // reusing this boot for anything where the device's BLE identity matters.
+    //
+    // For the full downstream consequence chain -- leftover identity ->
+    // ble_hid_spike.cpp's ble_hs_id_infer_auto() -> BLE Bad-KB advertising
+    // under an address a previously-bonded macOS/Windows host does not
+    // recognise, forcing a re-pair and churning a bond store capped at 3 --
+    // see ble_clone.cpp's version of this disclosure, where that chain is
+    // written out in full.
     int rc = ble_hs_id_set_rnd(addr);
     Serial.printf("quarky-tab5: [ble-findmy] ble_hs_id_set_rnd rc=%d\n", rc);
 
@@ -115,6 +146,17 @@ static void rotate() {
         // analysis tooling, not an incidental donor choice.
         adv_params.itvl_min = 0x0640;
         adv_params.itvl_max = 0x0780;
+        // IMPORTANT, same single-legacy-advertising-instance constraint
+        // ble_spam.cpp and ble_clone.cpp disclose for their own
+        // ble_gap_adv_start() calls (whole-branch review finding I6,
+        // 2026-08-17 -- this file did the identical thing undisclosed): this
+        // project has not configured NimBLE Extended Advertising, so exactly
+        // one advertisement is live system-wide and starting this one stops
+        // c2link_ble's C2 advertisement. While the Find My emulator is open
+        // the Tab5 is not discoverable as "Quarky-Tab5" for BLE C2 pairing.
+        // The teardown handler in build_screen() calls
+        // c2link_ble_rearm_advertising(), so C2 comes back on Back rather
+        // than staying down for the rest of the boot.
         start_rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER, &adv_params, nullptr, nullptr);
     }
     Serial.printf("quarky-tab5: [ble-findmy] ble_gap_adv_start rc=%d\n", start_rc);
@@ -129,14 +171,48 @@ static lv_obj_t *build_screen() {
     lv_label_set_text(s_status_label, "Broadcasting...");
 
     lv_obj_add_event_cb(s_status_label, [](lv_event_t *e) {
+        bool was_advertising = s_active;
         s_active = false;
         s_status_label = nullptr;
         int rc = ble_gap_adv_stop();
         Serial.printf("quarky-tab5: [ble-findmy] ble_gap_adv_stop rc=%d\n", rc);
+        // Finding I6 (2026-08-17): give the C2 link its advertisement back --
+        // rotate() took over the radio's single legacy-advertising slot (see
+        // its disclosure above). Stop ours first, then re-arm, or the
+        // re-arm's ble_gap_adv_start() returns BLE_HS_EALREADY and leaves the
+        // emulated tag broadcasting.
+        if (was_advertising) c2link_ble_rearm_advertising();
     }, LV_EVENT_DELETE, nullptr);
 
+    // Finding C1 (2026-08-17). Without this guard, opening this screen on a
+    // radios-disabled boot panics the device on its first rotation: rotate()
+    // calls ble_hs_id_set_rnd(), which -- unlike ble_gap_adv_start/stop/
+    // set_data -- has NO internal ble_hs_is_enabled() check and dereferences
+    // a NULL npl_funcs table pointer (LoadProhibited). See ble_common.h for
+    // the full disassembly-verified writeup. Must come before s_active is
+    // armed, and before the s_last_rotate_ms priming below (which exists
+    // specifically to make that first rotation happen immediately).
+    if (!ble_require_host_ready(s_status_label)) return screen;
+
     s_active = true;
-    s_last_rotate_ms = 0; // force immediate first rotate in poll()
+    // Force an immediate first rotate on the very next poll() tick.
+    //
+    // Finding I4 (2026-08-17): this used to be `s_last_rotate_ms = 0;` with
+    // the same "force immediate first rotate" comment, which was false for
+    // this file specifically. poll()'s gate is
+    // `if (now - s_last_rotate_ms < s_dwell_ms) return;` -- with a zero
+    // timestamp that reads `millis() < 60000`, i.e. the first advertisement
+    // was SUPPRESSED for the whole first minute of device uptime while this
+    // screen already said "Broadcasting...". Every other file using the same
+    // `= 0` idiom (ble_spam.cpp/ble_sourapple.cpp at 200ms, ble_karma.cpp at
+    // 2000ms) has a dwell short enough that the window is unnoticeable; Find
+    // My's 60s dwell is the one place it was reachable and user-visible.
+    // Subtracting the dwell makes the gate's subtraction come out >= dwell on
+    // the first tick regardless of uptime, which is what the comment always
+    // claimed. (Unsigned wraparound is fine and intentional here: for
+    // millis() < s_dwell_ms this wraps to a huge value, and the gate's own
+    // `now - s_last_rotate_ms` wraps back to exactly s_dwell_ms.)
+    s_last_rotate_ms = millis() - s_dwell_ms;
     return screen;
 }
 

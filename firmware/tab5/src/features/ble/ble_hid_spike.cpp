@@ -109,6 +109,16 @@ static volatile bool s_notify_warn_logged = false;
 // (task-2-review.md finding I1).
 static volatile bool s_advertising = false;
 
+// Finding I6 (2026-08-17): true once start() has called ble_gap_adv_stop() to
+// claim the radio's single legacy-advertising slot from c2link_ble, cleared
+// once stop() has handed it back. Deliberately NOT the same thing as
+// s_advertising above: start() can take the slot and then fail to put its own
+// advertisement up (start_advertising() returning nonzero leaves s_advertising
+// false), and that is precisely the case where C2 is left with no
+// advertisement at all and most needs the re-arm. Main-task-only, same as
+// s_svc_queued below.
+static bool s_took_adv_slot = false;
+
 // Main-task-only: read/written exclusively from start()/stop(), which only ever
 // run from main.cpp's serial-trigger path.
 static bool s_svc_queued = false;
@@ -507,8 +517,12 @@ bool start() {
     // c2link_ble's C2 advertisement. This is the spike's only remaining side
     // effect on c2link_ble; the GATT server is untouched.
     int rc = ble_gap_adv_stop();
+    s_took_adv_slot = true;
+    // Finding I6 (2026-08-17): this log line used to say "down for this boot",
+    // which is no longer true -- stop() now calls
+    // c2link_ble_rearm_advertising() and the C2 advertisement comes back.
     Serial.printf("quarky-tab5: [ble-hid-spike] ble_gap_adv_stop rc=%d "
-                  "(c2link_ble's C2 advertisement is now down for this boot)\n", rc);
+                  "(c2link_ble's C2 advertisement is down until stop())\n", rc);
 
     // Same async stop/set-data race documented in ble_sourapple.cpp's
     // send_one() (the original real-hardware discovery: the controller can
@@ -723,6 +737,29 @@ void stop() {
     // nothing actionable.
     if (s_prev_device_name[0] != '\0') {
         ble_svc_gap_device_name_set(s_prev_device_name);
+    }
+
+    // Finding I6 (2026-08-17): hand the radio's single legacy-advertising
+    // slot back to c2link_ble. start() explicitly takes it over (see its
+    // ble_gap_adv_stop() call and the "c2link_ble's C2 advertisement is now
+    // down for this boot" log line, which is no longer true of this teardown
+    // path). Done LAST, after the GAP device name has been restored, so the
+    // C2 advertisement's scan response goes back out carrying "Quarky-Tab5"
+    // rather than "QuarkyKB" -- c2link_ble's start_advertising() reads the
+    // name from its own stored copy for the scan-response field, but
+    // ble_svc_gap_device_name_set() is what a connected central reads from
+    // the GAP service, and leaving those two disagreeing is exactly the
+    // post-connect mismatch this file already fixed once.
+    //
+    // This also covers BLE Bad-KB (ble_bad_kb.cpp), whose LV_EVENT_DELETE
+    // teardown calls this function rather than touching NimBLE itself. Guarded
+    // on s_took_adv_slot so a stop() that follows a start() which bailed at one
+    // of its four early-return guards (host not synced, service not queued,
+    // already advertising, host already connected) does not restart an
+    // advertisement that was never disturbed.
+    if (s_took_adv_slot) {
+        s_took_adv_slot = false;
+        c2link_ble_rearm_advertising();
     }
 }
 
