@@ -21,12 +21,25 @@ submit.
    launch again). Tapping **Back** also stops the portal, in addition to
    leaving the screen.
 
-While the portal is running, it takes over the Tab5's WiFi AP identity —
-the C2 link's own "Quarky-Tab5" SoftAP goes down for the duration (ESP32
-WiFi supports one AP configuration at a time). It comes back once the
-portal is stopped, but not automatically on close if the whole device
-reboots mid-session with the portal left running — restart the portal
-screen if that happens.
+### Side effect: this takes the WiFi C2 link down for the rest of the boot
+
+ESP32 WiFi supports exactly one SoftAP configuration at a time, so launching
+the portal takes over the Tab5's AP identity: the WiFi C2 link's own
+`Quarky-Tab5-Test` SoftAP — the transport the Cardputer-ADV satellite joins —
+goes down as soon as the portal comes up.
+
+**It does not come back by itself.** Stopping the portal (Stop Portal, or
+Back) calls `WiFi.softAPdisconnect(true)`, which tears the portal's AP down
+and disables AP mode entirely; nothing re-initializes `c2link_wifi`, so the
+C2 SoftAP stays down until the Tab5 is rebooted. Plan around that: finish
+what you need the WiFi C2 link for before opening this screen, or reboot
+afterwards. (If the satellite is paired over the BLE C2 transport instead,
+that link is unaffected — this is a WiFi-only side effect.)
+
+Rebooting with the portal running does not preserve it either: the portal is
+never restarted automatically at boot, so a reboot mid-session comes up with
+the normal C2 SoftAP and no portal. Reopen this screen and tap Launch Portal
+again if you want the portal back.
 
 ## Custom templates
 

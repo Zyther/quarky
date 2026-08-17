@@ -370,8 +370,24 @@ static void launch_click_cb(lv_event_t *e) {
     // ble_spam.cpp hit for BLE advertising, so starting this DOES take over
     // c2link_wifi's AP identity/SSID while the portal runs. stop_portal()
     // (LV_EVENT_DELETE) releases the portal's own AP on Back, but does not
-    // restore c2link_wifi's prior AP config -- same class of disclosed,
-    // scoped-out follow-up as ble_spam.cpp's C2-advertising re-arm gap.
+    // restore c2link_wifi's prior AP config: its WiFi.softAPdisconnect(true)
+    // disables AP mode outright, and nothing re-runs c2link_wifi's SoftAP
+    // setup, so the WiFi C2 link stays down until reboot. This is the
+    // documented behaviour (docs/features/evil-portal.md says so explicitly
+    // as of finding I2, 2026-08-17 -- it previously claimed the opposite).
+    //
+    // The BLE analogue of this gap -- six features taking over c2link_ble's
+    // single advertising slot with no way back -- was CLOSED by finding I6
+    // (hal/c2link_ble.h's c2link_ble_rearm_advertising()). The WiFi side is
+    // deliberately not being fixed by analogy in the same pass: re-arming
+    // BLE advertising is a re-run of one self-contained field-set +
+    // adv_start sequence, whereas restoring c2link_wifi means re-running a
+    // SoftAP bring-up that also owns a UDP socket, a PSK-authenticated
+    // session and a receive handler registration -- a real re-init path with
+    // its own failure modes, not a symmetric one-liner. If it gets built, it
+    // belongs in hal/c2link_wifi.h alongside its own state, mirroring how
+    // the BLE re-arm lives in c2link_ble.cpp next to the advertising state
+    // it re-runs.
     WiFi.softAP(ssid);
 
     s_server = new AsyncWebServer(80);
