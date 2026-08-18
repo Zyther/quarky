@@ -1,12 +1,13 @@
 #include "ble_flood.h"
 #include "ble_central.h"
 #include "ble_common.h"
-#include "ble_scan.h" // BleScanFeature::first_device_addr()/first_device_addr_type() --
-                       // same directory as this file (features/ble/), so a plain
-                       // relative include, matching ble_central.h's own include
-                       // above rather than main.cpp's "features/ble/..." form
-                       // (main.cpp includes from src/, this file is already inside
-                       // features/ble/).
+#include "ble_target_picker.h" // the shared scan -> tap-a-target -> hand-off screen
+                                // this feature now starts with. Same directory as
+                                // this file (features/ble/), so a plain relative
+                                // include, matching ble_central.h's own include
+                                // above rather than main.cpp's "features/ble/..."
+                                // form (main.cpp includes from src/, this file is
+                                // already inside features/ble/).
 #include "../../hal/c2link_ble.h"
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
@@ -32,8 +33,10 @@ extern FeatureRegistry g_registry;
 //   so a hardcoded PUBLIC type silently fails to connect against them -- the
 //   same bug class already found and fixed in this plan's
 //   ble_central_spike.cpp, ble_clone.cpp, and ble_gatt_explorer.cpp. Fixed by
-//   using BleScanFeature::first_device_addr_type() (see ble_scan.h), the
-//   accessor Task 1's implementer added for exactly this situation.
+//   propagating the peer's REAL advertised address type into build_screen();
+//   it now arrives from BleTargetPicker's own scan (which records
+//   event->disc.addr.type per target), where it used to come from
+//   BleScanFeature::first_device_addr_type().
 //
 //   Bug 2 (connection leak on teardown, POS-AUDIT-220 / ble-004): the donor's
 //   feat_ble_flood() teardown does NOT just call ble_gap_conn_cancel() once.
@@ -134,12 +137,13 @@ static lv_obj_t *build_screen(const uint8_t addr_val[6], uint8_t addr_type) {
         } while (s_last_connect_rc == 0 && millis() < deadline);
     }, LV_EVENT_DELETE, nullptr);
 
-    // Finding C1 (2026-08-17), defensive. This screen was only ACCIDENTALLY
-    // safe on a radios-disabled boot: start() bails when
-    // BleScanFeature::first_device_addr() is null, which happens to always be
-    // true there because BLE Scan could never have run -- a coincidence of
-    // call order, not a guarantee, and one that evaporates the day anything
-    // else populates that list. s_last_connect_rc is set to a nonzero
+    // Finding C1 (2026-08-17), defensive. This screen used to be only
+    // ACCIDENTALLY safe on a radios-disabled boot (start() bailed because BLE
+    // Scan could never have populated slot 0 -- a coincidence of call order,
+    // not a guarantee). It is now genuinely unreachable in that state, since
+    // BleTargetPicker runs its own host-ready guard before it can ever offer a
+    // target, but this guard stays: it is the one that belongs to THIS screen.
+    // s_last_connect_rc is set to a nonzero
     // "nothing was ever in flight" value first so the teardown handler's
     // do-while (which loops for 500ms while s_last_connect_rc == 0) exits
     // after one iteration on this bail-out path instead of burning the full
@@ -158,29 +162,33 @@ static lv_obj_t *build_screen(const uint8_t addr_val[6], uint8_t addr_type) {
 }
 
 void register_module() {
-    // No launcher tile of its own -- this feature needs a target address,
-    // supplied via the same "run against the first BLE-scanned device"
-    // pattern Task 1's spike uses. A future target-picker UI (reusing the
-    // scan-then-tap-to-select pattern Task 9/13 both already establish) is
-    // a reasonable near-term follow-up; kept out of this task's own scope
-    // to match the plan's Interfaces note that this task consumes
-    // BleCentral only, not a new target-selection mechanism.
-    g_registry.register_module({"ble_flood", "BLE Flood (first scanned)", Category::BLE,
+    // The tile name no longer says "(first scanned)": as of the 2026-08-17 UX
+    // fix this feature scans for itself and the user picks the target, so
+    // there is nothing "first scanned" about it any more. The follow-up this
+    // file's old comment here called "a reasonable near-term follow-up
+    // (reusing the scan-then-tap-to-select pattern Task 9/13 both already
+    // establish)" is exactly what BleTargetPicker now is.
+    g_registry.register_module({"ble_flood", "BLE Flood", Category::BLE,
                                  Affinity::TAB5_NATIVE, start, nullptr});
 }
 
+// Handed a target the user actually tapped in BleTargetPicker's own scan
+// results, on the main/LVGL task, after the picker screen has already popped
+// itself. Everything below this line -- the whole flood loop, its connect
+// calls, and its teardown -- is unchanged by that fix: this feature's input
+// changed, not its behaviour.
+static void on_target_selected(const BleDeviceInfo &target) {
+    ScreenStack::push(build_screen(target.addr, target.addr_type));
+}
+
 void start() {
-    const uint8_t *addr = BleScanFeature::first_device_addr(); // from Task 1, Step 4
-    if (!addr) {
-        // Finding I3 (2026-08-17): this used to Serial.println() and return,
-        // so tapping the launcher tile on a cold session produced no visible
-        // reaction whatsoever on a touchscreen device. See ble_common.h.
-        Serial.println("quarky-tab5: [ble-flood] no scanned device available -- run BLE Scan first");
-        ble_push_message_screen("BLE Flood", kBleNoScannedTargetMsg);
-        return;
-    }
-    uint8_t addr_type = BleScanFeature::first_device_addr_type(); // Bug 1 fix
-    ScreenStack::push(build_screen(addr, addr_type));
+    // 2026-08-17 UX fix (the deferred half of whole-branch review finding I3):
+    // scan is now step one OF THE FEATURE. This used to read
+    // BleScanFeature::first_device_addr() -- whatever device happened to land
+    // in slot 0 of a prior, separate BLE Scan screen run -- and push a "run
+    // BLE Scan first" message screen when there was none. Both are gone: the
+    // user picks a real target here, and the no-target case cannot occur.
+    BleTargetPicker::start("BLE Flood -- pick a target", on_target_selected);
 }
 
 void poll() {

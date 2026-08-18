@@ -3,7 +3,9 @@
 // -----------------------------------------------------------------------------
 // WhisperPair -- CVE-2025-36911 detector (second Phase 2 plan, Task 18).
 //
-// Connects to the first BLE-scanned device via Task 1's BleCentral helper,
+// Connects to a target the user picks in BleTargetPicker's own scan (2026-08-17
+// UX fix; this used to be "the first BLE-scanned device", i.e. slot 0 of a
+// prior, separate BLE Scan run) via Task 1's BleCentral helper,
 // finds the Google Fast Pair service (0xFE2C) and its Key-based Pairing (KBP)
 // characteristic, SUBSCRIBES to that characteristic's notify (real CCCD
 // discovery, not a guessed handle -- see the .cpp), then writes a real
