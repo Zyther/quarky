@@ -58,6 +58,7 @@ static uint8_t keycode_for(char c) {
 
 static lv_obj_t *s_status_label = nullptr;
 static lv_obj_t *s_name_input = nullptr;
+static lv_obj_t *s_start_btn = nullptr;
 static lv_obj_t *s_script_input = nullptr;
 static lv_obj_t *s_keyboard = nullptr;
 static bool s_last_connected = false;
@@ -106,6 +107,59 @@ static void update_status_label() {
         lv_label_set_text(s_status_label, "Enter a name and tap Start");
     } else {
         lv_label_set_text(s_status_label, "Not paired -- cannot send");
+    }
+}
+
+// Review finding (2026-08-18): re-tapping Start after a successful start
+// used to silently lie -- BleHidSpike::start() early-returns true on its
+// "already advertising" guard without calling start_advertising() again, so
+// a name typed and Start-tapped a second time updated s_device_name (and
+// therefore this file's own status label, which reads it back via
+// BleHidSpike::device_name()) while the radio kept broadcasting the FIRST
+// name. Disabling both widgets whenever there is nothing left for Start to
+// usefully do -- genuinely advertising, or already paired -- removes the
+// only way to reach that lie, rather than trying to make a second start()
+// call actually restart with the new name (a bigger change than this
+// feature's scope).
+//
+// Re-review finding (2026-08-18): the first version of this fix only ever
+// LOCKED, never unlocked -- so the reopen-race build-time lock
+// (s_last_connected true at build_screen()) became a permanent dead end the
+// moment that prior session's connection actually dropped: poll()'s
+// connection-state-change branch would correctly flip the label back to
+// "Enter a name and tap Start", but the widgets stayed disabled forever,
+// with no action left that could ever re-enable them short of closing and
+// reopening the screen. Made symmetric instead -- derives lock state fresh
+// from real current state (s_last_connected/s_advertise_ok) every time it's
+// called, so it can un-lock just as correctly as it locks. Called from
+// build_screen() (initial state), the Start handler (after a tap), and
+// poll()'s connection-change branch (a disconnect while the screen stays
+// open) -- every place update_status_label() already runs, since "is there
+// anything for Start to usefully do" and "what does the label say" are the
+// same underlying question.
+static void sync_name_controls_lock() {
+    if (!s_name_input || !s_start_btn) return;
+    if (s_last_connected || s_advertise_ok) {
+        lv_obj_add_state(s_name_input, LV_STATE_DISABLED);
+        lv_obj_add_state(s_start_btn, LV_STATE_DISABLED);
+        // Re-review finding (2026-08-18): LV_STATE_DISABLED alone leaves a
+        // keyboard that was linked to s_name_input BEFORE this lock fired
+        // still delivering keystrokes to it -- lv_keyboard's own button
+        // handler calls lv_textarea_add_text() directly on whatever
+        // textarea it's linked to, with no LV_STATE_DISABLED check anywhere
+        // in lv_textarea itself (unlike the FOCUSED-handler guard above,
+        // which only stops a NEW link from being made, not an existing
+        // one). Explicitly unlink and hide the keyboard here too, but only
+        // if it's currently linked to s_name_input specifically -- locking
+        // the name controls must not steal focus from the script textarea
+        // if that's what the user is actively typing into.
+        if (s_keyboard && lv_keyboard_get_textarea(s_keyboard) == s_name_input) {
+            lv_keyboard_set_textarea(s_keyboard, nullptr);
+            lv_obj_add_flag(s_keyboard, LV_OBJ_FLAG_HIDDEN);
+        }
+    } else {
+        lv_obj_clear_state(s_name_input, LV_STATE_DISABLED);
+        lv_obj_clear_state(s_start_btn, LV_STATE_DISABLED);
     }
 }
 
@@ -201,7 +255,17 @@ static lv_obj_t *build_screen() {
                                                       // reopen-race case) --
                                                       // check reality, don't
                                                       // assume false
-    s_advertise_ok = false;    // this screen-open hasn't started anything yet
+    s_advertise_ok = BleHidSpike::is_advertising(); // same reasoning as
+                                                      // s_last_connected just
+                                                      // above -- BleHidSpike
+                                                      // can already be
+                                                      // advertising here too
+                                                      // (main.cpp's 'h'
+                                                      // serial-debug trigger
+                                                      // bypasses this screen
+                                                      // entirely), so check
+                                                      // reality rather than
+                                                      // assume a fresh false
     s_start_attempted = false;
 
     // Device-name input -- Task "device-name textbox" (BLE Bad-KB UI): the
@@ -219,14 +283,23 @@ static lv_obj_t *build_screen() {
     lv_textarea_set_placeholder_text(s_name_input, "QuarkyKB");
     lv_textarea_set_max_length(s_name_input, BleHidSpike::kMaxDeviceNameLen);
     lv_obj_add_event_cb(s_name_input, [](lv_event_t *) {
+        // Re-review finding (2026-08-18): LV_STATE_DISABLED (see
+        // sync_name_controls_lock()) does not stop an lv_textarea from
+        // taking focus or accepting typed input in this LVGL version --
+        // only LV_EVENT_CLICKED delivery to buttons is gated on it. Without
+        // this explicit check, a "locked" name field would still visibly
+        // accept edits and pop the keyboard, implying the change does
+        // something even though Start (the only thing that reads this text)
+        // is genuinely unclickable while locked.
+        if (lv_obj_has_state(s_name_input, LV_STATE_DISABLED)) return;
         lv_keyboard_set_textarea(s_keyboard, s_name_input);
         lv_obj_clear_flag(s_keyboard, LV_OBJ_FLAG_HIDDEN);
     }, LV_EVENT_FOCUSED, nullptr);
 
-    lv_obj_t *start_btn = lv_button_create(content);
-    lv_obj_t *start_label = lv_label_create(start_btn);
+    s_start_btn = lv_button_create(content);
+    lv_obj_t *start_label = lv_label_create(s_start_btn);
     lv_label_set_text(start_label, "Start");
-    lv_obj_add_event_cb(start_btn, [](lv_event_t *) {
+    lv_obj_add_event_cb(s_start_btn, [](lv_event_t *) {
         // Empty text falls through to BleHidSpike::set_device_name()'s own
         // null/empty -> "QuarkyKB" fallback (see its comment in
         // ble_hid_spike.h) -- this handler doesn't need its own default
@@ -258,7 +331,21 @@ static lv_obj_t *build_screen() {
         Serial.printf("quarky-tab5: [ble-bad-kb] Start tapped, name=\"%s\", "
                       "advertise_ok=%d\n", BleHidSpike::device_name(), (int)s_advertise_ok);
         update_status_label();
+        // Lock out further name edits/retaps once genuinely advertising --
+        // see sync_name_controls_lock()'s comment for why a second tap would
+        // lie otherwise. Left enabled on failure so the user can retry (e.g.
+        // after fixing whatever start() rejected).
+        sync_name_controls_lock();
     }, LV_EVENT_CLICKED, nullptr);
+
+    // Reopen-race case (see s_last_connected's comment above): a prior
+    // session's connection can already be live when this screen opens fresh.
+    // Tapping Start there would hit start()'s own "already connected"
+    // early-return and do nothing useful -- lock it out up front rather than
+    // offering an action with no effect. (If that connection later drops
+    // while this screen stays open, poll()'s connection-change branch below
+    // calls sync_name_controls_lock() again and correctly unlocks it.)
+    sync_name_controls_lock();
 
     s_script_input = lv_textarea_create(content);
     lv_textarea_set_placeholder_text(s_script_input, "STRING hello world\nENTER");
@@ -323,23 +410,18 @@ static lv_obj_t *build_screen() {
     // freed widgets after ScreenStack::pop() destroys them. Same pattern
     // ble_spam.cpp/ble_scan.cpp use for their own LV_EVENT_DELETE teardown.
     //
-    // Guarded on s_start_attempted -- new with the device-name-textbox
-    // redesign, and load-bearing, not defensive: build_screen() used to call
-    // BleHidSpike::start() unconditionally, so stop() always had a matching
-    // prior start() to undo. Now Start is opt-in, so a user can open this
-    // screen and back out without ever tapping it -- BleHidSpike::start()
-    // was never called, so it never took the C2 advertisement's slot
-    // (s_took_adv_slot stayed false). Calling stop() unconditionally in that
-    // case would still run its own ble_gap_adv_stop(), which -- with nothing
-    // else claiming the radio -- would stop C2's actual live advertisement,
-    // and then skip the re-arm (guarded on that same s_took_adv_slot),
-    // leaving C2 permanently unadvertised until reboot. Skipping stop()
-    // entirely when Start was never tapped avoids ever touching NimBLE for a
-    // screen-open that never touched it either.
+    // Unconditional, including when this screen-open never tapped Start at
+    // all (a real, now-reachable case with Start opt-in rather than
+    // build_screen() always calling start()): stop() itself is safe to call
+    // whether or not a matching start() ever ran -- it only touches the
+    // radio's advertising slot if it actually took it (guarded on
+    // s_took_adv_slot, see ble_hid_spike.cpp's stop()), so an unmatched call
+    // here cannot stop c2link_ble's own advertisement.
     lv_obj_add_event_cb(content, [](lv_event_t *) {
-        if (s_start_attempted) BleHidSpike::stop();
+        BleHidSpike::stop();
         s_status_label = nullptr;
         s_name_input = nullptr;
+        s_start_btn = nullptr;
         s_script_input = nullptr;
         s_keyboard = nullptr;
         s_typing = false;
@@ -372,7 +454,33 @@ void poll() {
     bool connected = BleHidSpike::is_connected();
     if (connected != s_last_connected) {
         s_last_connected = connected;
-        if (s_status_label) update_status_label();
+        if (s_status_label) {
+            update_status_label();
+            // Re-review finding (2026-08-18): a disconnect that drops
+            // s_last_connected back to false while this screen stays open
+            // (e.g. the reopen-race build-time lock's connection finally
+            // ending) needs the widgets re-synced too, not just the label --
+            // see sync_name_controls_lock()'s comment for the dead-end this
+            // closes.
+            sync_name_controls_lock();
+        }
+    }
+
+    // Reconciles s_advertise_ok against BleHidSpike's own real advertising
+    // state every tick, the same way s_last_connected is reconciled against
+    // is_connected() just above -- not only set once from the Start button's
+    // own call site. Closes a real gap (re-review finding, 2026-08-18):
+    // main.cpp's 'h' serial-debug trigger calls BleHidSpike::start()
+    // directly, bypassing this screen's Start button entirely, so a
+    // QUARKY_SERIAL_DEBUG build where 'h' fires while this screen happens to
+    // be open would otherwise leave the label/lock state stale.
+    bool advertising = BleHidSpike::is_advertising();
+    if (advertising != s_advertise_ok) {
+        s_advertise_ok = advertising;
+        if (s_status_label) {
+            update_status_label();
+            sync_name_controls_lock();
+        }
     }
 
     if (!s_typing) return;

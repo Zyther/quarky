@@ -83,10 +83,24 @@ static const uint8_t kReportRef[2] = {0x00, 0x01};
 
 // Runtime-mutable, unlike the true constants above (kReportMap etc.) -- Task
 // "device-name textbox" (BLE Bad-KB UI) needs the advertised name settable
-// per session. Main-task-only (read in start_advertising()/start(), written
-// only from set_device_name(), which is documented as a pre-start() call --
-// see ble_hid_spike.h), so no locking, same reasoning as s_svc_queued.
-// kMaxDeviceNameLen (ble_hid_spike.h) + 1 for the null terminator.
+// per session. kMaxDeviceNameLen (ble_hid_spike.h) + 1 for the null
+// terminator.
+//
+// NOT main-task-only, unlike s_svc_queued -- review finding (2026-08-18):
+// an earlier version of this comment claimed it was, reasoning that
+// set_device_name() (the only writer) is only ever called from
+// ble_bad_kb.cpp's Start button, main task. True for the write side, but
+// start_advertising() (the read side, below) is NOT main-task-only: besides
+// its main-task call from start(), gap_event_cb calls it directly from the
+// NimBLE HOST task on both the failed-connect and disconnect paths (see
+// their "if (s_advertising) start_advertising();" calls) to resume
+// advertising without a re-trigger. So a main-task set_device_name() write
+// can race a host-task start_advertising() read -- a real cross-task
+// multi-byte buffer, the shape this project's house rule (c2link_ble.cpp's
+// own stated convention, see its s_rx_mux) requires a portMUX_TYPE critical
+// section for, not volatile (volatile only covers single-word scalars, see
+// s_conn_handle/s_notify_enabled above).
+static portMUX_TYPE s_device_name_mux = portMUX_INITIALIZER_UNLOCKED;
 static char s_device_name[kMaxDeviceNameLen + 1] = "QuarkyKB";
 
 // Written on the NimBLE host task, read on the main task -- single-word
@@ -333,7 +347,16 @@ static int gap_event_cb(struct ble_gap_event *event, void *) {
                           event->connect.status);
             // Stay discoverable after a failed attempt -- unless stop() has
             // already disarmed the spike (see s_advertising's comment).
-            if (s_advertising) start_advertising();
+            // Re-review finding (2026-08-18): the result used to be
+            // discarded, leaving s_advertising latched true even if this
+            // re-advertise attempt itself failed -- harmless while nothing
+            // read s_advertising except this same file, but is_advertising()
+            // (added the same round) now exposes it as ble_bad_kb.cpp's UI
+            // source of truth, where a stale true would show "Advertising as
+            // X" (and keep the name controls locked) with nothing actually
+            // on the air. Keep it honest the same way start() already does
+            // for its own initial call.
+            if (s_advertising) s_advertising = (start_advertising() == 0);
         }
         return 0;
     case BLE_GAP_EVENT_DISCONNECT:
@@ -344,7 +367,9 @@ static int gap_event_cb(struct ble_gap_event *event, void *) {
         // Let the host reconnect without a re-trigger -- but only if this
         // disconnect wasn't stop()'s own ble_gap_terminate(). stop() clears
         // s_advertising before terminating precisely so this check sees it.
-        if (s_advertising) start_advertising();
+        // Result captured for the same is_advertising()-honesty reason as
+        // the connect-failed branch above.
+        if (s_advertising) s_advertising = (start_advertising() == 0);
         return 0;
     case BLE_GAP_EVENT_SUBSCRIBE:
         // The single most informative event in this whole spike: a host that
@@ -391,9 +416,22 @@ static int gap_event_cb(struct ble_gap_event *event, void *) {
 // Returns the ble_gap_adv_start() return code (or the earlier failure's), so
 // start() can keep s_advertising honest instead of assuming success.
 static int start_advertising() {
+    // Locked snapshot, not a direct s_device_name read -- this function runs
+    // on the NimBLE host task as well as the main task (gap_event_cb's
+    // failed-connect/disconnect re-advertise paths, see s_device_name's own
+    // comment), so reading the shared buffer here needs the same
+    // portMUX_TYPE section set_device_name() writes it under. ble_gap_adv_set_fields()
+    // below copies these bytes into its own advertisement-data buffer
+    // synchronously before returning, so the snapshot only needs to survive
+    // this function's body, not any longer.
+    char name_snapshot[kMaxDeviceNameLen + 1];
+    portENTER_CRITICAL(&s_device_name_mux);
+    strncpy(name_snapshot, s_device_name, sizeof(name_snapshot));
+    portEXIT_CRITICAL(&s_device_name_mux);
+
     // Budget check against the 31-byte legacy advertisement limit: flags 3 +
     // appearance 4 + one 16-bit UUID 4 + name AD header 2 = 13 bytes fixed
-    // overhead, leaving kMaxDeviceNameLen (18) bytes for s_device_name --
+    // overhead, leaving kMaxDeviceNameLen (18) bytes for the name --
     // set_device_name() enforces that cap on the way in, so strlen() here can
     // never exceed it. The 0x1812 UUID is what makes an OS classify the
     // device as HID BEFORE connecting; appearance alone is a hint, not a
@@ -407,8 +445,8 @@ static int start_advertising() {
     fields.uuids16_is_complete = 1;
     fields.appearance = 0x03C1; // Keyboard (Human Interface Device category)
     fields.appearance_is_present = 1;
-    fields.name = (const uint8_t *)s_device_name;
-    fields.name_len = (uint8_t)strlen(s_device_name);
+    fields.name = (const uint8_t *)name_snapshot;
+    fields.name_len = (uint8_t)strlen(name_snapshot);
     fields.name_is_complete = 1;
 
     int rc = ble_gap_adv_set_fields(&fields);
@@ -432,7 +470,7 @@ static int start_advertising() {
     rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER,
                            &adv_params, gap_event_cb, nullptr);
     Serial.printf("quarky-tab5: [ble-hid-spike] ble_gap_adv_start rc=%d (own addr type=%u, name=\"%s\")\n",
-                  rc, s_own_addr_type, s_device_name);
+                  rc, s_own_addr_type, name_snapshot);
 
     // Real-hardware verification diagnostic: log the exact address this
     // advertises under, same reasoning as ble_spam.cpp's equivalent -- lets a
@@ -454,6 +492,10 @@ static int start_advertising() {
 // ---- Public API -------------------------------------------------------------
 
 void set_device_name(const char *name) {
+    // Locked -- see s_device_name's own comment for the real cross-task read
+    // (start_advertising(), reachable from the NimBLE host task) this
+    // protects against.
+    portENTER_CRITICAL(&s_device_name_mux);
     if (name == nullptr || name[0] == '\0') {
         // strncpy's source and dest here are both compile-time-sized and
         // "QuarkyKB" is well under kMaxDeviceNameLen, so this can't truncate.
@@ -465,9 +507,19 @@ void set_device_name(const char *name) {
                                                        // null-terminate when
                                                        // the source is >=
                                                        // the length given
+    portEXIT_CRITICAL(&s_device_name_mux);
 }
 
 const char *device_name() {
+    // Unlocked, deliberately: every real caller of this getter (ble_bad_kb.cpp's
+    // status label) runs on the main task, same as set_device_name()'s only
+    // caller -- so there is no cross-task reader of the raw pointer this
+    // returns. The cross-task hazard s_device_name_mux exists for is
+    // start_advertising()'s own read (see s_device_name's comment), which
+    // takes its own locked snapshot rather than going through this getter.
+    // If a future caller needs this from the NimBLE host task, it must copy
+    // under s_device_name_mux instead of dereferencing this return value
+    // unlocked.
     return s_device_name;
 }
 
@@ -584,7 +636,15 @@ bool start() {
         return false;
     }
 
-    // Point the GAP Device Name characteristic at s_device_name too.
+    // Point the GAP Device Name characteristic at s_device_name too. Read
+    // directly here, unlike start_advertising()'s locked snapshot -- start()
+    // itself only ever runs on the main task (its only two callers are
+    // ble_bad_kb.cpp's Start button and main.cpp's 'h' serial-debug trigger),
+    // and the only writer, set_device_name(), is also main-task-only and
+    // never runs concurrently with this same-task, single-threaded call
+    // sequence -- so there is no cross-task reader here the way
+    // start_advertising() has via gap_event_cb.
+    //
     // Unconditional (not gated on first-run state) so a stop() -> start()
     // cycle cannot leave the device advertising under a new name while 0x1800
     // still reads c2link_ble's name -- the post-connect mismatch this call
@@ -734,6 +794,13 @@ bool is_connected() {
     return s_conn_handle != BLE_HS_CONN_HANDLE_NONE;
 }
 
+bool is_advertising() {
+    // Same safe-by-existing-precedent pattern as is_connected() just above --
+    // s_advertising is volatile for exactly this reason (see its own
+    // declaration comment).
+    return s_advertising;
+}
+
 void stop() {
     // Disarm FIRST. gap_event_cb's disconnect path checks this flag, and the
     // ble_gap_terminate() below raises that event asynchronously -- clearing
@@ -741,8 +808,26 @@ void stop() {
     // milliseconds after stop() returned (finding I1).
     s_advertising = false;
 
-    int rc = ble_gap_adv_stop();
-    Serial.printf("quarky-tab5: [ble-hid-spike] ble_gap_adv_stop rc=%d\n", rc);
+    // Device-name-textbox review finding (2026-08-18): guarded on
+    // s_took_adv_slot -- NOT unconditional like every call before it in this
+    // function's history. Now that Start is a caller-triggered UI action
+    // (ble_bad_kb.cpp) rather than something build_screen() always ran, stop()
+    // can be reached after a start() that bailed at one of its early-return
+    // guards WITHOUT ever taking the radio's single legacy-advertising slot
+    // (s_took_adv_slot stayed false) -- or after no start() call at all this
+    // session. Calling ble_gap_adv_stop() anyway in that case stops whatever
+    // IS currently advertising -- normally c2link_ble's own C2 advertisement,
+    // which this spike never touched -- and the un-arm below (also gated on
+    // s_took_adv_slot) then correctly skips re-arming it, leaving C2 dead
+    // until reboot. s_took_adv_slot is the right condition, not s_advertising:
+    // start() sets it unconditionally right after ITS OWN ble_gap_adv_stop()
+    // call, before start_advertising() is even attempted, so s_advertising
+    // true always implies s_took_adv_slot already true -- this guard loses no
+    // coverage of the one case that actually needs the radio call.
+    if (s_took_adv_slot) {
+        int rc = ble_gap_adv_stop();
+        Serial.printf("quarky-tab5: [ble-hid-spike] ble_gap_adv_stop rc=%d\n", rc);
+    }
 
     uint16_t conn = s_conn_handle;
     if (conn != BLE_HS_CONN_HANDLE_NONE) {

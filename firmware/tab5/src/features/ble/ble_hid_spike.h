@@ -185,6 +185,25 @@ void send_key(uint8_t keycode);
 // Polling this from ble_bad_kb.cpp's own poll() is the safe alternative.
 bool is_connected();
 
+// True from a successful start() (i.e. its own start_advertising() actually
+// returned 0) until stop() -- the real, authoritative "is this file's own
+// HID advertisement genuinely on the air right now" state, independent of
+// whatever caller last asked. Added (re-review finding, 2026-08-18) so
+// ble_bad_kb.cpp's status label/lock state can be reconciled from the real
+// source of truth on every poll() tick, the same way is_connected() already
+// is, instead of only being set once from the Start button's own call site --
+// a caller-local snapshot that this file's advertising state can genuinely
+// drift out of sync with. Concretely: main.cpp's 'h' serial-debug trigger
+// calls start() directly, bypassing ble_bad_kb.cpp's UI entirely; without
+// this accessor, a QUARKY_SERIAL_DEBUG build where 'h' fires while the
+// Bad-KB screen happens to be open would leave that screen's label/lock
+// state stale (still showing "Enter a name and tap Start" over
+// still-unlocked widgets) even though this file is, in reality, already
+// advertising. Same volatile-scalar cross-task shape as s_advertising's own
+// declaration comment (ble_hid_spike.cpp) -- safe to read from any task,
+// same precedent as is_connected() just above.
+bool is_advertising();
+
 // Stops the HID advertisement, terminates any open connection, and restores
 // the previous GAP device name. Does NOT restore c2link_ble's C2
 // advertisement (see the header comment above), and does not unregister the
