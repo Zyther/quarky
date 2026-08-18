@@ -160,21 +160,45 @@ static int gap_scan_event_cb(struct ble_gap_event *event, void *arg) {
         // list rebuild happens in refresh_tracker_list_ui() on the main/LVGL
         // task, driven by poll().
         add_or_update_tracker(event->disc.addr.val, addr_str, kind, event->disc.rssi);
-        // Real target-lock UI (tap a row to lock onto it) is a reasonable
-        // near-future addition using lv_list's per-button click callback
-        // with the row's own addr stashed in user_data -- kept out of this
-        // task's own real-hardware verification loop, matching the
-        // scoped-narrow pattern wifi_pmkid.cpp's brief used for EAPOL
-        // filtering. Locking is demonstrated here via main.cpp's 'f' serial
-        // trigger (BleFinderFeature::lock_last_seen()) instead, which locks
-        // onto whichever tracker was seen most recently -- recorded right
-        // here, every time a not-yet-locked sighting is recorded.
+        // s_last_seen_addr is what main.cpp's QUARKY_SERIAL_DEBUG 'f' trigger
+        // (BleFinderFeature::lock_last_seen()) locks onto -- whichever tracker
+        // was seen most recently, recorded right here every time a
+        // not-yet-locked sighting comes in. That trigger is retained as the
+        // headless-testing path; the REAL user path is now tapping a row in
+        // refresh_tracker_list_ui()'s list, which locks onto that specific
+        // tracker rather than the most recent one (2026-08-17 UX fix -- the
+        // "reasonable near-future addition" this comment used to describe).
         portENTER_CRITICAL(&s_lock_mux);
         memcpy(s_last_seen_addr, event->disc.addr.val, 6);
         s_have_last_seen = true;
         portEXIT_CRITICAL(&s_lock_mux);
     }
     return 0;
+}
+
+// The one place s_locked/s_locked_addr are armed. Both entry points funnel
+// through here: the row-tap handler in refresh_tracker_list_ui() (the real
+// user path, added 2026-08-17) and lock_last_seen() (main.cpp's
+// QUARKY_SERIAL_DEBUG 'f' trigger, the headless-testing path this file has
+// always had). Runs on the main/LVGL task in both cases, and takes s_lock_mux
+// for every field because gap_scan_event_cb reads s_locked/s_locked_addr on
+// the NimBLE host task while a scan is running -- which it always is here,
+// since geiger mode is fed by that very scan and must NOT cancel it.
+static void lock_onto(const uint8_t addr[6]) {
+    char addr_str[18];
+    ble_addr_to_str(addr, addr_str);
+
+    portENTER_CRITICAL(&s_lock_mux);
+    memcpy(s_locked_addr, addr, 6);
+    s_locked = true;
+    // -128 + "now" so update_geiger_ui() doesn't immediately report NO
+    // SIGNAL before the first real RSSI update arrives from
+    // gap_scan_event_cb's locked-target branch.
+    s_locked_rssi = -128;
+    s_locked_last_ms = millis();
+    portEXIT_CRITICAL(&s_lock_mux);
+
+    Serial.printf("quarky-tab5: [ble-finder] locked onto %s\n", addr_str);
 }
 
 // Snapshots s_trackers/s_tracker_count under the lock (a fast, bounded
@@ -194,10 +218,43 @@ static void refresh_tracker_list_ui() {
     portEXIT_CRITICAL(&s_lock_mux);
 
     lv_obj_clean(s_list);
+    // Say what the rows are for -- before this fix they were inert-looking
+    // buttons with no handler at all, and the only way to reach geiger mode
+    // was a serial trigger no touchscreen user can reach.
+    lv_list_add_text(s_list, count > 0 ? "Tap a tracker to lock on" : "Scanning for trackers...");
     for (int i = 0; i < count; i++) {
         char row[48];
         snprintf(row, sizeof(row), "%s  (%s)  %ddBm", snapshot[i].kind, snapshot[i].addr_str, snapshot[i].rssi);
-        lv_list_add_button(s_list, LV_SYMBOL_GPS, row);
+        lv_obj_t *btn = lv_list_add_button(s_list, LV_SYMBOL_GPS, row);
+        // 2026-08-17 UX fix: tapping a row locks onto THAT tracker (not
+        // whichever was seen most recently, which is all the serial 'f'
+        // trigger can do). Row index stashed as user_data, the same shape
+        // ble_gatt_explorer.cpp's and ble_clone.cpp's pickers use -- valid
+        // across refreshes because add_or_update_tracker() only ever appends
+        // or updates in place, never reorders or removes. The address is
+        // re-read from s_trackers under s_lock_mux inside the handler rather
+        // than captured from the snapshot, so a row tapped just as the host
+        // task is writing that same entry still reads a consistent address.
+        lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+            int idx = (int)(intptr_t)lv_event_get_user_data(e);
+            uint8_t addr[6];
+            bool valid = false;
+            portENTER_CRITICAL(&s_lock_mux);
+            if (idx >= 0 && idx < s_tracker_count) {
+                memcpy(addr, s_trackers[idx].addr, 6);
+                valid = true;
+            }
+            portEXIT_CRITICAL(&s_lock_mux);
+            if (!valid) return;
+            // Deliberately does NOT cancel the scan: geiger mode's whole
+            // signal source is gap_scan_event_cb's locked-target branch
+            // continuing to report RSSI for this address, and this file's
+            // ble_gap_disc() runs with BLE_HS_FOREVER for exactly that
+            // reason. Nothing about the screen or its teardown changes on
+            // lock -- poll() simply starts rendering update_geiger_ui()
+            // instead of the tracker list.
+            lock_onto(addr);
+        }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
     }
 }
 
@@ -317,13 +374,20 @@ void poll() {
     s_trackers_dirty = false;
 }
 
-// Controller-resolution addition: the serial-trigger-only ('f' in main.cpp,
-// mnemonic "finder-lock") entry point that actually exercises geiger mode.
+// The serial-trigger-only ('f' in main.cpp, mnemonic "finder-lock") entry
+// point into geiger mode. RETAINED after the 2026-08-17 tap-to-lock UX fix,
+// not superseded by it: this project's QUARKY_SERIAL_DEBUG convention exists
+// so features can be exercised headlessly, and this is the only way to reach
+// geiger mode without a human finger on the glass. It differs from the touch
+// path in what it targets -- most-recently-seen tracker, rather than a
+// specific one -- which is exactly what makes it usable with no screen to
+// read.
+//
 // Runs on the main/LVGL task (called from loop()'s QUARKY_SERIAL_DEBUG
-// block), so every touch of s_last_seen_addr/s_have_last_seen/s_locked_addr/
-// s_locked below is under s_lock_mux -- see the s_last_seen_addr/
-// s_have_last_seen comment above for why this is a genuine cross-task case
-// and not just belt-and-suspenders.
+// block), so every touch of s_last_seen_addr/s_have_last_seen is under
+// s_lock_mux -- see the s_last_seen_addr/s_have_last_seen comment above for
+// why this is a genuine cross-task case and not just belt-and-suspenders.
+// The actual arming is lock_onto()'s job, shared with the row-tap handler.
 void lock_last_seen() {
     portENTER_CRITICAL(&s_lock_mux);
     bool have = s_have_last_seen;
@@ -336,20 +400,8 @@ void lock_last_seen() {
         return;
     }
 
-    char addr_str[18];
-    ble_addr_to_str(addr, addr_str);
-
-    portENTER_CRITICAL(&s_lock_mux);
-    memcpy(s_locked_addr, addr, 6);
-    s_locked = true;
-    // -128 + "now" so update_geiger_ui() doesn't immediately report NO
-    // SIGNAL before the first real RSSI update arrives from
-    // gap_scan_event_cb's locked-target branch.
-    s_locked_rssi = -128;
-    s_locked_last_ms = millis();
-    portEXIT_CRITICAL(&s_lock_mux);
-
-    Serial.printf("quarky-tab5: [debug] BleFinderFeature locked onto %s via serial trigger\n", addr_str);
+    Serial.println("quarky-tab5: [debug] BleFinderFeature lock via serial trigger");
+    lock_onto(addr);
 }
 
 } // namespace BleFinderFeature
