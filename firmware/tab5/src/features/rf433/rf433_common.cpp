@@ -23,9 +23,10 @@ constexpr size_t kRingSize = 512; // generous headroom for one OOK burst --
 // so the compiler may not hoist or sink accesses across them and the two
 // cores may not interleave inside them. `volatile` would add nothing to that
 // guarantee -- it is not a synchronization primitive. The scalar indices
-// below DO stay volatile: they are also read (via is_capturing()'s sibling
-// paths and future poll()-side "is there anything to drain?" checks) in ways
-// where a stale cached value would be a real bug.
+// below keep `volatile` purely as cheap future-proofing against someone
+// later adding an unlocked peek at them (an "is there anything to drain?"
+// fast path is the obvious candidate); as of today every access to both is
+// already inside a critical section, so it is not load-bearing either.
 EdgeSample s_ring[kRingSize];
 volatile size_t s_head = 0;  // ISR-owned write index, wraps
 volatile size_t s_count = 0; // number of valid unread samples, capped at kRingSize
@@ -43,7 +44,11 @@ void IRAM_ATTR isr_edge() {
     s_ring[s_head].timestamp_us = micros();
     s_ring[s_head].level = (digitalRead(TAB5_RF433R_PIN) != LOW);
     s_head = (s_head + 1) % kRingSize;
-    if (s_count < kRingSize) s_count++;
+    // Spelled out as `= s_count + 1` rather than `s_count++`: ++/-- on a
+    // volatile-qualified lvalue is deprecated in C++20 (P1152R4) and this
+    // toolchain warns about it (-Wvolatile). An explicit load-add-store is
+    // identical here (we are inside the critical section) and warning-free.
+    if (s_count < kRingSize) s_count = s_count + 1;
     portEXIT_CRITICAL_ISR(&s_mux);
 }
 
@@ -77,11 +82,23 @@ size_t capture_capacity() { return kRingSize; }
 size_t capture_read(EdgeSample *out, size_t max) {
     if (!out || max == 0) return 0;
     portENTER_CRITICAL(&s_mux);
-    // Read out oldest-first: s_head is the next WRITE slot, so with a full
-    // buffer the oldest sample is at s_head itself; with a partially-filled
-    // buffer (s_count < kRingSize) the oldest is at index 0 (capture_start()
-    // reset s_head to 0, so the first s_count writes landed at 0..s_count-1
-    // in order -- no wraparound has happened yet).
+    // Read out oldest-first. s_head is the next WRITE slot and s_count is how
+    // many unread samples sit behind it, so the oldest unread sample is
+    // always exactly s_count slots back from the head -- modulo the ring.
+    // That single expression is correct for every state: a fresh partial fill
+    // (head == count, so start == 0), a saturated buffer (count == kRingSize,
+    // so start == head), AND a partial fill that follows an earlier drain
+    // (head is wherever the ISR left it, unrelated to count).
+    //
+    // That last case is why this is NOT the "start at 0 unless the buffer is
+    // full" test it used to be. Consuming does not rewind s_head, so after a
+    // drain at head==300 the next 10 edges land in slots 300-309 with
+    // s_count==10 -- and the old test, seeing s_count < kRingSize, would have
+    // copied out slots 0-9 and reported pre-drain samples as the new ones.
+    // Harmless for the 'r' trigger (which only ever stops and drains once),
+    // but this file is the shared receive front-end for the later scan/decode
+    // tasks, which drain repeatedly during an open capture and would have
+    // silently decoded stale data.
     //
     // Overflow behavior, disclosed: once s_count saturates at kRingSize the
     // ISR keeps writing and silently overwrites the OLDEST unread samples.
@@ -90,11 +107,17 @@ size_t capture_read(EdgeSample *out, size_t max) {
     // but a caller that reads exactly capture_capacity() samples should
     // assume it lost older ones.
     size_t n = s_count < max ? s_count : max;
-    size_t start = (s_count < kRingSize) ? 0 : s_head;
+    size_t start = (s_head + kRingSize - s_count) % kRingSize;
     for (size_t i = 0; i < n; i++) {
         out[i] = s_ring[(start + i) % kRingSize];
     }
-    s_count = 0; // consumed
+    // Consume only what was actually copied. A short read (max < s_count)
+    // therefore leaves the NEWEST s_count - n samples in the ring for the
+    // next call instead of throwing them away, which is what `s_count = 0`
+    // used to do -- and for OOK capture the recent edges are usually the ones
+    // the caller wanted. This is only expressible now that `start` is derived
+    // from head-minus-count rather than special-cased.
+    s_count = s_count - n; // not `-=`, for the same -Wvolatile reason as the ISR
     portEXIT_CRITICAL(&s_mux);
     return n;
 }

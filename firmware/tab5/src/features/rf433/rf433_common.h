@@ -46,9 +46,15 @@ void capture_stop();
 // its own duplicate copy of this state.
 bool is_capturing();
 
-// Copies up to max samples out of the ring buffer into out, in the order
-// they were captured, and clears the buffer. Returns the number actually
-// copied. Call from poll() / the main task -- see this function's .cpp for
+// Copies up to max samples out of the ring buffer into out, oldest first,
+// and consumes exactly what it copied. Returns the number actually copied.
+// A short read (max smaller than the number of unread samples) keeps the
+// remaining, NEWER samples queued for the next call rather than discarding
+// them, so repeated draining during a single open capture returns a
+// continuous, in-order, gap-free stream -- calling this more than once per
+// capture session is explicitly supported and is what the later
+// scan/decode features do.
+// Call from poll() / the main task -- see this function's .cpp for
 // the portMUX_TYPE critical section that makes this safe against the
 // interrupt handler. The handler runs in ISR context, not a FreeRTOS task,
 // so it uses portENTER_CRITICAL_ISR while this function uses the matching
