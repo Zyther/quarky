@@ -131,6 +131,14 @@ const char *labelForExternalI2CAddr(uint8_t a) {
 
 } // namespace
 
+// Public thin wrapper over the file-local bring-up above. Deliberately a
+// wrapper rather than moving ensureExternalI2CBegun() out of the anonymous
+// namespace: everything in this file keeps calling the local symbol, so there
+// is exactly one implementation and no chance of the two drifting.
+void nfc_ensure_external_i2c_begun() {
+    ensureExternalI2CBegun();
+}
+
 bool NfcPN532::detect(const char *label) {
     ensureExternalI2CBegun();
 

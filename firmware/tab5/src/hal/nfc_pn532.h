@@ -24,6 +24,20 @@ private:
     uint8_t i2c_addr_;
 };
 
+// Brings up the external HY2.0 PORT.A I2C bus (Wire1) if it isn't up already:
+// asserts the EXT_5V_EN gate on the internal-bus IO-expander, waits out the
+// connected unit's power-on reset, then Wire1.begin()/setClock(). Idempotent
+// and safe to call from any module.
+//
+// Exposed (Phase 3 Task 2) so that features/nfc/st25r3916_driver.cpp -- which
+// talks to the very same physical unit this HAL probes, just at register level
+// -- can reuse this exact sequence instead of re-deriving it. That matters:
+// PORT.A has NO power at reset until EXT_5V_EN is asserted, a bug that cost a
+// full "(nothing responded)" hardware run to find (see nfc_pn532.cpp's header
+// comment). Duplicating the bring-up would mean duplicating the chance of
+// getting it wrong.
+void nfc_ensure_external_i2c_begun();
+
 // Diagnostic: labelled scan of the external HY2.0 PORT.A I2C bus (GPIO 53/54
 // on this board -- see TAB5_EXTERNAL_I2C_SDA_GPIO/SCL_GPIO in pins_config.h).
 // Not part of INFC; a bring-up aid in the same shape as touch_tab5.cpp's

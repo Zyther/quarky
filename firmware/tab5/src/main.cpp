@@ -114,6 +114,16 @@
                                           // 'c'/'h' above). Becomes the shared
                                           // receive front-end for the later
                                           // RF433 scan/decode/replay tasks.
+#include "features/nfc/st25r3916_driver.h" // Task 2 (Phase 3 plan): real
+                                            // register-level driver for the
+                                            // PORT.A NFC unit's ST25R3916.
+                                            // Spike only for now -- no
+                                            // register_module(), no launcher
+                                            // tile; serial-trigger 'n' is its
+                                            // only entry point (same shape as
+                                            // 'c'/'h'/'r' above). Becomes the
+                                            // foundation for the later NFC
+                                            // tag-protocol tasks.
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -742,6 +752,69 @@ void loop() {
                 Rf433Common::capture_start();
                 s_rf433_capture_started_ms = millis();
             }
+        } else if (c == 'n') {
+            // Task 2 (Phase 3 plan): the ST25R3916 chip-ID readback SPIKE.
+            // Like 'c'/'h'/'r' above it has NO launcher tile -- it is a
+            // one-shot experiment (does the PORT.A NFC unit really answer
+            // ST25R3916 register framing, and report ST's documented IC
+            // identity?), so serial is its only entry point by design.
+            //
+            // 'n' (mnemonic: NFC) is free -- k/p/b/w/s/m/g/a/c/h/j/f/r are the
+            // thirteen already taken above.
+            //
+            // *** HARDWARE PRECONDITION ***: the NFC unit -- NOT the RFID2
+            // unit and NOT the RF433R receiver Task 1 used -- must be the
+            // thing plugged into the Tab5's single HY2.0 PORT.A socket. There
+            // is only one such socket. If RF433R is still connected this will
+            // report an I2C NACK, which means "wrong unit plugged in", not
+            // "the driver is wrong".
+            //
+            // ACCEPTANCE CRITERION (this task's brief, and it is a specific
+            // cited value, not "something non-zero came back"): the IC
+            // identity register at 0x3F must have its ic_type field -- bits
+            // 7..3, masked with 0xF8 -- equal to 0x28, i.e. 00101b, which
+            // DS12484 Rev 3 Table 117 documents as "ST25R3916/7". The low
+            // three bits are ic_rev and are silicon-revision dependent (that
+            // table's default column shows 010b = "rev 3.1", making 0x2A the
+            // whole-byte value to expect on that revision) -- so the revision
+            // is LOGGED but is deliberately NOT part of pass/fail.
+            Serial.println("quarky-tab5: [debug] St25r3916 chip-ID readback via serial trigger");
+            uint8_t id = 0;
+            bool init_ok = St25r3916::init();
+            bool read_ok = St25r3916::read_chip_id(&id);
+            if (!read_ok) {
+                Serial.println("quarky-tab5: [st25r3916] *** FAIL: could not read "
+                               "IC identity (reg 0x3F) at all -- I2C 0x50 on Wire1 "
+                               "did not answer. Is the NFC unit (not RFID2, not "
+                               "RF433R) on PORT.A? ***");
+            } else {
+                uint8_t type = id & St25r3916::kIcIdentityIcTypeMask;
+                uint8_t rev = id & St25r3916::kIcIdentityIcRevMask;
+                Serial.printf("quarky-tab5: [st25r3916] EXPECTED ic_type = 0x%02X "
+                              "(DS12484 Rev 3 Table 117, 00101b = ST25R3916/7); "
+                              "whole-byte value on the datasheet's documented "
+                              "rev 3.1 silicon would be 0x2A\n",
+                              St25r3916::kIcTypeSt25r3916);
+                Serial.printf("quarky-tab5: [st25r3916] ACTUAL   reg 0x3F = 0x%02X "
+                              "-> ic_type = 0x%02X, ic_rev = %u\n",
+                              id, type, (unsigned)rev);
+                if (type == St25r3916::kIcTypeSt25r3916) {
+                    Serial.println("quarky-tab5: [st25r3916] *** PASS: ic_type matches "
+                                   "ST25R3916/7 ***");
+                } else if (type == St25r3916::kIcTypeSt25r3916B) {
+                    Serial.println("quarky-tab5: [st25r3916] *** PASS (variant): ic_type "
+                                   "is ST25R3916B, not the -AQWT M5Stack documents. "
+                                   "Same programming model for this driver, but later "
+                                   "tasks must add the B part's RC-calibration step. ***");
+                } else {
+                    Serial.println("quarky-tab5: [st25r3916] *** FAIL: ic_type matches "
+                                   "neither ST25R3916 nor ST25R3916B. Something answered "
+                                   "at 0x50, but it is not this chip -- do NOT paper over "
+                                   "this by relaxing the check. ***");
+                }
+            }
+            Serial.printf("quarky-tab5: [st25r3916] init() returned %s\n",
+                          init_ok ? "true" : "false");
         }
     }
 
