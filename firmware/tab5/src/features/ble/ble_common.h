@@ -72,19 +72,15 @@ bool ble_require_host_ready(lv_obj_t *status_label,
 bool ble_require_host_ready_list(lv_obj_t *list,
                                  const char *not_ready_msg = kBleHostNotReadyMsg);
 
-// Pushes a minimal, self-explanatory screen (standard scaffold Back button +
-// one label) and returns.
+// REMOVED 2026-08-17: ble_push_message_screen() / kBleNoScannedTargetMsg.
 //
-// Whole-branch review finding I3 (2026-08-17): the four connect-based BLE
-// features that run against BleScanFeature::first_device_addr()
-// (ble_flood.cpp, ble_fastpair_exploit.cpp, ble_hfp_exploit.cpp,
-// ble_whisperpair.cpp) used to `Serial.println(...); return;` when no scan
-// had been run, which on a touchscreen device means tapping the launcher
-// tile produces literally no visible reaction -- the same class of silent
-// no-feedback failure Task 15's Bad-KB status-label fix already closed.
-// This gives them a real on-screen answer for the price of one call.
-void ble_push_message_screen(const char *title, const char *message);
-
-// The standard "you have to scan first" text for ble_push_message_screen(),
-// shared so all four features word it identically.
-extern const char *const kBleNoScannedTargetMsg;
+// They existed for finding I3's minimal fix -- the four connect-based BLE
+// features (ble_flood.cpp, ble_fastpair_exploit.cpp, ble_hfp_exploit.cpp,
+// ble_whisperpair.cpp) needed something to show when
+// BleScanFeature::first_device_addr() returned null, i.e. when no separate
+// BLE Scan screen run had left a device in slot 0. All four now run their own
+// scan through BleTargetPicker (see ble_target_picker.h), so "no scanned
+// target" is not a reachable state any more and both were left with zero
+// callers. Deleted rather than kept as never-called code, per this project's
+// no-dead-code discipline. If some future screen wants a one-label message
+// screen, build_sub_screen() + one lv_label is the four lines this was.
