@@ -91,7 +91,11 @@
 
 namespace {
 
-bool s_external_bus_begun = false;
+// Latched separately from the bus itself. The power gate is a bit on an
+// IO-expander on the INTERNAL bus; nothing that happens to GPIO53 can disturb
+// it, so once asserted it stays asserted for the boot. Keeping it out of the
+// bus latch means a Wire1 re-init never pays the 200 ms EXT_5V settle again.
+bool s_external_port_powered = false;
 
 // Turn on the external 5V bus that feeds PORT.A's red wire (and the rear
 // M5-Bus / side 2.54-10P header). Off at reset; nothing on PORT.A can answer
@@ -116,30 +120,41 @@ void ensureExternalPortPowered() {
 // True while GPIO53 is still registered to the Arduino peripheral manager as
 // this bus's I2C SDA line. Goes false the moment anything else claims the pin.
 //
-// WHY THIS EXISTS (real incident, 2026-08-18, Phase 3 Task 2 Step 3's first
-// attempt): GPIO53 is simultaneously TAB5_EXTERNAL_I2C_SDA_GPIO,
-// TAB5_RF433T_PIN and TAB5_RF433R_PIN -- one physical pin, because PORT.A is
-// one physical socket holding one unit at a time. Any pinMode() on it (which
-// Rf433Gpio::init() and Rf433Common::capture_start() both do) routes through
-// perimanSetPinBus(pin, ESP32_BUS_TYPE_GPIO, ...) at
-// cores/esp32/esp32-hal-gpio.c:161, and perimanSetPinBus() calls the previous
-// owner's deinit callback before reassigning
-// (cores/esp32/esp32-hal-periman.c:174-183). For an I2C SDA pin that callback
-// is i2cDetachBus() -> i2cDeinit(), which DELETES THE ENTIRE Wire1 MASTER BUS.
-// The symptom is `esp32-hal-i2c-ng.c: bus is not initialized` on a bus that
-// was working seconds earlier.
+// GPIO53 is shared three ways (TAB5_EXTERNAL_I2C_SDA_GPIO, TAB5_RF433T_PIN,
+// TAB5_RF433R_PIN) and an RF433 pinMode() on it destroys this entire I2C bus.
+// >>> The full incident write-up, mechanism and framework citations live in
+// >>> hal/rf433_gpio.cpp's header comment -- the ONE canonical copy. <<<
+// Short version, enough to read this function: any pinMode() on GPIO53 runs
+// the peripheral manager's deinit callback for the pin's previous owner, and
+// for an I2C SDA pin that callback deletes the whole master bus, producing
+// `esp32-hal-i2c-ng.c: bus is not initialized` on a bus that worked seconds
+// earlier.
 //
-// The bare `s_external_bus_begun` latch could not see that: it recorded "we
-// called begin() once", which stayed true after the peripheral underneath it
-// had been destroyed, so every later call short-circuited into a dead bus for
-// the rest of the boot. Asking the peripheral manager who currently owns the
-// pin is the direct question, and it is cheap (an array lookup).
+// A plain "did we call begin() once" latch cannot see that -- it stays true
+// after the peripheral underneath it has been destroyed. Asking the peripheral
+// manager who currently owns the pin is the direct question, and it is cheap
+// (an array lookup).
+//
+// WHY CHECKING SDA ALONE IS ENOUGH, and why that is not obvious: SCL (GPIO54)
+// is not shared with anything and so is never the pin that gets stolen -- but
+// that is not the real reason. The real reason is that the two pins' periman
+// registrations are created and destroyed strictly together:
+// i2cInit() registers both (esp32-hal-i2c-ng.c:148-149) and i2cDeinit() clears
+// both in the same branch that sets initialized=false
+// (esp32-hal-i2c-ng.c:200-201). There is no state where SDA is released and
+// SCL is not. That coupling is a framework implementation detail one refactor
+// away from silently breaking this check, so it is written down rather than
+// relied on silently.
 bool externalI2CPinStillOwnedByI2C() {
     return perimanGetPinBusType(TAB5_EXTERNAL_I2C_SDA_GPIO) ==
            ESP32_BUS_TYPE_I2C_MASTER_SDA;
 }
 
-void beginExternalI2C() {
+// Returns false if the bus could not be brought up. Callers must not treat a
+// failure as "probably fine": the entire point of the recovery path below is
+// to stop silent `bus is not initialized` failures, and swallowing begin()'s
+// result here would reintroduce exactly that, one layer up.
+bool beginExternalI2C() {
     // Safe to call again after a teardown: TwoWire::begin() only short-circuits
     // ("Bus already started in Master Mode", Wire.cpp:299-303) when
     // i2cIsInit() is true -- and the i2cDeinit() that stole the pin is exactly
@@ -148,29 +163,71 @@ void beginExternalI2C() {
     // manager and rebuilds the bus. So no explicit "release the pin back"
     // step is needed on the RF433 side; the I2C side re-claims what it needs,
     // when it needs it.
-    Wire1.begin(TAB5_EXTERNAL_I2C_SDA_GPIO, TAB5_EXTERNAL_I2C_SCL_GPIO);
+    if (!Wire1.begin(TAB5_EXTERNAL_I2C_SDA_GPIO, TAB5_EXTERNAL_I2C_SCL_GPIO)) {
+        Serial.printf("quarky-tab5: Wire1.begin(SDA=GPIO%d, SCL=GPIO%d) FAILED -- "
+                      "the external PORT.A I2C bus is NOT usable. Every NFC/RFID2 "
+                      "access after this will fail; expect "
+                      "`esp32-hal-i2c-ng.c: bus is not initialized`.\n",
+                      TAB5_EXTERNAL_I2C_SDA_GPIO, TAB5_EXTERNAL_I2C_SCL_GPIO);
+        return false;
+    }
     Wire1.setClock(TAB5_EXTERNAL_I2C_FREQ_HZ);
+    return true;
 }
 
 void ensureExternalI2CBegun() {
-    if (s_external_bus_begun) {
-        if (externalI2CPinStillOwnedByI2C()) {
-            return;
-        }
-        // Recovery path. The EXT_5V_EN power gate is deliberately NOT
-        // re-asserted here: it is a bit on the PI4IOE5V6408 IO-expander on the
-        // INTERNAL bus, which nothing on GPIO53 can disturb, so it is still
-        // set and re-running it would only cost a pointless 200 ms settle.
-        Serial.printf("quarky-tab5: external I2C bus was torn down -- GPIO%d is "
-                      "no longer owned by I2C (an RF433 pinMode() will do this; "
-                      "see hal/rf433_gpio.cpp). Re-initializing Wire1.\n",
-                      TAB5_EXTERNAL_I2C_SDA_GPIO);
-        beginExternalI2C();
+    if (!s_external_port_powered) {
+        ensureExternalPortPowered();
+        s_external_port_powered = true;
+    } else if (externalI2CPinStillOwnedByI2C()) {
+        // Fast path: powered, and the bus still owns its pin. Nothing to do.
         return;
+    } else {
+        // ===================================================================
+        // RECOVERY PATH -- and it is not free. READ THIS BEFORE ASSUMING IT IS
+        // SAFE TO TRIGGER FROM ANYWHERE.
+        // ===================================================================
+        // Re-initializing Wire1 takes GPIO53 BACK, which is the exact mirror
+        // image of the bug this whole mechanism exists to fix. i2cInit() calls
+        // perimanClearPinBus() on both pins (esp32-hal-i2c-ng.c:107) and then
+        // hands GPIO53's routing to the I2C peripheral.
+        //
+        // If an RF433 edge capture is running when that happens, it is NOT
+        // told. Rf433Common keeps s_capturing == true and keeps its
+        // attachInterrupt() handler installed, because the peripheral
+        // manager's GPIO deinit callback -- gpioDetachBus(),
+        // cores/esp32/esp32-hal-gpio.c:105-107 -- is a no-op that returns true
+        // without detaching anything. So the capture module still believes it
+        // owns a pin that now belongs to I2C.
+        //
+        // Which of two bad outcomes follows depends on whether the I2C
+        // driver's own pin setup masks the GPIO interrupt (that path is inside
+        // the prebuilt i2c_new_master_bus() and was NOT read, so this is
+        // stated as the open question it is):
+        //   - if it masks it: the capture quietly records ~0 edges;
+        //   - if it does not: the still-installed ISR timestamps I2C bus
+        //     transitions, i.e. this driver's own register reads, and the
+        //     capture returns plausible-looking pulse data that is entirely
+        //     fake. That is the worse case, and it is not obviously the less
+        //     likely one.
+        // Either way the RF433 side reports no error.
+        //
+        // NOT FIXED IN CODE, deliberately: hal/ calling into features/ would
+        // be a layering violation, and this is a real arbitration problem (see
+        // the note in features/rf433/rf433_common.cpp) that wants a proper
+        // owner token, not a back-reference from the HAL. Today it is
+        // unreachable in practice -- neither RF433 nor NFC has a launcher
+        // tile, both are serial-trigger spikes, and a human cannot press 'r'
+        // and 'n' simultaneously. It becomes reachable the moment either grows
+        // a UI that can stay open while the other runs.
+        Serial.printf("quarky-tab5: external I2C bus was torn down -- GPIO%d is "
+                      "no longer owned by I2C (an RF433 pinMode() does this; see "
+                      "hal/rf433_gpio.cpp). Re-initializing Wire1 and TAKING THE "
+                      "PIN BACK -- any RF433 capture still running is now "
+                      "invalid.\n",
+                      TAB5_EXTERNAL_I2C_SDA_GPIO);
     }
-    ensureExternalPortPowered();
     beginExternalI2C();
-    s_external_bus_begun = true;
 }
 
 const char *labelForExternalI2CAddr(uint8_t a) {

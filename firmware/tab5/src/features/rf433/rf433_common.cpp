@@ -3,6 +3,44 @@
 #include <Arduino.h>
 #include <driver/gpio.h> // gpio_intr_disable() -- the ISR self-disarm below
 
+// ===========================================================================
+// HAZARD: A CAPTURE CAN BE INVALIDATED FROM OUTSIDE, SILENTLY (2026-08-18)
+// ===========================================================================
+// If you are here because a capture returned zero edges, or returned edges
+// that decode to nonsense, read this before debugging the ring buffer.
+//
+// TAB5_RF433R_PIN is GPIO53, which is ALSO TAB5_EXTERNAL_I2C_SDA_GPIO -- the
+// SDA line of the external HY2.0 PORT.A I2C bus. One physical pin, because
+// PORT.A is one physical socket holding one unit at a time. The full write-up
+// of the sharing and its consequences is the canonical block in
+// hal/rf433_gpio.cpp.
+//
+// The direction that matters HERE is I2C taking the pin back. capture_start()
+// claims GPIO53 with pinMode(), which tears down the Wire1 peripheral. The NFC
+// side detects that and re-initializes Wire1 on its next access
+// (hal/nfc_pn532.cpp's ensureExternalI2CBegun()), and that re-init routes
+// GPIO53 to the I2C peripheral again -- possibly while a capture is still
+// running.
+//
+// THIS MODULE IS NOT NOTIFIED. s_capturing stays true and the attachInterrupt()
+// handler stays installed, because the peripheral manager's GPIO deinit
+// callback (gpioDetachBus(), cores/esp32/esp32-hal-gpio.c:105-107) is a no-op
+// returning true -- it detaches nothing. So this module keeps believing it
+// owns a pin that I2C now drives. Depending on whether the I2C driver's pin
+// setup masks the GPIO interrupt (inside the prebuilt i2c_new_master_bus();
+// not verified), the capture then either records ~0 edges or -- worse --
+// timestamps I2C bus traffic and returns fake but plausible-looking pulse
+// data. Neither case sets overrun() or any other error flag.
+//
+// Not defended against in code on purpose: the fix is proper arbitration of
+// GPIO53 (a claim/release owner token shared by both subsystems), not a
+// back-reference from either side. Unreachable in practice today -- both RF433
+// and NFC are serial-trigger spikes with no launcher tile, so nothing can run
+// concurrently with a capture -- and it becomes reachable the moment either
+// grows a UI that stays open while the other runs. Whoever builds that owns
+// this problem; do not assume the current quiet is a guarantee.
+// ===========================================================================
+
 namespace Rf433Common {
 namespace {
 

@@ -369,16 +369,16 @@ void setup() {
     // `esp32-hal-i2c-ng.c: bus is not initialized`, on the exact bus and
     // address that had just answered.
     //
-    // ROOT CAUSE: TAB5_EXTERNAL_I2C_SDA_GPIO, TAB5_RF433T_PIN and
+    // ROOT CAUSE, in one line: TAB5_EXTERNAL_I2C_SDA_GPIO, TAB5_RF433T_PIN and
     // TAB5_RF433R_PIN are ALL GPIO53 -- one physical pin, because PORT.A is
-    // one physical HY2.0 socket that holds exactly one unit at a time
-    // (NFC *or* RFID2 *or* RF433R/T). Rf433Gpio::init() unconditionally does
-    // pinMode(GPIO53, ...), and pinMode() does far more than re-route a pin:
-    // esp32-hal-gpio.c:161 calls perimanSetPinBus(pin, ESP32_BUS_TYPE_GPIO, ...),
-    // which at esp32-hal-periman.c:174-183 invokes the PREVIOUS owner's deinit
-    // callback -- here i2cDetachBus -> i2cDeinit() -- tearing down the whole
-    // Wire1 I2C peripheral, not just the pin. Hence "bus is not initialized"
-    // rather than a NACK.
+    // one physical HY2.0 socket that holds exactly one unit at a time (NFC
+    // *or* RFID2 *or* RF433R/T) -- and Rf433Gpio::init()'s pinMode() on it
+    // does far more than re-route the pin: it destroys the entire Wire1 I2C
+    // peripheral. Hence "bus is not initialized" rather than a NACK.
+    //
+    // >>> The mechanism, the framework citations, and the symmetric hazard in
+    // >>> the other direction are written up ONCE, in hal/rf433_gpio.cpp's
+    // >>> header comment. Read that before changing anything here. <<<
     //
     // THE FIX: RF433 claims GPIO53 on demand, only when an RF433 feature is
     // actually running -- the same arbitration this project already uses for
