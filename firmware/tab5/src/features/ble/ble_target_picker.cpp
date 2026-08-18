@@ -1,4 +1,5 @@
 #include "ble_target_picker.h"
+#include "ble_classify.h"
 #include "ble_common.h"
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
@@ -35,6 +36,18 @@ static portMUX_TYPE s_targets_mux = portMUX_INITIALIZER_UNLOCKED;
 static lv_obj_t *s_list = nullptr;
 static bool s_scanning = false;
 
+// Task-review Minor (2026-08-18): the picker used to have no path that ever
+// noticed its own 10s ble_gap_disc() window closing on its own -- s_scanning
+// stayed true for the life of the screen, the list just silently stopped
+// updating (poll()'s 500ms refresh kept re-running with nothing new to draw),
+// and the header still read "Scanning for targets..." forever. Same fix
+// ble_scan.cpp's task review already applied there (finding M6): a
+// BLE_GAP_EVENT_DISC_COMPLETE case sets this flag on the host task; poll()
+// clears s_scanning and does one final render on the main task. volatile
+// per this file's own cross-task convention -- written on the NimBLE host
+// task (gap_scan_event_cb), read/cleared on the main task (poll()).
+static volatile bool s_scan_complete = false;
+
 // Main-task-only: written by start(), read by the row click handler. Never
 // touched from the host task.
 static TargetSelectedFn s_on_selected = nullptr;
@@ -51,6 +64,10 @@ static TargetSelectedFn s_on_selected = nullptr;
 // Getting this right ONCE, here, is a large part of the point of sharing the
 // picker -- every feature the picker feeds now inherits the correct type.
 static int gap_scan_event_cb(struct ble_gap_event *event, void *arg) {
+    if (event->type == BLE_GAP_EVENT_DISC_COMPLETE) {
+        s_scan_complete = true;
+        return 0;
+    }
     if (event->type != BLE_GAP_EVENT_DISC) return 0;
 
     BleDeviceInfo d{};
@@ -65,6 +82,18 @@ static int gap_scan_event_cb(struct ble_gap_event *event, void *arg) {
             memcpy(d.name, fields.name, len);
             d.name[len] = '\0';
         }
+    }
+    // Task-review Minor (2026-08-18): populate the same BleClassify label
+    // ble_scan.cpp already attaches to its own scan results. Wasn't wired up
+    // here originally, which meant the picker silently dropped exactly the
+    // signal (e.g. "Fast Pair") that Fast Pair/WhisperPair's own deferred
+    // "rank candidates by classification" follow-up would need to consume.
+    const char *label = BleClassify::classify(event->disc.data, event->disc.length_data);
+    if (label != nullptr) {
+        strncpy(d.label, label, sizeof(d.label) - 1);
+        d.label[sizeof(d.label) - 1] = '\0';
+    } else {
+        d.label[0] = '\0';
     }
 
     portENTER_CRITICAL(&s_targets_mux);
@@ -153,9 +182,17 @@ static void refresh_target_list_ui() {
     lv_list_add_text(s_list, count > 0 ? "Tap a target to continue" : "Scanning for targets...");
 
     for (int i = 0; i < count; i++) {
-        char row[56];
-        const char *label = snapshot[i].name[0] ? snapshot[i].name : snapshot[i].addr_str;
-        snprintf(row, sizeof(row), "%s  %s  %ddBm", label, snapshot[i].addr_str, snapshot[i].rssi);
+        // 80, not the original 56: worst case is a 31-char name + a 17-char
+        // addr_str + a 23-char classify label + separators/dBm, which 56
+        // truncated -- for exactly the named, classified devices a user is
+        // most likely choosing between (task-review Minor, 2026-08-18).
+        char row[80];
+        const char *name_or_addr = snapshot[i].name[0] ? snapshot[i].name : snapshot[i].addr_str;
+        if (snapshot[i].label[0]) {
+            snprintf(row, sizeof(row), "%s  [%s]  %ddBm", name_or_addr, snapshot[i].label, snapshot[i].rssi);
+        } else {
+            snprintf(row, sizeof(row), "%s  %s  %ddBm", name_or_addr, snapshot[i].addr_str, snapshot[i].rssi);
+        }
         lv_obj_t *btn = lv_list_add_button(s_list, LV_SYMBOL_BLUETOOTH, row);
         // Row index (not a pointer into s_targets) stashed as user_data, same
         // as ble_gatt_explorer.cpp / ble_clone.cpp: entries are append-only
@@ -222,6 +259,7 @@ static lv_obj_t *build_screen(const char *screen_title) {
     portENTER_CRITICAL(&s_targets_mux);
     s_target_count = 0;
     portEXIT_CRITICAL(&s_targets_mux);
+    s_scan_complete = false;
 
     struct ble_gap_disc_params params{};
     params.passive = 0; // active scan: pull scan-response data so named
@@ -251,6 +289,21 @@ void poll() {
     // Only relevant while the picker screen is open and its scan is running,
     // matching ble_clone.cpp / ble_gatt_explorer.cpp's own throttled refresh.
     if (!s_scanning || !s_list) return;
+
+    // Task-review Minor (2026-08-18), same fix ble_scan.cpp already applied
+    // for itself (finding M6): notice the scan's own 10s window closing on
+    // its own, do one final render, and stop the throttled refresh below
+    // from running forever with nothing new to draw. Checked before the
+    // 500ms throttle so completion is picked up on the very next poll()
+    // tick, not delayed behind it.
+    if (s_scan_complete) {
+        refresh_target_list_ui();
+        if (s_list) lv_list_add_text(s_list, "Scan finished -- Back to retry");
+        s_scanning = false;
+        s_scan_complete = false;
+        return;
+    }
+
     static uint32_t last_refresh = 0;
     if (millis() - last_refresh < 500) return;
     last_refresh = millis();

@@ -260,12 +260,14 @@ static void refresh_tracker_list_ui() {
 
 static void update_geiger_ui() {
     // s_locked read here is unprotected by design, not oversight: every
-    // writer of s_locked (build_screen(), the LV_EVENT_DELETE handler, and
-    // lock_last_seen()) runs on this same main/LVGL task that
-    // update_geiger_ui() runs on (called from poll()) -- a same-task
-    // read/write is not a cross-task race. Only gap_scan_event_cb (a
-    // different task) reads s_locked, and it does so under s_lock_mux (see
-    // above), which is what actually matters for correctness there.
+    // writer of s_locked (build_screen(), the LV_EVENT_DELETE handler,
+    // lock_last_seen(), and lock_onto() -- the last one covers both the
+    // row-tap handler and lock_last_seen(), added 2026-08-17) runs on this
+    // same main/LVGL task that update_geiger_ui() runs on (called from
+    // poll()) -- a same-task read/write is not a cross-task race. Only
+    // gap_scan_event_cb (a different task) reads s_locked, and it does so
+    // under s_lock_mux (see above), which is what actually matters for
+    // correctness there.
     if (!s_list || !s_locked) return;
     portENTER_CRITICAL(&s_lock_mux);
     int8_t rssi = s_locked_rssi;
