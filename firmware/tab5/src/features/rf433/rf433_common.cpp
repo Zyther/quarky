@@ -1,6 +1,7 @@
 #include "rf433_common.h"
 #include "../../../boards/tab5/pins_config.h"
 #include <Arduino.h>
+#include <driver/gpio.h> // gpio_intr_disable() -- the ISR self-disarm below
 
 namespace Rf433Common {
 namespace {
@@ -8,6 +9,12 @@ namespace {
 constexpr size_t kRingSize = 512; // generous headroom for one OOK burst --
                                    // typical fixed-code remotes send a few
                                    // hundred edges per press (repeated ~4-8x)
+
+// Hard ceiling on how many edges one capture session may service before the
+// ISR disarms itself. This is a runaway-interrupt guard, not a capture-length
+// setting -- see the self-disarm block in isr_edge() for the full rationale
+// and for how this number was derived from the 2026-08-18 real-hardware run.
+constexpr uint32_t kMaxEdgesPerCapture = 100000;
 
 // NOT declared `volatile`, deliberately. The brief's sketch had
 // `volatile EdgeSample s_ring[kRingSize]`, which does not compile: the
@@ -30,6 +37,10 @@ constexpr size_t kRingSize = 512; // generous headroom for one OOK burst --
 EdgeSample s_ring[kRingSize];
 volatile size_t s_head = 0;  // ISR-owned write index, wraps
 volatile size_t s_count = 0; // number of valid unread samples, capped at kRingSize
+volatile uint32_t s_edges_this_capture = 0; // total serviced since capture_start(),
+                                            // NOT reset by a drain -- this is the
+                                            // runaway guard's odometer
+volatile bool s_overrun = false;            // set by the ISR when it self-disarms
 portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 bool s_capturing = false;
 
@@ -41,6 +52,59 @@ void IRAM_ATTR isr_edge() {
     // elsewhere), an inferred/alternating level would stay wrong for the rest
     // of the capture, whereas a real read self-corrects on the next edge.
     portENTER_CRITICAL_ISR(&s_mux);
+
+    // ---- runaway-interrupt guard -----------------------------------------
+    // Added 2026-08-18 after a real incident: a caller left this ISR armed
+    // indefinitely (a second 'r' after the auto-stop had already fired
+    // re-STARTED a capture, and nothing ever stopped it) while a 433MHz
+    // transmitter nearby was still looping, and the Tab5 was observed to
+    // crash and reboot shortly afterwards. That crash was NOT reproduced on
+    // retry and no panic/backtrace was captured, so this is deliberately not
+    // presented as a root-cause fix -- it is a bound on the failure CLASS
+    // (unbounded ISR servicing with no main-task participation), which is
+    // real regardless of whether it caused that particular crash.
+    //
+    // WHY a count and not a timeout: a fixed edge budget converts to a
+    // SHORTER wall-clock bound the faster the interrupt is firing, which is
+    // exactly the discrimination wanted here. At the ~1000 edges/s measured
+    // during the real 2026-08-18 capture (512 edges spanning 509ms of
+    // sustained transmission) 100k edges is ~100 seconds -- 5x the longest
+    // sanctioned capture, so legitimate use can never trip it. Against a
+    // floating-pin/AGC-noise storm at tens of kHz it disarms in a couple of
+    // seconds. A small ceiling would invert that: 5-10k would fire partway
+    // into a legitimate 20s capture of real traffic (~20k edges) while
+    // buying only milliseconds in the storm case.
+    //
+    // WHY gpio_intr_disable() and not detachInterrupt() -- verified against
+    // this exact framework, not assumed:
+    //   * driver/gpio.h documents gpio_intr_disable() as callable from ISR
+    //     context, needing CONFIG_GPIO_CTRL_FUNC_IN_IRAM only for the
+    //     cache-disabled case. That config is NOT set here, but it does not
+    //     need to be: Arduino installs the GPIO ISR service with
+    //     ARDUINO_ISR_FLAG, which is (0) rather than ESP_INTR_FLAG_IRAM
+    //     because CONFIG_ARDUINO_ISR_IRAM is likewise not set in this
+    //     framework's esp32p4 sdkconfig. A non-IRAM ISR never runs with
+    //     cache disabled, so reaching a flash-resident driver function from
+    //     here is safe.
+    //   * detachInterrupt() is NOT safe from here. Per
+    //     cores/esp32/esp32-hal-gpio.c it calls gpio_isr_handler_remove(),
+    //     gpio_wakeup_disable() and gpio_set_intr_type(), and then clears
+    //     __pinInterruptHandlers[pin] -- which is the very struct passed as
+    //     `arg` to the handler that is executing at that moment. Tearing a
+    //     handler down from inside itself is not behavior the driver
+    //     specifies as safe.
+    // So the ISR does the minimum that stops the bleeding (mask the source)
+    // and leaves the full teardown to capture_stop() on the main task, which
+    // the overrun() flag prompts a caller to do.
+    if (s_edges_this_capture >= kMaxEdgesPerCapture) {
+        gpio_intr_disable((gpio_num_t)TAB5_RF433R_PIN);
+        s_overrun = true;
+        portEXIT_CRITICAL_ISR(&s_mux);
+        return; // record nothing: past the ceiling this is not data worth having
+    }
+    s_edges_this_capture = s_edges_this_capture + 1; // `= x + 1`, not `++`; see below
+    // ----------------------------------------------------------------------
+
     s_ring[s_head].timestamp_us = micros();
     s_ring[s_head].level = (digitalRead(TAB5_RF433R_PIN) != LOW);
     s_head = (s_head + 1) % kRingSize;
@@ -60,11 +124,23 @@ bool capture_start() {
     portENTER_CRITICAL(&s_mux);
     s_head = 0;
     s_count = 0;
+    s_edges_this_capture = 0;
+    s_overrun = false;
     portEXIT_CRITICAL(&s_mux);
     attachInterrupt(digitalPinToInterrupt(TAB5_RF433R_PIN), isr_edge, CHANGE);
+    // Explicitly re-enable rather than trusting attachInterrupt to undo a
+    // previous ISR self-disarm. gpio_isr_handler_add() (which attachInterrupt
+    // funnels into) does appear to enable the interrupt for the calling core,
+    // but that driver ships prebuilt in this framework -- only its headers are
+    // inspectable here -- and after a gpio_intr_disable() from ISR context the
+    // enable-bit state is not something to infer from an unread implementation.
+    // Enabling an already-enabled GPIO interrupt is a no-op, so this costs
+    // nothing and removes the guesswork.
+    gpio_intr_enable((gpio_num_t)TAB5_RF433R_PIN);
     s_capturing = true;
-    Serial.printf("quarky-tab5: [rf433] edge capture started on GPIO%d\n",
-                  TAB5_RF433R_PIN);
+    Serial.printf("quarky-tab5: [rf433] edge capture started on GPIO%d "
+                  "(self-disarms after %u edges)\n",
+                  TAB5_RF433R_PIN, (unsigned)kMaxEdgesPerCapture);
     return true;
 }
 
@@ -72,10 +148,17 @@ void capture_stop() {
     if (!s_capturing) return;
     detachInterrupt(digitalPinToInterrupt(TAB5_RF433R_PIN));
     s_capturing = false;
-    Serial.println("quarky-tab5: [rf433] edge capture stopped");
+    Serial.printf("quarky-tab5: [rf433] edge capture stopped (%u edges serviced"
+                  " this session)%s\n",
+                  (unsigned)s_edges_this_capture,
+                  s_overrun ? " -- ISR HAD SELF-DISARMED ON THE EDGE CEILING" : "");
 }
 
 bool is_capturing() { return s_capturing; }
+
+bool overrun() { return s_overrun; }
+
+uint32_t edges_this_capture() { return s_edges_this_capture; }
 
 size_t capture_capacity() { return kRingSize; }
 

@@ -191,6 +191,10 @@ static void rf433_dump_capture() {
 // Wall-clock start of the current capture, used only by the auto-stop safety
 // in loop(). 0 when no capture is running.
 static uint32_t s_rf433_capture_started_ms = 0;
+// How many captures have already run and finished this boot. Used only to
+// make a RE-ARM visually distinct from a first start in the log -- see the
+// 'r' handler.
+static uint32_t s_rf433_captures_completed = 0;
 static constexpr uint32_t kRf433CaptureMaxMs = 20000; // matches the ~10-20s
                                                       // capture window this
                                                       // spike's acceptance
@@ -715,8 +719,25 @@ void loop() {
                 Serial.println("quarky-tab5: [debug] Rf433Common::capture_stop() via serial trigger");
                 Rf433Common::capture_stop();
                 s_rf433_capture_started_ms = 0;
+                s_rf433_captures_completed++;
                 rf433_dump_capture();
             } else {
+                // Say loudly when this 'r' is a RE-ARM rather than a first
+                // start. Real operator error, 2026-08-18: after the 20s
+                // auto-stop had already fired, a second 'r' was sent expecting
+                // it to be the "stop" half of the toggle. It was not -- the
+                // capture had already stopped, so the toggle read as "start",
+                // and the ISR was left armed indefinitely when the session
+                // ended. Same keystroke, opposite meaning, and the only
+                // difference in the log was one easily-missed line. The module
+                // is now hard-bounded against that (Rf433Common's ISR
+                // self-disarms), but the operator should still be told.
+                if (s_rf433_captures_completed > 0) {
+                    Serial.printf("quarky-tab5: [debug] *** 'r' is RE-ARMING capture #%u -- "
+                                  "this is a START, not a stop (the previous capture already "
+                                  "ended). Send 'r' again to stop it. ***\n",
+                                  (unsigned)(s_rf433_captures_completed + 1));
+                }
                 Serial.println("quarky-tab5: [debug] Rf433Common::capture_start() via serial trigger");
                 Rf433Common::capture_start();
                 s_rf433_capture_started_ms = millis();
@@ -724,20 +745,34 @@ void loop() {
         }
     }
 
-    // Task 1 (Phase 3 plan) safety net, NOT in the brief but deliberate: if
-    // GPIO53 is floating (which is exactly the outcome this spike might
-    // prove), an OOK receiver's AGC-amplified noise can fire the CHANGE
-    // interrupt continuously, and there is then no guarantee anyone can get a
-    // second 'r' keystroke serviced to stop it. Bounding the capture means the
-    // worst case is a noisy dump rather than a wedged device needing a power
-    // cycle in the middle of a hardware session. A capture stopped this way
-    // dumps exactly as if 'r' had been pressed again.
-    if (s_rf433_capture_started_ms != 0 &&
-        millis() - s_rf433_capture_started_ms > kRf433CaptureMaxMs) {
-        Serial.printf("quarky-tab5: [rf433] auto-stopping capture after %u ms\n",
-                      (unsigned)kRf433CaptureMaxMs);
+    // Task 1 (Phase 3 plan) safety net, NOT in the brief but deliberate: bound
+    // how long one capture can stay armed, so a caller who never sends the
+    // second 'r' does not leave the ISR running forever. This is the
+    // main-task half of the guard only -- it depends on loop() still running,
+    // so it is NOT protection against genuine loop() starvation. The real
+    // bound against that lives in Rf433Common's ISR, which counts edges and
+    // masks its own interrupt source at a hard ceiling with no main-task
+    // participation at all. Both exist because they fail differently.
+    //
+    // Also fires on overrun so that an ISR self-disarm gets a full main-task
+    // teardown (capture_stop()) and a dump, instead of sitting in the
+    // half-state "capturing, but the interrupt is masked".
+    bool rf433_timed_out = s_rf433_capture_started_ms != 0 &&
+                           millis() - s_rf433_capture_started_ms > kRf433CaptureMaxMs;
+    bool rf433_overran = Rf433Common::is_capturing() && Rf433Common::overrun();
+    if (rf433_timed_out || rf433_overran) {
+        if (rf433_overran) {
+            Serial.printf("quarky-tab5: [rf433] *** ISR SELF-DISARMED at the %u-edge "
+                          "ceiling -- the interrupt was firing far longer or far faster "
+                          "than a legitimate capture. Completing teardown. ***\n",
+                          (unsigned)Rf433Common::edges_this_capture());
+        } else {
+            Serial.printf("quarky-tab5: [rf433] auto-stopping capture after %u ms\n",
+                          (unsigned)kRf433CaptureMaxMs);
+        }
         Rf433Common::capture_stop();
         s_rf433_capture_started_ms = 0;
+        s_rf433_captures_completed++;
         rf433_dump_capture();
     }
     // --- end debug aid ---

@@ -44,7 +44,27 @@ void capture_stop();
 // True while an edge capture is active. Lets a caller (e.g. main.cpp's
 // serial trigger) implement a single-key start/stop toggle without keeping
 // its own duplicate copy of this state.
+//
+// NOTE: this stays true even after the ISR has self-disarmed on the edge
+// ceiling (see overrun()) -- the module was never told to stop, it just
+// stopped collecting. Callers that poll should check overrun() too.
 bool is_capturing();
+
+// True if this capture session hit the hard edge ceiling and the ISR masked
+// its own interrupt source to stop servicing it. A caller seeing this should
+// call capture_stop() to complete the teardown on the main task (the ISR
+// deliberately does the minimum, not the full detach) and should treat the
+// capture as suspect: at the rates real 433MHz traffic produces, reaching
+// the ceiling means either the interrupt was left armed far longer than any
+// legitimate capture, or the pin is seeing something that is not signal.
+// Cleared by the next capture_start().
+bool overrun();
+
+// Total edges this session's ISR has serviced since capture_start(). Unlike
+// the ring's occupancy this is NOT reset by capture_read() -- it is the
+// runaway guard's odometer, and is useful for reporting the real interrupt
+// rate a capture saw.
+uint32_t edges_this_capture();
 
 // Copies up to max samples out of the ring buffer into out, oldest first,
 // and consumes exactly what it copied. Returns the number actually copied.

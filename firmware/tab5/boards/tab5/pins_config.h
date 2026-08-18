@@ -653,21 +653,27 @@
 #define TAB5_RF433T_PIN 53 // CONFIRMED 2026-08-09: independent 433.92MHz listener test
 #endif
 //
-// TAB5_RF433R_PIN: HYPOTHESIS, not independently confirmed to the same
-// standard as T above -- set to the same pin (53) on the reasoning that R
-// and T share the same physical HY2.0 connector position, but this has NOT
-// been verified by an equally rigorous test. An earlier same-day attempt to
-// verify R by polling digitalRead(53)/digitalRead(54) from loop() during a
-// real remote-control button press found no correlated signal on either
-// pin -- but loop()-based polling samples far too slowly and irregularly to
-// reliably catch genuine OOK receive-pulse timing (typically hundreds of
-// microseconds per bit), so that earlier "no correlation" result is more
-// likely a false negative from inadequate sampling than real evidence this
-// pin is wrong. Treat this value as a reasoned starting point, not a
-// confirmed fact, until a proper interrupt- or timer-driven receive test is
-// run.
+// TAB5_RF433R_PIN: CONFIRMED on real hardware 2026-08-18, to the same
+// standard as T above. With a real RF433R unit on PORT.A, an
+// interrupt-driven capture (attachInterrupt CHANGE, micros()-timestamped
+// edges -- see this plan's Task 1 and src/features/rf433/rf433_common.cpp)
+// was run for 20 seconds while a second physical device running Bruce
+// firmware transmitted a 433MHz sub continuously. GPIO53 produced a highly
+// regular, continuously-sustained burst-repeat pattern -- dozens of evenly
+// spaced ~7-8ms burst boundaries across the whole window, each burst made of
+// edges spanning a wide but structured pulse-width range. Regular repeating
+// structure at a transmitter's cadence is signal; a floating pin produces
+// irregular chatter with no such period. This is real, positive
+// real-hardware evidence.
+//
+// It also retires the earlier same-day-2026-08-09 negative result, which
+// polled digitalRead(53)/digitalRead(54) from loop() during a remote-control
+// button press and saw nothing. That was a false negative from inadequate
+// sampling, exactly as suspected at the time: loop()-based polling samples
+// far too slowly and irregularly to catch OOK receive-pulse timing (hundreds
+// of microseconds per bit). The pin was never wrong -- the instrument was.
 #ifndef TAB5_RF433R_PIN
-#define TAB5_RF433R_PIN 53 // HYPOTHESIS 2026-08-09: same connector position as confirmed T pin; unverified
+#define TAB5_RF433R_PIN 53 // CONFIRMED 2026-08-18: interrupt-driven receive test, continuous 433MHz TX from a second Bruce-firmware device
 #endif
 
 // Free GPIOs on the Tab5's rear M5-Bus connector (per docs.m5stack.com/en/
