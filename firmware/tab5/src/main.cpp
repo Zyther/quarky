@@ -105,6 +105,15 @@
                                              // feature -- but it does own a
                                              // screen and a scan, so it needs
                                              // a poll() like any other
+#include "features/rf433/rf433_common.h" // Task 1 (Phase 3 plan): interrupt-
+                                          // driven 433MHz edge-timing capture.
+                                          // Spike only for now -- no
+                                          // register_module(), no launcher
+                                          // tile; serial-trigger 'r' is its
+                                          // only entry point (same shape as
+                                          // 'c'/'h' above). Becomes the shared
+                                          // receive front-end for the later
+                                          // RF433 scan/decode/replay tasks.
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -146,6 +155,47 @@ NfcPN532 rfid2_unit(TAB5_RFID2_I2C_ADDR); // 0x28, per docs (WS1850S); no such
                                           // hotfix's hardware run, so this
                                           // address remains doc-only.
 Rf433Gpio rf433;
+
+#ifdef QUARKY_SERIAL_DEBUG
+// Task 1 (Phase 3 plan): drain and print whatever the RF433 edge-capture ISR
+// collected. Shared by the 'r' toggle's stop half and the auto-stop safety
+// below so both paths print identically.
+//
+// The drain buffer is `static`, not a local: capture_capacity() is 512
+// EdgeSamples (~4KB), and the Arduino main task's stack is not somewhere to
+// put that.
+//
+// What to look for in the output (this is the whole point of the spike):
+// a real OOK/ASK fixed-code remote produces deltas clustered into a SMALL
+// NUMBER OF DISTINCT BUCKETS -- classically two, a "short" of a few hundred
+// microseconds and a "long" at a small integer multiple of it -- and repeats
+// the same burst 4-8x per button press. Evenly-spaced chatter with no
+// repeating structure is noise on a floating pin, i.e. GPIO53 is NOT the
+// receive line.
+static void rf433_dump_capture() {
+    static Rf433Common::EdgeSample s_dump[512];
+    size_t cap = Rf433Common::capture_capacity();
+    if (cap > 512) cap = 512;
+    size_t n = Rf433Common::capture_read(s_dump, cap);
+    Serial.printf("quarky-tab5: [rf433] captured %u edges%s\n", (unsigned)n,
+                  n >= cap ? " (buffer FULL -- older edges were overwritten)" : "");
+    for (size_t i = 0; i < n; i++) {
+        uint32_t delta = (i == 0) ? 0 : (s_dump[i].timestamp_us - s_dump[i - 1].timestamp_us);
+        Serial.printf("quarky-tab5: [rf433] %4u  t=%10u us  d=%8u us  ->%d\n",
+                      (unsigned)i, (unsigned)s_dump[i].timestamp_us,
+                      (unsigned)delta, s_dump[i].level ? 1 : 0);
+    }
+    Serial.println("quarky-tab5: [rf433] end of capture dump");
+}
+
+// Wall-clock start of the current capture, used only by the auto-stop safety
+// in loop(). 0 when no capture is running.
+static uint32_t s_rf433_capture_started_ms = 0;
+static constexpr uint32_t kRf433CaptureMaxMs = 20000; // matches the ~10-20s
+                                                      // capture window this
+                                                      // spike's acceptance
+                                                      // test calls for
+#endif
 
 // Task 9's WiFi STA smoke test still ships with placeholder credentials.
 // Attempting them costs a guaranteed-to-fail 15s connect timeout on every
@@ -647,7 +697,48 @@ void loop() {
             // the dependent trigger" pattern 'c' uses with 'g'.
             Serial.println("quarky-tab5: [debug] BleFinderFeature::lock_last_seen() via serial trigger");
             BleFinderFeature::lock_last_seen();
+        } else if (c == 'r') {
+            // Task 1 (Phase 3 plan): the RF433 receive-pin SPIKE. Like 'c' and
+            // 'h' above it has NO launcher tile -- it is a one-shot experiment
+            // (does TAB5_RF433R_PIN=GPIO53 actually carry the RF433R unit's
+            // data line?), so serial is its only entry point by design.
+            //
+            // 'r' is a toggle, per this task's brief: first press starts the
+            // interrupt-driven edge capture, second press stops it and dumps
+            // every captured edge's inter-edge delta and post-edge level. The
+            // letter is free -- k/p/b/w/s/m/g/a/c/h/j/f are all taken above.
+            //
+            // Procedure: press 'r', press a real 433MHz remote several times
+            // over the next 10-20 seconds, press 'r' again (or just wait for
+            // the auto-stop below), then read the dump.
+            if (Rf433Common::is_capturing()) {
+                Serial.println("quarky-tab5: [debug] Rf433Common::capture_stop() via serial trigger");
+                Rf433Common::capture_stop();
+                s_rf433_capture_started_ms = 0;
+                rf433_dump_capture();
+            } else {
+                Serial.println("quarky-tab5: [debug] Rf433Common::capture_start() via serial trigger");
+                Rf433Common::capture_start();
+                s_rf433_capture_started_ms = millis();
+            }
         }
+    }
+
+    // Task 1 (Phase 3 plan) safety net, NOT in the brief but deliberate: if
+    // GPIO53 is floating (which is exactly the outcome this spike might
+    // prove), an OOK receiver's AGC-amplified noise can fire the CHANGE
+    // interrupt continuously, and there is then no guarantee anyone can get a
+    // second 'r' keystroke serviced to stop it. Bounding the capture means the
+    // worst case is a noisy dump rather than a wedged device needing a power
+    // cycle in the middle of a hardware session. A capture stopped this way
+    // dumps exactly as if 'r' had been pressed again.
+    if (s_rf433_capture_started_ms != 0 &&
+        millis() - s_rf433_capture_started_ms > kRf433CaptureMaxMs) {
+        Serial.printf("quarky-tab5: [rf433] auto-stopping capture after %u ms\n",
+                      (unsigned)kRf433CaptureMaxMs);
+        Rf433Common::capture_stop();
+        s_rf433_capture_started_ms = 0;
+        rf433_dump_capture();
     }
     // --- end debug aid ---
 #endif
