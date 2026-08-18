@@ -89,8 +89,22 @@
                                            // ECDH/AES-derived probe outside
                                            // pairing mode and see whether the
                                            // accessory replies. Via Task 1's
-                                           // BleCentral, against the first
-                                           // BLE-scanned device
+                                           // BleCentral, against a target the
+                                           // user picks in BleTargetPicker
+#include "features/ble/ble_target_picker.h" // 2026-08-17 UX fix: the shared
+                                             // "scan -> tap a target -> hand
+                                             // off" picker screen the four
+                                             // connect-based BLE features
+                                             // (Flood / Fast Pair / HFP /
+                                             // WhisperPair) now start with,
+                                             // replacing their old dependence
+                                             // on whatever device the BLE Scan
+                                             // screen happened to leave in
+                                             // slot 0. No launcher tile of its
+                                             // own -- it is a component, not a
+                                             // feature -- but it does own a
+                                             // screen and a scan, so it needs
+                                             // a poll() like any other
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -488,6 +502,14 @@ void loop() {
                                         // post-probe notify wait window (which
                                         // is what emits the "target stayed
                                         // silent" verdict)
+    BleTargetPicker::poll();           // no-ops unless the shared BLE target
+                                        // picker screen is open and still
+                                        // scanning; rebuilds the tappable
+                                        // device list on the main/LVGL task
+                                        // from the buffer its NimBLE host-task
+                                        // scan callback fills (same
+                                        // host-task-must-not-call-lv_* split
+                                        // as every other BLE screen here)
 
 #ifdef QUARKY_SERIAL_DEBUG
     // --- Serial-driven headless-verification aid (intentionally kept, gated) ---
