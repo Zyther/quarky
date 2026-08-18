@@ -164,7 +164,12 @@ NfcPN532 rfid2_unit(TAB5_RFID2_I2C_ADDR); // 0x28, per docs (WS1850S); no such
                                           // unit was plugged in during the
                                           // hotfix's hardware run, so this
                                           // address remains doc-only.
-Rf433Gpio rf433;
+Rf433Gpio rf433; // Intentionally has NO init() call in setup() as of 2026-08-18
+                 // -- GPIO53 is shared with the external I2C SDA line and
+                 // claiming it at boot tore down Wire1. See the long comment at
+                 // the removal site in setup(). The instance is kept because it
+                 // is this board's IRF433 implementation and Task 6 (RF433
+                 // transmit/replay) is its real first caller.
 
 #ifdef QUARKY_SERIAL_DEBUG
 // Task 1 (Phase 3 plan): drain and print whatever the RF433 edge-capture ISR
@@ -352,7 +357,45 @@ void setup() {
     nfc_scan_external_i2c_bus();
     nfc_unit.detect("NFC");
     rfid2_unit.detect("RFID2");
-    rf433.init();
+
+    // rf433.init() is DELIBERATELY NOT CALLED HERE. Do not "helpfully" put it
+    // back -- doing so reintroduces a real, observed bug.
+    //
+    // THE INCIDENT (2026-08-18, Phase 3 Task 2 Step 3, first attempt on real
+    // hardware). The project owner swapped the NFC unit onto PORT.A. The
+    // census three lines above correctly found `0x50 ST25R3916` -- the unit was
+    // present and answering. Moments later the 'n' trigger's
+    // St25r3916::init() failed 2/2 with
+    // `esp32-hal-i2c-ng.c: bus is not initialized`, on the exact bus and
+    // address that had just answered.
+    //
+    // ROOT CAUSE: TAB5_EXTERNAL_I2C_SDA_GPIO, TAB5_RF433T_PIN and
+    // TAB5_RF433R_PIN are ALL GPIO53 -- one physical pin, because PORT.A is
+    // one physical HY2.0 socket that holds exactly one unit at a time
+    // (NFC *or* RFID2 *or* RF433R/T). Rf433Gpio::init() unconditionally does
+    // pinMode(GPIO53, ...), and pinMode() does far more than re-route a pin:
+    // esp32-hal-gpio.c:161 calls perimanSetPinBus(pin, ESP32_BUS_TYPE_GPIO, ...),
+    // which at esp32-hal-periman.c:174-183 invokes the PREVIOUS owner's deinit
+    // callback -- here i2cDetachBus -> i2cDeinit() -- tearing down the whole
+    // Wire1 I2C peripheral, not just the pin. Hence "bus is not initialized"
+    // rather than a NACK.
+    //
+    // THE FIX: RF433 claims GPIO53 on demand, only when an RF433 feature is
+    // actually running -- the same arbitration this project already uses for
+    // other exclusive shared hardware (e.g. BLE's single advertising slot,
+    // claimed on open and released on close rather than held from boot).
+    // Claiming both pin functions at boot regardless of which unit is really
+    // plugged in was never right; it only looked harmless because Task 1's
+    // receive test uses raw digitalRead()/attachInterrupt() and never touches
+    // the I2C peripheral.
+    //
+    // Nothing needs wiring up in its place today: Rf433Common::capture_start()
+    // already does its own pinMode(TAB5_RF433R_PIN, INPUT) every time the 'r'
+    // trigger fires (rf433_common.cpp:123), so RF433 receive is unaffected by
+    // this removal. Rf433Gpio::init() itself is unchanged and still correct --
+    // it simply has no caller until Task 6 (RF433 transmit/replay) is built,
+    // at which point that feature calls it when its screen starts
+    // transmitting.
 
     // ---- ESP32-C6 radio co-processor ---------------------------------------
     // One bounded attempt at the shared esp-hosted SDIO link, with the result

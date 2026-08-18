@@ -3,6 +3,9 @@
 #include "io_expander.h"
 #include <Wire.h>
 #include <Arduino.h>
+#include <esp32-hal-periman.h> // perimanGetPinBusType() -- see
+                                // externalI2CPinStillOwnedByI2C() below for why
+                                // this file needs to ask who owns GPIO53
 
 // ===========================================================================
 // Task 18 real-hardware research: which bus, which addresses, which chips
@@ -110,13 +113,63 @@ void ensureExternalPortPowered() {
     delay(TAB5_EXT_5V_SETTLE_MS);
 }
 
+// True while GPIO53 is still registered to the Arduino peripheral manager as
+// this bus's I2C SDA line. Goes false the moment anything else claims the pin.
+//
+// WHY THIS EXISTS (real incident, 2026-08-18, Phase 3 Task 2 Step 3's first
+// attempt): GPIO53 is simultaneously TAB5_EXTERNAL_I2C_SDA_GPIO,
+// TAB5_RF433T_PIN and TAB5_RF433R_PIN -- one physical pin, because PORT.A is
+// one physical socket holding one unit at a time. Any pinMode() on it (which
+// Rf433Gpio::init() and Rf433Common::capture_start() both do) routes through
+// perimanSetPinBus(pin, ESP32_BUS_TYPE_GPIO, ...) at
+// cores/esp32/esp32-hal-gpio.c:161, and perimanSetPinBus() calls the previous
+// owner's deinit callback before reassigning
+// (cores/esp32/esp32-hal-periman.c:174-183). For an I2C SDA pin that callback
+// is i2cDetachBus() -> i2cDeinit(), which DELETES THE ENTIRE Wire1 MASTER BUS.
+// The symptom is `esp32-hal-i2c-ng.c: bus is not initialized` on a bus that
+// was working seconds earlier.
+//
+// The bare `s_external_bus_begun` latch could not see that: it recorded "we
+// called begin() once", which stayed true after the peripheral underneath it
+// had been destroyed, so every later call short-circuited into a dead bus for
+// the rest of the boot. Asking the peripheral manager who currently owns the
+// pin is the direct question, and it is cheap (an array lookup).
+bool externalI2CPinStillOwnedByI2C() {
+    return perimanGetPinBusType(TAB5_EXTERNAL_I2C_SDA_GPIO) ==
+           ESP32_BUS_TYPE_I2C_MASTER_SDA;
+}
+
+void beginExternalI2C() {
+    // Safe to call again after a teardown: TwoWire::begin() only short-circuits
+    // ("Bus already started in Master Mode", Wire.cpp:299-303) when
+    // i2cIsInit() is true -- and the i2cDeinit() that stole the pin is exactly
+    // what cleared that flag. When it is false, begin() re-runs initPins() and
+    // i2cInit() in full, which re-registers GPIO53/54 with the peripheral
+    // manager and rebuilds the bus. So no explicit "release the pin back"
+    // step is needed on the RF433 side; the I2C side re-claims what it needs,
+    // when it needs it.
+    Wire1.begin(TAB5_EXTERNAL_I2C_SDA_GPIO, TAB5_EXTERNAL_I2C_SCL_GPIO);
+    Wire1.setClock(TAB5_EXTERNAL_I2C_FREQ_HZ);
+}
+
 void ensureExternalI2CBegun() {
     if (s_external_bus_begun) {
+        if (externalI2CPinStillOwnedByI2C()) {
+            return;
+        }
+        // Recovery path. The EXT_5V_EN power gate is deliberately NOT
+        // re-asserted here: it is a bit on the PI4IOE5V6408 IO-expander on the
+        // INTERNAL bus, which nothing on GPIO53 can disturb, so it is still
+        // set and re-running it would only cost a pointless 200 ms settle.
+        Serial.printf("quarky-tab5: external I2C bus was torn down -- GPIO%d is "
+                      "no longer owned by I2C (an RF433 pinMode() will do this; "
+                      "see hal/rf433_gpio.cpp). Re-initializing Wire1.\n",
+                      TAB5_EXTERNAL_I2C_SDA_GPIO);
+        beginExternalI2C();
         return;
     }
     ensureExternalPortPowered();
-    Wire1.begin(TAB5_EXTERNAL_I2C_SDA_GPIO, TAB5_EXTERNAL_I2C_SCL_GPIO);
-    Wire1.setClock(TAB5_EXTERNAL_I2C_FREQ_HZ);
+    beginExternalI2C();
     s_external_bus_begun = true;
 }
 

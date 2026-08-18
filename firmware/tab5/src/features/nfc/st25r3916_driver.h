@@ -18,7 +18,6 @@ namespace St25r3916 {
 // and MUST NOT be part of a pass/fail comparison, since a different silicon
 // revision of the very same part reports a different value there.
 constexpr uint8_t kIcIdentityIcTypeMask  = 0x1FU << 3; // 0xF8
-constexpr uint8_t kIcIdentityIcTypeShift = 3U;
 constexpr uint8_t kIcTypeSt25r3916       = 5U << 3;    // 0x28 -- 00101b
 constexpr uint8_t kIcTypeSt25r3916B      = 6U << 3;    // 0x30 -- 00110b
 constexpr uint8_t kIcIdentityIcRevMask   = 0x07U;

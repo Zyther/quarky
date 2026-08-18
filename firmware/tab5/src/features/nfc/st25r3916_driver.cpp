@@ -28,6 +28,10 @@
 //        - Sec 4.3.4   "I2C interface"             (p.53-57) -- "The I2C
 //                       address is 50h"; register write/read use "the same
 //                       Register Write/Read mode byte as for SPI"
+//        - Figure 20   "Writing a single register"   (p.54) -- the I2C
+//                       register-write byte order used by write_register()
+//        - Figure 25   "Sending a direct command"    (p.56) -- the one-byte
+//                       I2C direct-command frame used by execute_command()
 //        - Figure 26   "Read and Write mode for register space-B access"
 //                       (p.56) -- the only figure whose legend spells the
 //                       framing out in words: "S: Start, Sr: repeated Start,
@@ -232,11 +236,18 @@ bool write_register(uint8_t reg, uint8_t val) {
     if (reg > kMaxSpaceARegister) {
         return false;
     }
-    // [DS] Sec 4.3.4 / Figure 20: S, slave addr+W, <00 A5..A0>, data, P.
+    // [DS] Sec 4.3.4 / Figure 20 "Writing a single register": S, slave addr+W,
+    // <00 A5..A0>, data, P.
     Wire1.beginTransmission(kI2cAddr);
-    Wire1.write(static_cast<uint8_t>(reg | kModeWrite));
-    Wire1.write(val);
-    return Wire1.endTransmission(true) == 0;
+    // Checked for the same reason readRegisterRaw() checks: consistency, and
+    // because a short write would otherwise send a mode byte with no data and
+    // report success. In practice 2 bytes never fail to enqueue into the
+    // 128-byte TX buffer, so this is belt-and-braces rather than a live risk.
+    const bool queued = (Wire1.write(static_cast<uint8_t>(reg | kModeWrite)) == 1) &&
+                        (Wire1.write(val) == 1);
+    const bool sent = (Wire1.endTransmission(true) == 0); // always run: releases
+                                                          // the Wire1 lock
+    return queued && sent;
 }
 
 bool execute_command(uint8_t cmd) {
@@ -346,21 +357,40 @@ bool field_on() {
     }
 
     bool osc_ok = false;
+    // Track whether the polling loop ever managed to READ the register at all.
+    // Without this, "the oscillator never stabilised" and "I2C was dead for the
+    // whole 10 ms" produce the identical message, and they call for opposite
+    // investigations (a crystal/analog problem vs. a bus problem -- and on this
+    // board a torn-down Wire1 is a live possibility, see hal/rf433_gpio.cpp's
+    // GPIO53 note).
+    bool aux_read_ok = false;
+    uint8_t aux = 0;
     const uint32_t deadline = millis() + kOscStableTimeoutMs;
     do {
-        uint8_t aux = 0;
-        if (read_register(kRegAuxDisplay, &aux) && (aux & kAuxDisplayOscOk) != 0) {
-            osc_ok = true;
-            break;
+        if (read_register(kRegAuxDisplay, &aux)) {
+            aux_read_ok = true;
+            if ((aux & kAuxDisplayOscOk) != 0) {
+                osc_ok = true;
+                break;
+            }
         }
     } while ((int32_t)(millis() - deadline) < 0);
 
     if (!osc_ok) {
         // [REF] OscOn() returns ERR_SYSTEM in exactly this case. Do not press
         // on and enable the transmitter against an unstable carrier.
-        Serial.printf("quarky-tab5: [st25r3916] oscillator did not report "
-                      "osc_ok (aux_display 0x31 bit 4) within %u ms -- field "
-                      "NOT enabled\n", (unsigned)kOscStableTimeoutMs);
+        if (aux_read_ok) {
+            Serial.printf("quarky-tab5: [st25r3916] oscillator did not report "
+                          "osc_ok within %u ms -- aux_display (0x31) last read "
+                          "0x%02X, bit 4 clear. The chip is talking; the "
+                          "crystal is not stabilising. Field NOT enabled\n",
+                          (unsigned)kOscStableTimeoutMs, aux);
+        } else {
+            Serial.printf("quarky-tab5: [st25r3916] could not read aux_display "
+                          "(0x31) even once in %u ms -- this is an I2C failure, "
+                          "NOT an oscillator problem. Field NOT enabled\n",
+                          (unsigned)kOscStableTimeoutMs);
+        }
         return false;
     }
 
