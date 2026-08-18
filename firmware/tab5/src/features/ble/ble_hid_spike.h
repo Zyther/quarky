@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef> // size_t (kMaxDeviceNameLen)
 #include <cstdint> // uint8_t (send_key()'s keycode parameter, added Task 15)
 
 // -----------------------------------------------------------------------------
@@ -50,6 +51,35 @@
 // -----------------------------------------------------------------------------
 namespace BleHidSpike {
 
+// Real budget inside the 31-byte legacy BLE advertisement start_advertising()
+// (ble_hid_spike.cpp) builds: flags(3) + appearance(4) + one 16-bit service
+// UUID(4) + the name AD structure's own length+type header(2) = 13 bytes of
+// fixed overhead, leaving 18 bytes for the name text itself. set_device_name()
+// enforces this by truncating; exposed here too so a caller-side textarea
+// (ble_bad_kb.cpp) can cap input at the same real limit instead of guessing
+// or duplicating the arithmetic.
+constexpr size_t kMaxDeviceNameLen = 18;
+
+// Sets the name the NEXT start() call advertises under and points the GAP
+// Device Name characteristic at. Does not affect an already-advertising
+// session -- call before start(), not after (matches this codebase's
+// generally-established "config the state, then start" ordering, e.g.
+// ble_karma.cpp's identity setup before rotate_identity()). Silently
+// truncated to kMaxDeviceNameLen characters regardless of what's passed in --
+// see that constant's own comment. A null or empty name resets to "QuarkyKB",
+// the fixed name every caller got before this setter existed, so main.cpp's
+// 'h' serial-debug trigger (which never calls this) keeps its original,
+// real-hardware-proven behavior unchanged.
+void set_device_name(const char *name);
+
+// The name the next start() call will advertise under -- whatever
+// set_device_name() last set (after its own truncation/empty-fallback), or
+// "QuarkyKB" if it was never called. Lets a caller (BleBadKbFeature's status
+// label) display the name that will actually go out, including the
+// empty-input-falls-back-to-default case, without keeping its own duplicate
+// copy that could drift from this file's real truncation/fallback logic.
+const char *device_name();
+
 // Queues the HID GATT service for registration. Does ONLY
 // ble_gatts_count_cfg() + ble_gatts_add_svcs() -- never ble_gatts_start().
 //
@@ -75,10 +105,11 @@ namespace BleHidSpike {
 // "Send" button can never work.
 void register_service();
 
-// Begins advertising as "QuarkyKB" with the HID appearance and the 0x1812
-// service UUID, and points the GAP Device Name characteristic at "QuarkyKB"
-// too (several host stacks read it post-connect rather than trusting the
-// advertised name). Safe to call twice -- the second call is a no-op while
+// Begins advertising under device_name()'s current name (default "QuarkyKB"
+// if set_device_name() was never called) with the HID appearance and the
+// 0x1812 service UUID, and points the GAP Device Name characteristic at the
+// same name too (several host stacks read it post-connect rather than
+// trusting the advertised name). Safe to call twice -- the second call is a no-op while
 // already advertising or connected. Also safe to call from a real
 // launcher-tile open/close flow (BleBadKbFeature's build_screen(), not just
 // a one-shot serial trigger) -- see ble_bad_kb.cpp's own comment at its

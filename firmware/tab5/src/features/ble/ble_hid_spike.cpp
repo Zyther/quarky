@@ -81,7 +81,13 @@ static const uint8_t kHidInfo[4] = {0x11, 0x01, 0x00, 0x02};
 // Report Reference (0x2908) for the input report: report ID 0, type 1 = Input.
 static const uint8_t kReportRef[2] = {0x00, 0x01};
 
-static const char kDeviceName[] = "QuarkyKB";
+// Runtime-mutable, unlike the true constants above (kReportMap etc.) -- Task
+// "device-name textbox" (BLE Bad-KB UI) needs the advertised name settable
+// per session. Main-task-only (read in start_advertising()/start(), written
+// only from set_device_name(), which is documented as a pre-start() call --
+// see ble_hid_spike.h), so no locking, same reasoning as s_svc_queued.
+// kMaxDeviceNameLen (ble_hid_spike.h) + 1 for the null terminator.
+static char s_device_name[kMaxDeviceNameLen + 1] = "QuarkyKB";
 
 // Written on the NimBLE host task, read on the main task -- single-word
 // scalars crossing a real task boundary, so volatile, per the house rule
@@ -105,8 +111,8 @@ static volatile bool s_notify_warn_logged = false;
 // whether a disconnect should resume advertising -- so volatile for the same
 // reason. Without that read, stop() would not stop: ble_gap_terminate()'s
 // asynchronous BLE_GAP_EVENT_DISCONNECT used to re-advertise unconditionally,
-// putting "QuarkyKB" back on the air milliseconds after stop() returned
-// (task-2-review.md finding I1).
+// putting the HID advertisement back on the air milliseconds after stop()
+// returned (task-2-review.md finding I1).
 static volatile bool s_advertising = false;
 
 // Finding I6 (2026-08-17): true once start() has called ble_gap_adv_stop() to
@@ -385,11 +391,14 @@ static int gap_event_cb(struct ble_gap_event *event, void *) {
 // Returns the ble_gap_adv_start() return code (or the earlier failure's), so
 // start() can keep s_advertising honest instead of assuming success.
 static int start_advertising() {
-    // Budget check against the 31-byte legacy advertisement limit:
-    //   flags 3 + appearance 4 + one 16-bit UUID 4 + "QuarkyKB" 10 = 21 bytes.
-    // The 0x1812 UUID is what makes an OS classify the device as HID BEFORE
-    // connecting; appearance alone is a hint, not a classification, so both are
-    // in the primary advertisement rather than a scan response.
+    // Budget check against the 31-byte legacy advertisement limit: flags 3 +
+    // appearance 4 + one 16-bit UUID 4 + name AD header 2 = 13 bytes fixed
+    // overhead, leaving kMaxDeviceNameLen (18) bytes for s_device_name --
+    // set_device_name() enforces that cap on the way in, so strlen() here can
+    // never exceed it. The 0x1812 UUID is what makes an OS classify the
+    // device as HID BEFORE connecting; appearance alone is a hint, not a
+    // classification, so both are in the primary advertisement rather than a
+    // scan response.
     struct ble_hs_adv_fields fields;
     memset(&fields, 0, sizeof(fields));
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
@@ -398,8 +407,8 @@ static int start_advertising() {
     fields.uuids16_is_complete = 1;
     fields.appearance = 0x03C1; // Keyboard (Human Interface Device category)
     fields.appearance_is_present = 1;
-    fields.name = (const uint8_t *)kDeviceName;
-    fields.name_len = (uint8_t)(sizeof(kDeviceName) - 1);
+    fields.name = (const uint8_t *)s_device_name;
+    fields.name_len = (uint8_t)strlen(s_device_name);
     fields.name_is_complete = 1;
 
     int rc = ble_gap_adv_set_fields(&fields);
@@ -422,8 +431,8 @@ static int start_advertising() {
     // the failure class this task exists to avoid (review finding I2).
     rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER,
                            &adv_params, gap_event_cb, nullptr);
-    Serial.printf("quarky-tab5: [ble-hid-spike] ble_gap_adv_start rc=%d (own addr type=%u)%s\n",
-                  rc, s_own_addr_type, rc == 0 ? " -- advertising as \"QuarkyKB\"" : "");
+    Serial.printf("quarky-tab5: [ble-hid-spike] ble_gap_adv_start rc=%d (own addr type=%u, name=\"%s\")\n",
+                  rc, s_own_addr_type, s_device_name);
 
     // Real-hardware verification diagnostic: log the exact address this
     // advertises under, same reasoning as ble_spam.cpp's equivalent -- lets a
@@ -443,6 +452,24 @@ static int start_advertising() {
 }
 
 // ---- Public API -------------------------------------------------------------
+
+void set_device_name(const char *name) {
+    if (name == nullptr || name[0] == '\0') {
+        // strncpy's source and dest here are both compile-time-sized and
+        // "QuarkyKB" is well under kMaxDeviceNameLen, so this can't truncate.
+        strncpy(s_device_name, "QuarkyKB", sizeof(s_device_name) - 1);
+    } else {
+        strncpy(s_device_name, name, kMaxDeviceNameLen);
+    }
+    s_device_name[sizeof(s_device_name) - 1] = '\0'; // strncpy does not
+                                                       // null-terminate when
+                                                       // the source is >=
+                                                       // the length given
+}
+
+const char *device_name() {
+    return s_device_name;
+}
 
 void register_service() {
     // Real-hardware finding (2026-08-14): with encryption required on the
@@ -557,18 +584,22 @@ bool start() {
         return false;
     }
 
-    // Point the GAP Device Name characteristic at "QuarkyKB" too. Unconditional
-    // (not gated on first-run state) so a stop() -> start() cycle cannot leave
-    // the device advertising as "QuarkyKB" while 0x1800 still reads
-    // c2link_ble's name -- the post-connect mismatch this call exists to
-    // prevent (review finding M2). The strcmp guard keeps a repeated start()
-    // from snapshotting our own name as the one to restore.
+    // Point the GAP Device Name characteristic at s_device_name too.
+    // Unconditional (not gated on first-run state) so a stop() -> start()
+    // cycle cannot leave the device advertising under a new name while 0x1800
+    // still reads c2link_ble's name -- the post-connect mismatch this call
+    // exists to prevent (review finding M2). The strcmp guard keeps a
+    // repeated start() from snapshotting our own name as the one to restore
+    // (matters more now than at the original fix: set_device_name() can
+    // change s_device_name between calls, but the name GAP currently holds
+    // from THIS spike's own prior start() is still never the right thing to
+    // save as "previous").
     const char *prev = ble_svc_gap_device_name();
-    if (prev != nullptr && strcmp(prev, kDeviceName) != 0) {
+    if (prev != nullptr && strcmp(prev, s_device_name) != 0) {
         strncpy(s_prev_device_name, prev, sizeof(s_prev_device_name) - 1);
         s_prev_device_name[sizeof(s_prev_device_name) - 1] = '\0';
     }
-    rc = ble_svc_gap_device_name_set(kDeviceName);
+    rc = ble_svc_gap_device_name_set(s_device_name);
     if (rc != 0) {
         Serial.printf("quarky-tab5: [ble-hid-spike] device_name_set rc=%d\n", rc);
     }

@@ -57,39 +57,53 @@ static uint8_t keycode_for(char c) {
 }
 
 static lv_obj_t *s_status_label = nullptr;
+static lv_obj_t *s_name_input = nullptr;
 static lv_obj_t *s_script_input = nullptr;
 static lv_obj_t *s_keyboard = nullptr;
 static bool s_last_connected = false;
-// True iff BleHidSpike::start() reported real success (see build_screen()).
-// Task 15 review-round finding (Important): build_screen() used to set the
-// status label to "Advertising as QuarkyKB..." UNCONDITIONALLY, before even
-// checking start()'s outcome -- but start() has four real early-return
-// failure paths (NimBLE host not synced, e.g. this project's own "radios
-// disabled for this boot" mode; the HID service never got queued; already
-// advertising; a host is already connected from a still-live prior session,
-// see the reopen-race note at the start() call site below). Two of those are
-// reachable in normal use, and the label was lying in both -- exactly the
-// "false negative reads as success" outcome ble_hid_spike.cpp's own
-// send_key() "refuse rather than lie" guard exists to prevent at the
-// transport layer, reintroduced one level up in this UI. update_status_label()
-// now derives the label from s_last_connected/s_advertise_ok together instead
-// of asserting one fixed string.
+// True iff BleHidSpike::start() reported real success (see the Start
+// button's click handler, below). Task 15 review-round finding (Important):
+// build_screen() used to set the status label to "Advertising as
+// QuarkyKB..." UNCONDITIONALLY, before even checking start()'s outcome --
+// but start() has four real early-return failure paths (NimBLE host not
+// synced, e.g. this project's own "radios disabled for this boot" mode; the
+// HID service never got queued; already advertising; a host is already
+// connected from a still-live prior session, see the reopen-race note at the
+// start() call site below). Two of those are reachable in normal use, and
+// the label was lying in both -- exactly the "false negative reads as
+// success" outcome ble_hid_spike.cpp's own send_key() "refuse rather than
+// lie" guard exists to prevent at the transport layer, reintroduced one
+// level up in this UI. update_status_label() now derives the label from
+// s_last_connected/s_advertise_ok together instead of asserting one fixed
+// string.
 static bool s_advertise_ok = false;
+// True from the moment "Start" is first tapped this screen-open, until
+// teardown. Distinguishes "never attempted" (a fresh screen open, before the
+// device-name textbox has even been used) from "attempted and failed" for
+// update_status_label() -- both are !s_last_connected && !s_advertise_ok,
+// but they need different text: a fresh open showing "Not paired -- cannot
+// send" before the user has done anything would read as an unexplained
+// error, not an invitation to type a name and tap Start.
+static bool s_start_attempted = false;
 
-// Single source of truth for the status label's text, called both once (at
-// screen build, after BleHidSpike::start()'s real result is known) and on
-// every subsequent connection-state change from poll(). Connected always
-// wins (a host being connected is true regardless of why start() itself
-// returned false -- see the "already connected" case in start()'s own
-// comment: that failure path means a PRIOR session's connection is still
-// live, which is still a real, working pairing from this label's point of
-// view).
+// Single source of truth for the status label's text, called once at screen
+// build (before Start has ever been tapped) and again after every Start tap
+// and on every connection-state change from poll(). Connected always wins (a
+// host being connected is true regardless of why start() itself returned
+// false -- see the "already connected" case in start()'s own comment: that
+// failure path means a PRIOR session's connection is still live, which is
+// still a real, working pairing from this label's point of view).
 static void update_status_label() {
     if (!s_status_label) return;
     if (s_last_connected) {
         lv_label_set_text(s_status_label, "Paired");
     } else if (s_advertise_ok) {
-        lv_label_set_text(s_status_label, "Advertising as QuarkyKB...");
+        char buf[48]; // "Advertising as \"" + up to kMaxDeviceNameLen (18)
+                      // name bytes + "\"..." + '\0' comfortably fits
+        snprintf(buf, sizeof(buf), "Advertising as \"%s\"...", BleHidSpike::device_name());
+        lv_label_set_text(s_status_label, buf);
+    } else if (!s_start_attempted) {
+        lv_label_set_text(s_status_label, "Enter a name and tap Start");
     } else {
         lv_label_set_text(s_status_label, "Not paired -- cannot send");
     }
@@ -175,10 +189,11 @@ static lv_obj_t *build_screen() {
 
     s_status_label = lv_label_create(content);
     lv_label_set_text(s_status_label, "..."); // corrected below, right after
-                                               // BleHidSpike::start()'s real
-                                               // result is known -- never
-                                               // asserted as "Advertising"
-                                               // ahead of that (see
+                                               // s_last_connected/
+                                               // s_start_attempted are set --
+                                               // never asserted as
+                                               // "Advertising" ahead of a
+                                               // real start() result (see
                                                // s_advertise_ok's comment)
     s_last_connected = BleHidSpike::is_connected(); // a prior session's
                                                       // connection can already
@@ -186,6 +201,64 @@ static lv_obj_t *build_screen() {
                                                       // reopen-race case) --
                                                       // check reality, don't
                                                       // assume false
+    s_advertise_ok = false;    // this screen-open hasn't started anything yet
+    s_start_attempted = false;
+
+    // Device-name input -- Task "device-name textbox" (BLE Bad-KB UI): the
+    // name this HID device broadcasts under, previously a fixed "QuarkyKB"
+    // baked into ble_hid_spike.cpp. Placeholder (not pre-filled text) shows
+    // the real default so an empty submit still does something sensible --
+    // BleHidSpike::set_device_name() falls back to "QuarkyKB" on an empty
+    // name for exactly that reason. max_length is BleHidSpike's own
+    // kMaxDeviceNameLen, the real legacy-advertisement byte budget (see its
+    // comment in ble_hid_spike.h) -- truncating visibly at the widget rather
+    // than silently wherever the name is next used, same rationale as the
+    // script textarea's own max_length just below.
+    s_name_input = lv_textarea_create(content);
+    lv_textarea_set_one_line(s_name_input, true);
+    lv_textarea_set_placeholder_text(s_name_input, "QuarkyKB");
+    lv_textarea_set_max_length(s_name_input, BleHidSpike::kMaxDeviceNameLen);
+    lv_obj_add_event_cb(s_name_input, [](lv_event_t *) {
+        lv_keyboard_set_textarea(s_keyboard, s_name_input);
+        lv_obj_clear_flag(s_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }, LV_EVENT_FOCUSED, nullptr);
+
+    lv_obj_t *start_btn = lv_button_create(content);
+    lv_obj_t *start_label = lv_label_create(start_btn);
+    lv_label_set_text(start_label, "Start");
+    lv_obj_add_event_cb(start_btn, [](lv_event_t *) {
+        // Empty text falls through to BleHidSpike::set_device_name()'s own
+        // null/empty -> "QuarkyKB" fallback (see its comment in
+        // ble_hid_spike.h) -- this handler doesn't need its own default
+        // string, just don't call set_device_name() with a dangling read of
+        // an empty buffer's contents (lv_textarea_get_text() never returns
+        // nullptr for a live textarea, so passing it straight through is
+        // safe either way).
+        BleHidSpike::set_device_name(lv_textarea_get_text(s_name_input));
+        s_start_attempted = true;
+
+        // Reuses BleHidSpike's own proven advertise path (Task 2,
+        // real-hardware confirmed) instead of any inlined raw
+        // ble_gap_adv_set_fields()/ble_gap_adv_start() -- see this file's
+        // header comment. Bool return is checked (Task 15 review-round
+        // finding, Important): start() has four real early-return failure
+        // paths (host not synced, service never queued, already
+        // advertising, host already connected), and asserting "Advertising"
+        // without checking would repeat the exact "false negative reads as
+        // success" bug that finding fixed once already. One residual,
+        // pre-existing timing note: stop()'s ble_gap_terminate() (previous
+        // session's teardown) raises BLE_GAP_EVENT_DISCONNECT
+        // asynchronously, so tapping Start again immediately after a very
+        // recent disconnect can hit the "already connected" guard and
+        // return false here -- but s_last_connected (set at screen-build,
+        // above) already reflects that a host IS in fact still connected in
+        // that exact case, so update_status_label() below correctly shows
+        // "Paired" rather than this call's own false result.
+        s_advertise_ok = BleHidSpike::start();
+        Serial.printf("quarky-tab5: [ble-bad-kb] Start tapped, name=\"%s\", "
+                      "advertise_ok=%d\n", BleHidSpike::device_name(), (int)s_advertise_ok);
+        update_status_label();
+    }, LV_EVENT_CLICKED, nullptr);
 
     s_script_input = lv_textarea_create(content);
     lv_textarea_set_placeholder_text(s_script_input, "STRING hello world\nENTER");
@@ -249,39 +322,38 @@ static lv_obj_t *build_screen() {
     // every LVGL pointer + in-flight typing state so poll() cannot touch
     // freed widgets after ScreenStack::pop() destroys them. Same pattern
     // ble_spam.cpp/ble_scan.cpp use for their own LV_EVENT_DELETE teardown.
+    //
+    // Guarded on s_start_attempted -- new with the device-name-textbox
+    // redesign, and load-bearing, not defensive: build_screen() used to call
+    // BleHidSpike::start() unconditionally, so stop() always had a matching
+    // prior start() to undo. Now Start is opt-in, so a user can open this
+    // screen and back out without ever tapping it -- BleHidSpike::start()
+    // was never called, so it never took the C2 advertisement's slot
+    // (s_took_adv_slot stayed false). Calling stop() unconditionally in that
+    // case would still run its own ble_gap_adv_stop(), which -- with nothing
+    // else claiming the radio -- would stop C2's actual live advertisement,
+    // and then skip the re-arm (guarded on that same s_took_adv_slot),
+    // leaving C2 permanently unadvertised until reboot. Skipping stop()
+    // entirely when Start was never tapped avoids ever touching NimBLE for a
+    // screen-open that never touched it either.
     lv_obj_add_event_cb(content, [](lv_event_t *) {
-        BleHidSpike::stop();
+        if (s_start_attempted) BleHidSpike::stop();
         s_status_label = nullptr;
+        s_name_input = nullptr;
         s_script_input = nullptr;
         s_keyboard = nullptr;
         s_typing = false;
         s_advertise_ok = false;
+        s_start_attempted = false;
     }, LV_EVENT_DELETE, nullptr);
 
-    // Reuses BleHidSpike's own proven advertise path (Task 2, real-hardware
-    // confirmed) instead of any inlined raw ble_gap_adv_set_fields()/
-    // ble_gap_adv_start() -- see this file's header comment. Safe to call
-    // from a real open/close (not just one-shot serial-trigger) flow: read
-    // start()'s implementation (ble_hid_spike.cpp) to confirm -- it already
-    // guards on c2link_ble_host_synced(), the service having been queued at
-    // boot, already-advertising, and an existing connection, and only claims
-    // s_advertising=true if ble_gap_adv_start() actually returned 0 (finding
-    // M1's fix).
-    //
-    // Its bool return is now checked (Task 15 review-round finding, Important):
-    // previously this file ignored it entirely and hardcoded the label to
-    // "Advertising as QuarkyKB...", which lied whenever any of start()'s four
-    // early-return paths fired. The one residual, pre-existing timing note
-    // (not introduced by this feature): stop()'s ble_gap_terminate() raises
-    // BLE_GAP_EVENT_DISCONNECT asynchronously, so reopening this screen
-    // immediately after closing it while a previous connection's disconnect
-    // is still in flight can hit start()'s "a host is already connected"
-    // guard and return false here -- but s_last_connected (set above, before
-    // this call) already reflects that a host IS in fact still connected in
-    // that exact case, so update_status_label() below correctly shows
-    // "Paired" rather than the stale, uninformative label this used to show;
-    // there is no separate fix needed for that race beyond this one.
-    s_advertise_ok = BleHidSpike::start();
+    // Device-name-textbox redesign: BleHidSpike::start() is no longer called
+    // here unconditionally -- it now only runs from the Start button's own
+    // LV_EVENT_CLICKED handler above, once a name is available to hand it.
+    // This just renders whichever initial state applies (a still-live prior
+    // connection from the reopen-race case, or the fresh "enter a name and
+    // tap Start" prompt) via the same single-source-of-truth label function
+    // every later state change uses too.
     update_status_label();
 
     return screen;
