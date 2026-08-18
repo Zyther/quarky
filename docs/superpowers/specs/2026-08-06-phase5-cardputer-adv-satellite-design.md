@@ -1,21 +1,13 @@
-# Phase 5: Cardputer-ADV Satellite — IR, CC1101 Hydra-Hat, nRF24 — Design
+# Phase 5: Cardputer-ADV Satellite — CC1101 Hydra-Hat, nRF24 — Design
 
 **Status:** Draft for review
-**Date:** 2026-08-06
+**Date:** 2026-08-06 (IR scope removed 2026-08-18 — see note below)
 **Depends on:** Phase 1 Foundation — Cardputer-ADV `Device` HAL, `IC2Link`/`CommandDispatcher`, `LocalMenu` baseline, `FeatureModule` contract with `Affinity::CARDPUTER_ADV`, Tab5's descriptor-side pattern from Phase 1 Task 20 (ping feature).
-**Scope:** IR (Cardputer-ADV's own transmit LED), CC1101 sub-GHz (hydra hat, 433MHz-tuned but usable ~300–900MHz), nRF24 (hydra hat) — all remotely controllable from the Tab5 UI, while remaining usable standalone from Cardputer-ADV's own screen/keyboard.
+**Scope:** CC1101 sub-GHz (hydra hat, 433MHz-tuned but usable ~300–900MHz), nRF24 (hydra hat) — all remotely controllable from the Tab5 UI, while remaining usable standalone from Cardputer-ADV's own screen/keyboard.
+
+**IR scope removed (2026-08-18):** this section originally also covered IR via Cardputer-ADV's own onboard transmit LED (GPIO 44, active-low, transmit-only — see git history for the original Section 1 IR table if useful as a donor-reference pointer later). The project owner redirected IR entirely to a dedicated I2C IR receiver/transmitter HY2.0 unit on the Tab5 instead — see Phase 3's spec, which now owns IR. Reasons: Cardputer-ADV's hardware story was weak (transmit-only, receive-diode presence on this specific unit never confirmed) versus a purpose-built receive+transmit unit; and IR fits Phase 3's existing "Tab5-native HY2.0 I2C peripheral" pattern (NFC/RFID2/RF433 units) rather than needing its own Cardputer-ADV-side GPIO driver.
 
 ## 1. Feature Inventory and Source Mapping
-
-### IR
-| Feature | Donor reference | Notes |
-|---|---|---|
-| TV-B-Gone | Bruce `src/modules/ir/`, Poseidon `ir_tvbgone.cpp` | Static code-database transmit, simplest feature in this phase |
-| IR receive/decode | Bruce (`IRremoteESP8266` fork), Poseidon `ir_learn.cpp`/`ir_learn_decode.cpp` | |
-| Universal remote / multi-profile clone (Samsung/LG/Sony) | Poseidon `ir_clone.cpp/.h`, UniGeek Flipper-IRDB-compatible database | UniGeek's Flipper-IRDB compatibility is the most valuable single piece to port here — gives access to a large existing community remote database instead of hand-building one |
-| IR jammer | Bruce | Continuous-noise transmit on the IR LED |
-
-Cardputer-ADV's hardware here is IR-transmit-only (per Poseidon's research: "IR: transmit-only LED (GPIO 44, active-low)") — **IR receive/decode/learn features require confirming whether the specific Cardputer-ADV unit in this kit has an IR receiver diode populated**, since Poseidon's own hardware note only documents transmit. This is the first thing to check before committing to the receive/decode/clone rows above; if receive-only Cardputer-ADV units exist, TV-B-Gone and jammer (transmit-only) still work regardless.
 
 ### CC1101 (hydra hat, tuned 433MHz, usable ~300–900MHz per owner's hardware notes)
 | Feature | Donor reference | Notes |
@@ -44,11 +36,6 @@ Cardputer-ADV's hardware here is IR-transmit-only (per Poseidon's research: "IR:
 
 ```
 firmware/cardputer-adv/src/features/
-├── ir/
-│   ├── ir_tvbgone.{h,cpp}
-│   ├── ir_learn.{h,cpp}
-│   ├── ir_clone.{h,cpp}          # Flipper-IRDB-compatible, ported from UniGeek
-│   └── ir_jammer.{h,cpp}
 ├── cc1101/
 │   ├── cc1101_scan.{h,cpp}
 │   ├── cc1101_record.{h,cpp}     # .sub format read/write
@@ -103,7 +90,6 @@ Recommend implementing (1) first for standalone parity, then (2) as a natural en
 
 ## 3. Risks / Open Questions
 
-- **IR receive hardware presence on this specific Cardputer-ADV unit is unconfirmed** (see Section 1) — resolve before planning receive/decode/clone tasks.
 - **KeeLoq rolling-code replay** is the most legally sensitive feature in this program's full inventory (attacking rolling-code locks, e.g. vehicle/garage systems, is meaningfully different from passive scanning even under an owner's own-equipment authorization) — flagged here for explicit acknowledgment, not blocking, since the project owner has already established authorization for this kind of work.
 - **Hat radio exclusivity UX**: `hat_radio_lock`'s rejection path needs to be genuinely clear to a remote Tab5 user, not just logged locally — this is called out as an explicit Definition of Done item below because it's easy to under-build (a silent no-op) and hard to notice missing until a real remote user hits it.
 
@@ -116,9 +102,8 @@ Recommend implementing (1) first for standalone parity, then (2) as a natural en
 
 ## 5. Definition of Done
 
-1. IR receive-hardware presence confirmed; feature set scoped accordingly (transmit-only vs full receive+transmit).
-2. Every CC1101 feature in Section 1 verified on real 433MHz hardware, including at least one non-433MHz test signal within the hat's usable 300–900MHz range to confirm the "tuned for 433 but usable wider" hardware claim holds for scan/spectrum features.
-3. Every nRF24 feature in Section 1 verified against real 2.4GHz targets.
-4. `hat_radio_lock` conflict rejection verified end-to-end from the Tab5 UI (clear user-facing message, not silent failure).
-5. Capability negotiation correctly reflects live hat-radio state on the Tab5's Devices panel.
-6. At least one feature from each of IR/CC1101/nRF24 verified working identically from Cardputer-ADV's local menu and from Tab5 remote control.
+1. Every CC1101 feature in Section 1 verified on real 433MHz hardware, including at least one non-433MHz test signal within the hat's usable 300–900MHz range to confirm the "tuned for 433 but usable wider" hardware claim holds for scan/spectrum features.
+2. Every nRF24 feature in Section 1 verified against real 2.4GHz targets.
+3. `hat_radio_lock` conflict rejection verified end-to-end from the Tab5 UI (clear user-facing message, not silent failure).
+4. Capability negotiation correctly reflects live hat-radio state on the Tab5's Devices panel.
+5. At least one feature from each of CC1101/nRF24 verified working identically from Cardputer-ADV's local menu and from Tab5 remote control.

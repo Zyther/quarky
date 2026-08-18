@@ -1,23 +1,37 @@
-# Phase 3: Tab5-Native NFC/RFID2/RF433 Peripherals — Design
+# Phase 3: Tab5-Native NFC/RFID2/RF433/IR Peripherals — Design
 
 **Status:** Draft for review
-**Date:** 2026-08-06
+**Date:** 2026-08-06 (IR added, NFC chip-identity corrected 2026-08-18 — see notes below)
 **Depends on:** Phase 1 Foundation — `INFC`/`NfcPN532` and `IRF433`/`Rf433Gpio` HAL (detection-only, Task 18), LVGL shell, `lv_keyboard`, `IStorage`/SD.
-**Scope:** Full feature logic for the Tab5's three HY2.0 units confirmed in hand: NFC unit, RFID2 unit, RF433R (receiver) + RF433T (transmitter) unit. IR is explicitly excluded (Cardputer-ADV only, per owner direction) and Phase 1's peripheral-allocation decision.
+**Scope:** Full feature logic for the Tab5's HY2.0 units: NFC unit, RFID2 unit, RF433R (receiver) + RF433T (transmitter) unit, and (added 2026-08-18) a dedicated I2C IR receiver/transmitter unit.
+
+**IR added (2026-08-18):** originally excluded from this phase (Cardputer-ADV only, per the project owner's original peripheral-allocation direction). The owner redirected IR here instead, having ordered a dedicated I2C IR receiver/transmitter HY2.0 unit for the Tab5 — see Phase 5's spec for the now-removed Cardputer-ADV-side IR section this superseded. Section 1 below adds an IR feature table; Section 2 adds it to the module structure; this phase's implementation plan should treat IR as a fourth peripheral alongside NFC/RFID2/RF433, not a bolt-on.
+
+**NFC unit chip identity corrected (2026-08-18):** this spec originally assumed both the NFC unit and RFID2 unit are PN532-based, sharing the same `NfcPN532`-driven feature code (see the now-corrected Section 2.1 below). Real-hardware research recorded in Phase 1's Task 18 (see `firmware/tab5/src/hal/nfc_pn532.cpp`'s header comment) found this is wrong for the NFC unit: it identifies at I2C `0x50` as an **ST25R3916** (M5Stack's current "Unit NFC" / "NFC Universal Unit"), a different chip family from RFID2's **WS1850S** at `0x28` (a PN532-register-compatible clone chip — that half of the original assumption holds). ST25R3916 has its own register map and command protocol, unrelated to PN532 framing, so the two units need genuinely separate low-level driver code; only the RFID2 unit can realistically reuse PN532-oriented donor logic (Bruce/UniGeek's PN532 modules) directly. This phase's implementation plan must budget for a real ST25R3916 driver (ST's own datasheet/reference code, not a PN532 port) for the NFC-unit half of every feature row in the table below that currently assumes shared code.
 
 ## 1. Feature Inventory and Source Mapping
 
-### NFC / RFID (NFC unit + RFID2 unit, both PN532-based per Phase 1's HAL)
+### NFC / RFID (NFC unit = ST25R3916 @ 0x50, RFID2 unit = WS1850S @ 0x28 — see the chip-identity correction above; NOT both PN532)
 | Feature | Donor reference | Notes |
 |---|---|---|
-| Tag read (UID, type detection) | Bruce `src/modules/rfid/`, UniGeek `screens/module/PN532*Screen` | Baseline — both units use this identically, differentiated by which `NfcPN532` instance (I2C address) is called |
-| MIFARE Classic key recovery (dictionary, nested, darkside attacks) | UniGeek `utils/nfc/` | Most technically involved feature in this phase — nested/darkside attacks are timing-sensitive against the PN532's own firmware, port UniGeek's implementation closely rather than re-deriving |
-| Mifare/Chameleon Ultra-style emulation | Bruce `ESP-ChameleonUltra` (BLE-bridge to external hardware) | **Re-scoped**: Bruce's version bridges to a separate Chameleon Ultra device over BLE, which isn't in this project's hardware inventory. Tab5-native emulation is limited to what the PN532 itself can emulate as a card (MIFARE Classic UID/blocks) — full arbitrary tag emulation is out of scope for this phase, revisit only if a Chameleon Ultra is added to the kit later. |
-| Amiibo read/write | Bruce `ESP-Amiibolink` | Straightforward NTAG215 read/write, no crypto-attack complexity |
+| Tag read (UID, type detection) | Bruce `src/modules/rfid/`, UniGeek `screens/module/PN532*Screen` (RFID2/WS1850S path); ST's own ST25R3916 discovery-loop reference code (NFC-unit path — donor projects don't cover this chip) | **Two separate low-level implementations, one shared UI/result-card layer.** RFID2 can port Bruce/UniGeek's PN532-oriented code fairly directly (WS1850S is register-compatible). The NFC unit needs a real ST25R3916 driver written against ST's own datasheet/app notes — there is no donor reference for this chip in Bruce/Poseidon/UniGeek, so budget real implementation time, not a port. |
+| MIFARE Classic key recovery (dictionary, nested, darkside attacks) | UniGeek `utils/nfc/` | RFID2-unit feature (MIFARE Classic is a WS1850S/PN532-class operation). Most technically involved feature in this phase — nested/darkside attacks are timing-sensitive against the chip's own firmware, port UniGeek's implementation closely rather than re-deriving. Whether the ST25R3916 NFC unit can do the same MIFARE-layer attacks depends on its own command set — confirm during implementation rather than assuming parity with RFID2. |
+| Mifare/Chameleon Ultra-style emulation | Bruce `ESP-ChameleonUltra` (BLE-bridge to external hardware) | **Re-scoped**: Bruce's version bridges to a separate Chameleon Ultra device over BLE, which isn't in this project's hardware inventory. Tab5-native emulation is limited to what the RFID2 unit's chip can itself emulate as a card (MIFARE Classic UID/blocks) — full arbitrary tag emulation is out of scope for this phase, revisit only if a Chameleon Ultra is added to the kit later (see Phase 4). |
+| Amiibo read/write | Bruce `ESP-Amiibolink` | Straightforward NTAG215 read/write, no crypto-attack complexity. NTAG215 is an ISO 14443-A/NFC-Forum-Type-2 tag — confirm which of the two units (or both) can address it during implementation; ST25R3916 is a general NFC reader IC so should support it, don't assume without checking. |
 | SRIX tag tool | Bruce | ISO 14443-B, less common but low-effort port |
-| "Tag-o-matic" generic tag manager (save/load/browse tag library) | Bruce | UI/storage feature more than radio feature — a tag library browser backed by SD |
+| "Tag-o-matic" generic tag manager (save/load/browse tag library) | Bruce | UI/storage feature more than radio feature — a tag library browser backed by SD, shared across both units' read results |
 | EMV/APDU reader | Bruce `emv_reader.hpp`, `apdu.cpp`, `BER-TLV` | Read-only card-data extraction (PAN, expiry, etc. where unencrypted) — no payment/transaction logic |
-| 125kHz / T5577 clean, HID Prox | UniGeek `chameleon/` (via BLE-bridge, same caveat as emulation above); Bruce `rfid125.cpp` | Bruce's `rfid125.cpp` is the relevant reference since it doesn't require external hardware — confirm the RFID2 unit's PN532 variant actually supports 125kHz (some PN532 modules are 13.56MHz-only; if the RFID2 unit is 13.56MHz-only, 125kHz work is out of scope for this phase — verify against the unit's actual datasheet during implementation, don't assume) |
+| 125kHz / T5577 clone, HID Prox | UniGeek `chameleon/` (via BLE-bridge, same caveat as emulation above); Bruce `rfid125.cpp` | Bruce's `rfid125.cpp` is the relevant reference since it doesn't require external hardware — confirm which unit (if either) actually supports 125kHz (WS1850S and ST25R3916 are both primarily 13.56MHz NFC chips per their datasheets; 125kHz LF support is unlikely for either without dedicated LF hardware neither unit is known to have — verify against both units' actual datasheets during implementation, don't assume, and be prepared to drop this row entirely if neither supports it) |
+
+### IR (dedicated I2C IR receiver/transmitter HY2.0 unit — added 2026-08-18, replaces the original Cardputer-ADV-side IR plan; exact chip TBD until the unit arrives, see Section 3 risk)
+| Feature | Donor reference | Notes |
+|---|---|---|
+| TV-B-Gone | Bruce `src/modules/ir/`, Poseidon `ir_tvbgone.cpp` | Static code-database transmit, simplest feature in this section |
+| IR receive/decode/learn | Bruce (`IRremoteESP8266` fork), Poseidon `ir_learn.cpp`/`ir_learn_decode.cpp` | Unlike the original Cardputer-ADV plan (transmit-only LED, receive capability unconfirmed), this dedicated unit is receive+transmit by design — this row is no longer conditional on confirming receive hardware exists, only on confirming the unit's actual I2C protocol once it's in hand |
+| Universal remote / multi-profile clone (Samsung/LG/Sony) | Poseidon `ir_clone.cpp/.h`, UniGeek Flipper-IRDB-compatible database | UniGeek's Flipper-IRDB compatibility is the most valuable single piece to port here — gives access to a large existing community remote database instead of hand-building one |
+| IR jammer | Bruce | Continuous-noise transmit |
+
+Donor projects' IR code (`IRremoteESP8266`-based) universally assumes a GPIO-bit-banged transmit LED and a GPIO receive diode read via a hardware timer/RMT peripheral, not an I2C-attached IR transceiver IC — none of the three donors' IR modules were written against an I2C IR unit. Expect this section's implementation to need a real driver written against the actual unit's datasheet (once in hand), with donor code reused only for the higher-level pieces that don't depend on the transport (protocol timing databases, Flipper-IRDB parsing, code-database formats) — the same "separate low-level driver, shared upper layers" shape as the NFC-unit situation above.
 
 ### RF433 (RF433R + RF433T units — simple GPIO, not CC1101/SPI)
 | Feature | Donor reference | Notes |
@@ -38,22 +52,30 @@
 ```
 firmware/tab5/src/features/
 ├── nfc/
-│   ├── nfc_read.{h,cpp}              # shared by NFC unit + RFID2 unit, parameterized by NfcPN532 instance
-│   ├── nfc_mifare_crack.{h,cpp}      # dictionary/nested/darkside
+│   ├── nfc_read.{h,cpp}               # dispatches to whichever chip driver the target unit uses
+│   ├── nfc_mifare_crack.{h,cpp}       # dictionary/nested/darkside -- RFID2 (WS1850S) only, see Section 1
 │   ├── nfc_amiibo.{h,cpp}
 │   ├── nfc_srix.{h,cpp}
-│   ├── nfc_tag_library.{h,cpp}       # SD-backed save/load/browse
+│   ├── nfc_tag_library.{h,cpp}        # SD-backed save/load/browse, shared across both units' results
 │   ├── nfc_emv_read.{h,cpp}
-│   └── nfc_common.{h,cpp}            # tag-type detection, UID formatting
-└── rf433/
-    ├── rf433_scan.{h,cpp}
-    ├── rf433_replay.{h,cpp}
-    ├── rf433_bruteforce.{h,cpp}
-    ├── rf433_protocol_decode.{h,cpp}  # ported from UniGeek's M5RF433Util as primary reference
-    └── rf433_common.{h,cpp}
+│   ├── nfc_common.{h,cpp}             # tag-type detection, UID formatting -- chip-agnostic
+│   ├── ws1850s_driver.{h,cpp}         # RFID2 unit's real low-level chip driver (PN532-register-compatible)
+│   └── st25r3916_driver.{h,cpp}       # NFC unit's real low-level chip driver (own register map, no donor precedent)
+├── rf433/
+│   ├── rf433_scan.{h,cpp}
+│   ├── rf433_replay.{h,cpp}
+│   ├── rf433_bruteforce.{h,cpp}
+│   ├── rf433_protocol_decode.{h,cpp}  # ported from UniGeek's M5RF433Util as primary reference
+│   └── rf433_common.{h,cpp}
+└── ir/
+    ├── ir_tvbgone.{h,cpp}
+    ├── ir_learn.{h,cpp}
+    ├── ir_clone.{h,cpp}               # Flipper-IRDB-compatible, ported from UniGeek
+    ├── ir_jammer.{h,cpp}
+    └── ir_common.{h,cpp}              # the unit's real low-level I2C driver, once its chip is known
 ```
 
-Two units (NFC, RFID2) share the same feature code — every NFC feature module takes an `INFC&` parameter (or is instantiated twice, once per unit) rather than being duplicated. The Phase 1 launcher UI should let the user pick which physical unit (NFC vs RFID2) to target before entering a feature screen, since both are simultaneously connected and a tag could be presented to either.
+The two NFC-family units (NFC, RFID2) share their feature-logic and UI layer (`nfc_read.cpp` etc.) but NOT their low-level chip driver — `nfc_read.cpp` and friends dispatch to `ws1850s_driver.cpp` or `st25r3916_driver.cpp` depending on which physical unit (`INFC` instance) the user targeted, rather than one shared driver parameterized by I2C address the way the original (incorrect, PN532-for-both) design assumed. The Phase 1 launcher UI should let the user pick which physical unit (NFC vs RFID2) to target before entering a feature screen, since both are simultaneously connected and a tag could be presented to either.
 
 ### 2.2 UI Pattern
 
@@ -63,24 +85,27 @@ Two units (NFC, RFID2) share the same feature code — every NFC feature module 
 
 ### 2.3 Data Format
 
-Tag library and RF433 captures are saved to `/quarky/captures/nfc/` and `/quarky/captures/rf433/` on SD, using the same top-level `/quarky/captures/` convention established in Phase 2 — one consistent capture-storage layout across all Tab5-native feature phases.
+Tag library, RF433 captures, and (added 2026-08-18) IR code captures are saved to `/quarky/captures/nfc/`, `/quarky/captures/rf433/`, and `/quarky/captures/ir/` on SD, using the same top-level `/quarky/captures/` convention established in Phase 2 — one consistent capture-storage layout across all Tab5-native feature phases.
 
 ## 3. Risks / Open Questions
 
+- **NFC unit needs a real ST25R3916 driver with no donor-project precedent** (added 2026-08-18, see the chip-identity correction above) — this is now the single biggest unknown in this phase, bigger than the pre-existing risks below. First implementation task for the NFC-unit half of this phase should be a spike: bring up ST25R3916 register-level communication (chip ID read, basic field-detect) against ST's own datasheet/reference code, before committing to any specific feature's driver logic.
+- **IR unit's exact chip/protocol is unknown until the unit physically arrives** (added 2026-08-18) — this phase's IR tasks cannot start real implementation until then. Once in hand, first step is the same shape as the NFC-unit spike above: identify the chip (I2C address census, datasheet/markings lookup), confirm receive+transmit both work at a bare-protocol level, before building feature logic on top.
 - **RFID2 unit's actual frequency support (13.56MHz vs 125kHz) is unconfirmed.** The 125kHz/T5577/HID-Prox feature row above is contingent on this — first implementation task should be reading the RFID2 unit's actual datasheet/model number and confirming which frequency band(s) it supports before committing to porting Bruce's `rfid125.cpp` logic.
-- **MIFARE nested/darkside attack timing** depends on the PN532's own firmware response latency, which can differ between M5Stack's PN532 unit and whatever PN532 module the Bruce/UniGeek donor projects were tested against — expect some tuning of retry/timeout constants during bring-up rather than a direct drop-in port.
-- **RF433R/T unit's exact GPIO pin assignment on Tab5's HY2.0 ports** was left as a placeholder in the Phase 1 plan (Task 18) — must be resolved before any Phase 3 task starts, since every feature in this phase depends on it.
+- **MIFARE nested/darkside attack timing** depends on the WS1850S's own firmware response latency, which can differ between M5Stack's unit and whatever PN532-class module the Bruce/UniGeek donor projects were tested against — expect some tuning of retry/timeout constants during bring-up rather than a direct drop-in port.
+- **RF433R/T unit's exact GPIO pin assignment is partially resolved**, not fully open like the original text of this risk implied: real-hardware testing during Phase 1 confirmed `TAB5_RF433T_PIN = GPIO53` (independent-listener-verified, high confidence) and set `TAB5_RF433R_PIN = GPIO53` as a same-connector hypothesis, NOT independently confirmed — an earlier `loop()`-polling receive test on GPIO53/54 found no correlated signal, but is now understood as a likely false negative from sampling far too slow for real OOK receive-pulse timing (hundreds of microseconds per bit), not evidence the pin is wrong. This phase's first RF433 task should be a proper interrupt- or timer-driven (not `loop()`-polling) receive test against GPIO53 to actually confirm or refute the hypothesis before building scan/bruteforce features on top of it. See `.superpowers/sdd/2026-08-06-tab5-foundation-plan/progress.md`'s 2026-08-09 entries for the full real-hardware trail.
 
 ## 4. Testing Strategy
 
-- Host-native tests for pure-logic pieces: protocol decode/identify (given a captured raw timing sequence, decode to the correct brand/protocol — table-driven test against known sample captures), tag-library file format read/write round-trip, MIFARE dictionary-attack keyspace iteration logic (without needing real hardware to test the iteration order itself).
-- On-device verification against real tags/fobs and a real 433MHz remote (garage door, doorbell, etc., used only against your own equipment) for read/scan/replay features.
+- Host-native tests for pure-logic pieces: protocol decode/identify (given a captured raw timing sequence, decode to the correct brand/protocol — table-driven test against known sample captures), tag-library file format read/write round-trip, MIFARE dictionary-attack keyspace iteration logic (without needing real hardware to test the iteration order itself), IR code-database/Flipper-IRDB parsing.
+- On-device verification against real tags/fobs, a real 433MHz remote (garage door, doorbell, etc., used only against your own equipment), and (once the unit is in hand) a real IR remote/device for read/scan/replay features.
 - MIFARE crack features verified against a test card with a known, deliberately weak key (common practice: a blank/test MIFARE Classic card programmed with a default key) rather than an unknown target, so success/failure is unambiguous during development.
 
 ## 5. Definition of Done
 
-1. NFC unit and RFID2 unit both independently confirmed working for baseline tag read (UID + type).
+1. NFC unit and RFID2 unit both independently confirmed working for baseline tag read (UID + type), each via its own real chip driver (ST25R3916 / WS1850S respectively).
 2. RFID2 unit's frequency capability confirmed and the 125kHz feature row resolved (implemented or explicitly dropped with a note here).
 3. MIFARE key recovery succeeds against a known-weak test card.
-4. RF433 scan, replay, and bruteforce all verified against real 433MHz hardware you own.
+4. RF433R's receive pin hypothesis (GPIO53) confirmed or refuted via a real interrupt/timer-driven test; RF433 scan, replay, and bruteforce all verified against real 433MHz hardware you own.
 5. Tag/signal library save-and-reload round-trips correctly from the Tab5 UI.
+6. IR unit's chip/protocol identified once in hand; TV-B-Gone, receive/decode, universal-remote clone, and jammer all verified against real IR remotes/devices you own.

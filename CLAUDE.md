@@ -15,15 +15,17 @@ Phase numbers are execution order, **except Phase 10** (see note). Don't infer t
 |---|---|---|---|
 | 1 | Foundation | Both | Complete |
 | 2 | Tab5-Native 2.4GHz WiFi/BLE Suite | Tab5 | Not started |
-| 3 | Tab5-Native NFC/RFID2/RF433 Peripherals | Tab5 | Not started |
+| 3 | Tab5-Native NFC/RFID2/RF433/IR Peripherals | Tab5 | Not started |
 | 4 | Chameleon Ultra 3.0 Integration | Tab5 (BLE-central, fallback via Cardputer-ADV relay) | Not started |
-| 5 | Cardputer-ADV Satellite — IR, CC1101 Hydra-Hat, nRF24 | Cardputer-ADV | Not started |
+| 5 | Cardputer-ADV Satellite — CC1101 Hydra-Hat, nRF24 | Cardputer-ADV | Not started |
 | 6 | GNSS/SX1262 LoRa | Cardputer-ADV | Not started |
 | 7 | ESP32-C5 5GHz Sidecar | C5 (new satellite) | Not started |
 | 8 | Remaining Feature Sweep | Whichever fits | Not started |
 | 10 | Tab5-Native CC1101 via M-Bus | Tab5 | Not started |
 
 Phases 4-8 were renumbered from an original 4-7 spread when Phase 4 (Chameleon Ultra) was inserted on 2026-08-09, per the project owner's explicit direction to sequence it right before Phase 5's real Cardputer-ADV feature work. Phase 10 was deliberately given a non-sequential number (owner's choice, not a numbering mistake) when this hardware became available after the rest of the roadmap was drafted — it has no dependency on Phase 9 (which doesn't exist) and can run whenever its own M-Bus GPIO-mapping risk (see its spec) is resolved.
+
+IR was moved from Phase 5 (Cardputer-ADV) to Phase 3 (Tab5) on 2026-08-18, per the project owner's explicit direction: they're adding a dedicated I2C IR receiver/transmitter HY2.0 unit to the Tab5, replacing the original plan of using Cardputer-ADV's own onboard IR transmit LED (GPIO 44, active-low, transmit-only, receive-diode presence never confirmed — see Phase 5 spec's original Section 1 for that now-superseded hardware story). Phase 3's and Phase 5's specs were both updated accordingly.
 
 ## Process: every phase ends with documentation, not just a Definition-of-Done check
 
