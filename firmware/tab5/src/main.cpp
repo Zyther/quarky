@@ -176,9 +176,10 @@ NfcPN532 rfid2_unit(TAB5_RFID2_I2C_ADDR); // 0x28, CONFIRMED on hardware
                                           // with VersionReg (0x37) = 0x15, and
                                           // did NOT answer a PN532 frame. It is
                                           // a WS1850S, MFRC522/PN512-family.
-                                          // (Was "doc-only" until then: no
-                                          // RFID2 unit was connected during the
-                                          // 2026-08-08 HY2.0 hotfix run.)
+                                          // (The 0x28 address ACK was already
+                                          // confirmed 2026-08-09, Phase 1 Task 18
+                                          // follow-up -- what's new here is the
+                                          // protocol identity, not the address.)
 Rf433Gpio rf433; // Intentionally has NO init() call in setup() as of 2026-08-18
                  // -- GPIO53 is shared with the external I2C SDA line and
                  // claiming it at boot tore down Wire1. See the long comment at

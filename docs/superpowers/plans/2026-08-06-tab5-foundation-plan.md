@@ -2479,10 +2479,10 @@ git commit -m "Add Cardputer-ADV BLE GATT C2 client (second transport)"
 
 ## Task 18: Tab5 `INFC` and `IRF433` HAL Bring-Up (Detection Only)
 
-**Files:**
-- Create: `firmware/tab5/src/hal/infc.h`
 > **Historical record — chip identity superseded.** This task's `NfcPN532` naming assumes both HY2.0 units are PN532s. Neither is: the NFC unit is an ST25R3916 (found during this very task's hardware run) and the RFID2 unit is a WS1850S, MFRC522/PN512-family (proven on hardware 2026-08-19, Phase 3 Task 3). The class name survives because `detect()` is only a bare I2C presence probe. Text left unedited as the record of what was planned; see the Phase 3 spec's corrections.
 
+**Files:**
+- Create: `firmware/tab5/src/hal/infc.h`
 - Create: `firmware/tab5/src/hal/nfc_pn532.h`
 - Create: `firmware/tab5/src/hal/nfc_pn532.cpp`
 - Create: `firmware/tab5/src/hal/irf433.h`
