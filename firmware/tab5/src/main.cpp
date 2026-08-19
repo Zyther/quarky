@@ -21,6 +21,7 @@
 #include "features/wifi/wifi_connect.h"
 #include "features/wifi/wifi_evil_portal.h"
 #include "features/nfc/nfc_read.h" // Phase 3 Task 4: NFC/RFID2 tag read UI
+#include "features/rf433/rf433_scan.h" // Phase 3 Task 5: RF433 scan/capture UI
 #include "features/ble/ble_scan.h"
 #include "features/ble/ble_spam.h"
 #include "features/ble/ble_finder.h"
@@ -357,6 +358,9 @@ void setup() {
     NfcRead::register_module_nfc_unit();
     NfcRead::register_module_rfid2_unit();
 
+    // Task 5 (Phase 3): RF433 scan/capture UI (Category::RF433).
+    Rf433Scan::register_module();
+
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
     Serial.println("quarky-tab5: lvgl ready");
@@ -531,6 +535,8 @@ void loop() {
     c2link_ble.poll();  // drains BLE frames received on the NimBLE host task
     NfcRead::poll();    // Phase 3 Task 4: no-ops unless NFC/RFID2 tag-read screen
                         // is open and Scan is armed; drives RFAL/MFRC522 polling
+    Rf433Scan::poll();  // Phase 3 Task 5: no-ops unless RF433 scan/capture screen
+                        // is open and active; drains edge interrupt ring buffer
     WifiSpectrumFeature::poll(); // no-ops unless the WiFi Spectrum screen is open
     WifiConnectFeature::poll();  // no-ops unless a connect is in flight; drains the
                                   // background connect_task()'s result -- real-hardware
