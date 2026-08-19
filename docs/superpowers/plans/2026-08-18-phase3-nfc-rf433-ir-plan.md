@@ -230,7 +230,9 @@ Commit `st25r3916_driver.h/.cpp` and the serial-debug trigger together, with the
 
 ---
 
-## Task 3: RFID2 (WS1850S) frequency-capability confirmation + PN532-protocol bring-up
+## Task 3: RFID2 (WS1850S) frequency-capability confirmation + ~~PN532~~ **MFRC522**-protocol bring-up
+
+> **PREMISE CORRECTED 2026-08-19 — read this before reading the rest of this task.** This task's Context and Step 1 below state that WS1850S is PN532-register-compatible. **It is not.** Executing the task refuted that from the donor source it pointed at: Bruce's `RFID2.cpp` and UniGeek's `MFRC522Screen.cpp` both drive this exact unit at `0x28` with **MFRC522** libraries, and M5Stack's own library documents WS1850S as "**PN512**-compatible silicon" (PN512, an MFRC522-family register-mapped part — not PN532). Confirmed on real hardware: the delivered driver's MFRC522 framing reads `VersionReg (0x37) = 0x15`, while a real PN532 `GetFirmwareVersion` frame got no response. **What was actually built is an MFRC522 register driver** with the four signatures below unchanged. The original text is left intact below as the historical record of what was asked for; see the Phase 3 spec's 2026-08-19 correction and `features/nfc/ws1850s_driver.cpp`'s header for the full citation trail.
 
 **Files:**
 - Create: `firmware/tab5/src/features/nfc/ws1850s_driver.h`
@@ -451,12 +453,12 @@ Expected: PASS.
 - Consumes: `Ws1850sDriver::*` (Task 3), `NfcCommon::TagInfo/format_uid` (Task 4).
 - Produces: `namespace NfcMifareCrack { void register_module(); void poll(); }`.
 
-**Context:** RFID2-unit only (MIFARE Classic is a WS1850S/PN532-class operation — the spec explicitly flags the ST25R3916/NFC-unit path as unconfirmed for this, don't assume parity). Port UniGeek's dictionary/nested/darkside attack implementation closely per the spec's explicit guidance ("timing-sensitive against the chip's own firmware, port... closely rather than re-deriving"). `poll()`-driven with a progress UI (keys tried / keyspace, elapsed time), same streaming pattern as Task 8.
+**Context:** RFID2-unit only (MIFARE Classic is a WS1850S/**MFRC522**-class operation — *corrected 2026-08-19, this said "PN532-class"; see Task 3's correction banner. This is good news for this task: UniGeek's `utils/nfc/` attacks are written directly against `MFRC522_I2C`, the same library its `MFRC522Screen.cpp` drives this unit with, so they port onto `ws1850s_driver` rather than onto a PN532 abstraction that would have had to be invented first* — the spec explicitly flags the ST25R3916/NFC-unit path as unconfirmed for this, don't assume parity). Port UniGeek's dictionary/nested/darkside attack implementation closely per the spec's explicit guidance ("timing-sensitive against the chip's own firmware, port... closely rather than re-deriving"). `poll()`-driven with a progress UI (keys tried / keyspace, elapsed time), same streaming pattern as Task 8.
 
 - [ ] **Step 1: Port the dictionary-attack key list and per-tick key-try loop**
 - [ ] **Step 2: Port the nested-attack and darkside-attack logic**
 
-Expect real retry/timeout constant tuning during hardware bring-up per the spec's own risk note (WS1850S's firmware response latency may differ from whatever PN532 module UniGeek tested against) — this is expected engineering work for this task, not a sign the port is wrong.
+Expect real retry/timeout constant tuning during hardware bring-up per the spec's own risk note (WS1850S's firmware response latency may differ from whatever MFRC522-class module UniGeek tested against — *"PN532 module" corrected 2026-08-19*) — this is expected engineering work for this task, not a sign the port is wrong.
 
 - [ ] **Step 3: Build the progress-card screen**
 - [ ] **Step 4: PAUSE FOR HARDWARE, then verify against a known-weak test card**
