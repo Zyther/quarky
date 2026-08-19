@@ -20,6 +20,7 @@
 #include "features/wifi/wifi_pmkid.h"
 #include "features/wifi/wifi_connect.h"
 #include "features/wifi/wifi_evil_portal.h"
+#include "features/nfc/nfc_read.h" // Phase 3 Task 4: NFC/RFID2 tag read UI
 #include "features/ble/ble_scan.h"
 #include "features/ble/ble_spam.h"
 #include "features/ble/ble_finder.h"
@@ -351,6 +352,11 @@ void setup() {
                                                // detector, same reason -- must
                                                // run before Shell::build below
 
+    // Task 4 (Phase 3): NFC/RFID2 baseline tag read (UID + basic type).
+    // These modules are reachable via shell.cpp's Category::NFC tiles.
+    NfcRead::register_module_nfc_unit();
+    NfcRead::register_module_rfid2_unit();
+
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
     Serial.println("quarky-tab5: lvgl ready");
@@ -523,6 +529,8 @@ void loop() {
     lvgl_port_tick();
     c2link_wifi.poll(); // no-ops when the AP never came up
     c2link_ble.poll();  // drains BLE frames received on the NimBLE host task
+    NfcRead::poll();    // Phase 3 Task 4: no-ops unless NFC/RFID2 tag-read screen
+                        // is open and Scan is armed; drives RFAL/MFRC522 polling
     WifiSpectrumFeature::poll(); // no-ops unless the WiFi Spectrum screen is open
     WifiConnectFeature::poll();  // no-ops unless a connect is in flight; drains the
                                   // background connect_task()'s result -- real-hardware

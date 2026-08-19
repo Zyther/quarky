@@ -14,6 +14,12 @@ static const struct { Category cat; const char *label; } kCategoryTiles[] = {
     {Category::UTILITY, "Utility"},
     {Category::WIFI, "WiFi"},
     {Category::BLE, "BLE"},
+    {Category::NFC, "NFC"},
+    {Category::RF433, "RF433"},
+    {Category::IR, "IR"},
+    {Category::SUBGHZ, "Sub-GHz"},
+    {Category::NRF24, "NRF24"},
+    {Category::LORA, "LoRa"},
 };
 
 // The category screen's menu-bar title. Same table as the launcher tiles, so
