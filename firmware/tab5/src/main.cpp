@@ -169,10 +169,16 @@ void on_c2_receive(const c2proto::Frame &frame) {
 // 0x50, so the NFC unit's address is now CONFIRMED on hardware and the 0x24
 // PN532 guess is retired.
 NfcPN532 nfc_unit(TAB5_NFC_I2C_ADDR);     // 0x50, confirmed (ST25R3916 Unit NFC)
-NfcPN532 rfid2_unit(TAB5_RFID2_I2C_ADDR); // 0x28, per docs (WS1850S); no such
-                                          // unit was plugged in during the
-                                          // hotfix's hardware run, so this
-                                          // address remains doc-only.
+NfcPN532 rfid2_unit(TAB5_RFID2_I2C_ADDR); // 0x28, CONFIRMED on hardware
+                                          // 2026-08-19 (Phase 3 Task 3): not
+                                          // just an address ACK -- the unit
+                                          // answered MFRC522 register framing
+                                          // with VersionReg (0x37) = 0x15, and
+                                          // did NOT answer a PN532 frame. It is
+                                          // a WS1850S, MFRC522/PN512-family.
+                                          // (Was "doc-only" until then: no
+                                          // RFID2 unit was connected during the
+                                          // 2026-08-08 HY2.0 hotfix run.)
 Rf433Gpio rf433; // Intentionally has NO init() call in setup() as of 2026-08-18
                  // -- GPIO53 is shared with the external I2C SDA line and
                  // claiming it at boot tore down Wire1. See the long comment at

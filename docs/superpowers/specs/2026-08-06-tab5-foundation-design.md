@@ -124,7 +124,7 @@ Both firmware targets adopt UniGeek's interface-based `Device` HAL pattern — t
 | `IDisplay` | MIPI-DSI panel driver + LVGL draw/flush callback |
 | `ITouch` | GT911 multi-touch, feeds LVGL's input device layer |
 | `IRadio` | Thin wrapper over esp-hosted WiFiRemote (WiFi + BLE) |
-| `INFC` | PN532-based driver shared by the NFC unit and RFID2 unit |
+| `INFC` | PN532-based driver shared by the NFC unit and RFID2 unit — **historical: neither unit is a PN532. NFC = ST25R3916, RFID2 = WS1850S (MFRC522/PN512-family). Left as the Phase 1 record; see the Phase 3 spec's 2026-08-18 and 2026-08-19 corrections.** |
 | `IRF433` | Simple GPIO RX/TX driver for the RF433R/RF433T units (fixed-code protocols only — analogous to Bruce's `M5_RF_MODULE` path, distinct from CC1101's full-spectrum capability which lives on Cardputer-ADV) |
 | `IC2Link` | ESP-NOW + WiFi-socket transport to satellites, built on `shared/c2proto` |
 | `IPower` | Battery/charge state |
