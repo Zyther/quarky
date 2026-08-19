@@ -16,6 +16,17 @@ struct CapturedSignal {
     Rf433Common::EdgeSample edges[kMaxEdgesPerSignal];
     size_t edge_count;
     uint32_t captured_at_ms;
+
+    // Monotonically increasing, never reused within a session. Identifies
+    // this capture independent of its slot in the (ring-buffered) session
+    // array, so a UI element created for this signal stays correct even
+    // after later captures shift it out of its original array index.
+    uint32_t capture_id;
+
+    // True if the source burst hit kMaxEdgesPerSignal before its actual
+    // end-of-burst gap arrived -- edges beyond the cap were dropped and this
+    // signal's edges[]/edge_count do not represent the whole burst.
+    bool truncated;
 };
 
 // Register the RF433 Scan feature module with the registry

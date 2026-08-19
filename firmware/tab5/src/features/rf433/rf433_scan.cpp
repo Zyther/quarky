@@ -27,12 +27,32 @@ static lv_obj_t *s_placeholder = nullptr; // "No signals captured yet" row, if s
 static bool s_active = false;
 static uint32_t s_last_edge_time_us = 0;
 static size_t s_accum_edge_count = 0;
+static bool s_accum_truncated = false;
 static Rf433Common::EdgeSample s_accum_edges[kMaxEdgesPerSignal];
+static uint32_t s_next_capture_id = 1;
 
-// Gap threshold (in microseconds) to delimit end of an RF burst
-// Standard OOK remotes repeat bursts separated by 8ms - 15ms of silence
-constexpr uint32_t kBurstGapThresholdUs = 10000; // 10ms
+// Gap threshold (in microseconds) to delimit end of an RF burst.
+// Standard OOK remotes repeat the same code's burst every 8ms-15ms while a
+// button is held/pressed. The threshold must sit clearly OUTSIDE that band --
+// a value inside 8-15ms (the original 10ms here) sits squarely in the repeat
+// band itself, so jitter around the threshold splits some repeat-gaps into
+// separate signals while merging others. 25ms clears the repeat band with a
+// wide margin while staying comfortably below the tens-of-milliseconds of
+// silence that separates two distinct button presses, so one press's repeats
+// still coalesce into a single CapturedSignal.
+constexpr uint32_t kBurstGapThresholdUs = 25000; // 25ms
 constexpr size_t kMinEdgesForSignal = 10;        // Filter spurious single glitch transitions
+
+// Per-poll()-tick cap on the number of finalize_burst() calls (each one is
+// the expensive operation: synchronous SD write + LVGL list churn -- the
+// same operation that starved the watchdog before). A noisy/floating pin
+// producing many short gap-delimited runs within one tick must not be able
+// to fire this an unbounded number of times in a single loop() iteration.
+// Any boundary detected beyond the cap is deferred, not lost: the
+// accumulator and gap-tracking state persist across ticks (see poll()), so
+// an uncapped burst just keeps accumulating (bounded by kMaxEdgesPerSignal /
+// the truncated flag) until a later tick's finalize budget resets.
+constexpr size_t kMaxFinalizesPerPoll = 2;
 
 static void update_status_ui() {
     if (!s_status_label || !s_toggle_label) return;
@@ -47,18 +67,40 @@ static void update_status_ui() {
 
 static void set_capture_active(bool active) {
     if (s_active == active) return;
-    s_active = active;
     if (active) {
+        if (!Rf433Common::capture_start()) {
+            // Arm failed -- do not flip s_active or the UI into a state that
+            // claims we're capturing when we're not.
+            Serial.printf("quarky-tab5: [rf433-scan] capture_start() failed -- "
+                          "staying Idle\n");
+            return;
+        }
         s_accum_edge_count = 0;
+        s_accum_truncated = false;
         s_last_edge_time_us = 0;
-        Rf433Common::capture_start();
+        s_active = true;
     } else {
+        // Stopping mid-burst deliberately discards whatever is accumulated
+        // in s_accum_edges without finalizing it: a partial burst the user
+        // chose to cut off isn't a real captured signal, and the next
+        // capture_start() resets the accumulator anyway.
         Rf433Common::capture_stop();
+        s_active = false;
     }
     update_status_ui();
 }
 
-static void add_signal_to_list(const CapturedSignal &sig, size_t index) {
+// Looks up a signal by its stable capture_id rather than its (mutable, ring-
+// shifted) array slot. Mirrors get_signal()'s bounds-checked nullptr-on-miss
+// contract so callers (the row click handler) never index s_signals directly.
+static const CapturedSignal *find_signal_by_id(uint32_t capture_id) {
+    for (size_t i = 0; i < s_signal_count; i++) {
+        if (s_signals[i].capture_id == capture_id) return &s_signals[i];
+    }
+    return nullptr;
+}
+
+static void add_signal_to_list(const CapturedSignal &sig) {
     if (!s_list) return;
 
     // Drop the "nothing yet" placeholder the moment a real row exists.
@@ -77,31 +119,43 @@ static void add_signal_to_list(const CapturedSignal &sig, size_t index) {
         lv_obj_delete(oldest);
     }
 
-    // Calculate approx burst duration in milliseconds
+    // Calculate approx burst duration with one decimal place of millisecond
+    // precision -- most real bursts are only a few ms long, and truncating to
+    // whole milliseconds rendered nearly every short capture as "~0 ms".
     uint32_t duration_us = 0;
     if (sig.edge_count > 1) {
         duration_us = sig.edges[sig.edge_count - 1].timestamp_us - sig.edges[0].timestamp_us;
     }
 
-    char row[80];
-    std::snprintf(row, sizeof(row), "Sig #%u: %u edges, ~%lu ms (@%lu s)",
-                  (unsigned)(index + 1),
+    char row[96];
+    std::snprintf(row, sizeof(row), "Sig #%u: %u edges, ~%lu.%01lu ms (@%lu s)%s",
+                  (unsigned)sig.capture_id,
                   (unsigned)sig.edge_count,
                   (unsigned long)(duration_us / 1000),
-                  (unsigned long)(sig.captured_at_ms / 1000));
+                  (unsigned long)((duration_us % 1000) / 100),
+                  (unsigned long)(sig.captured_at_ms / 1000),
+                  sig.truncated ? " [truncated]" : "");
 
     lv_obj_t *btn = lv_list_add_button(s_list, LV_SYMBOL_AUDIO, row);
     lv_obj_add_event_cb(btn, [](lv_event_t *e) {
-        size_t idx = (size_t)(uintptr_t)lv_event_get_user_data(e);
+        uint32_t capture_id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+        const CapturedSignal *found = find_signal_by_id(capture_id);
+        if (!found) {
+            // Evicted from the session ring since this row was created.
+            Serial.printf("quarky-tab5: [rf433-scan] Selected signal #%u no longer "
+                          "available (evicted from ring)\n", (unsigned)capture_id);
+            return;
+        }
         Serial.printf("quarky-tab5: [rf433-scan] Selected signal #%u (%u edges)\n",
-                      (unsigned)(idx + 1), (unsigned)s_signals[idx].edge_count);
-    }, LV_EVENT_CLICKED, (void *)(uintptr_t)index);
+                      (unsigned)capture_id, (unsigned)found->edge_count);
+    }, LV_EVENT_CLICKED, (void *)(uintptr_t)sig.capture_id);
 }
 
 static void finalize_burst() {
     if (s_accum_edge_count < kMinEdgesForSignal) {
         // Discard short noise glitch
         s_accum_edge_count = 0;
+        s_accum_truncated = false;
         return;
     }
 
@@ -116,22 +170,31 @@ static void finalize_burst() {
     size_t new_idx = s_signal_count++;
     s_signals[new_idx].edge_count = s_accum_edge_count;
     s_signals[new_idx].captured_at_ms = millis();
+    s_signals[new_idx].capture_id = s_next_capture_id++;
+    s_signals[new_idx].truncated = s_accum_truncated;
     std::memcpy(s_signals[new_idx].edges, s_accum_edges,
                 sizeof(Rf433Common::EdgeSample) * s_accum_edge_count);
 
-    Serial.printf("quarky-tab5: [rf433-scan] Captured burst #%u: %u edges\n",
-                  (unsigned)s_signal_count, (unsigned)s_accum_edge_count);
+    Serial.printf("quarky-tab5: [rf433-scan] Captured burst #%u: %u edges%s\n",
+                  (unsigned)s_signals[new_idx].capture_id, (unsigned)s_accum_edge_count,
+                  s_accum_truncated ? " (TRUNCATED -- burst exceeded capacity)" : "");
 
     // Save capture to SD storage if available
     char filename[64];
     std::snprintf(filename, sizeof(filename), "/quarky/captures/rf433/sig_%lu_%u.raw",
                   (unsigned long)millis(), (unsigned)s_accum_edge_count);
-    storage.write_capture_file(filename,
+    bool wrote = storage.write_capture_file(filename,
                                (const uint8_t *)s_signals[new_idx].edges,
                                sizeof(Rf433Common::EdgeSample) * s_accum_edge_count);
+    if (!wrote) {
+        Serial.printf("quarky-tab5: [rf433-scan] Failed to write capture file %s "
+                      "(SD not mounted or write error) -- signal kept in RAM only\n",
+                      filename);
+    }
 
-    add_signal_to_list(s_signals[new_idx], new_idx);
+    add_signal_to_list(s_signals[new_idx]);
     s_accum_edge_count = 0;
+    s_accum_truncated = false;
 }
 
 static lv_obj_t *build_screen() {
@@ -157,20 +220,26 @@ static lv_obj_t *build_screen() {
         s_placeholder = lv_list_add_text(s_list, "No signals captured yet");
     } else {
         for (size_t i = 0; i < s_signal_count; i++) {
-            add_signal_to_list(s_signals[i], i);
+            add_signal_to_list(s_signals[i]);
         }
     }
 
-    // Teardown on delete (e.g. Back button tapped)
+    // Teardown on delete (e.g. Back button tapped). Null the widget pointers
+    // FIRST, before set_capture_active(false) -- that call runs
+    // update_status_ui(), which would otherwise write to labels this event is
+    // in the middle of freeing. update_status_ui() already no-ops when its
+    // labels are null, so nulling first removes the ordering dependency on
+    // LVGL's event-callback sequencing entirely rather than relying on it.
     lv_obj_add_event_cb(content, [](lv_event_t *) {
-        if (s_active) {
-            set_capture_active(false);
-        }
+        bool was_active = s_active;
         s_status_label = nullptr;
         s_toggle_btn = nullptr;
         s_toggle_label = nullptr;
         s_list = nullptr;
         s_placeholder = nullptr;
+        if (was_active) {
+            set_capture_active(false);
+        }
     }, LV_EVENT_DELETE, nullptr);
 
     return screen;
@@ -189,6 +258,23 @@ void register_module() {
 void poll() {
     if (!s_active) return;
 
+    // The ISR self-disarms (masks its own interrupt source) once a capture
+    // hits the hard edge ceiling, but is_capturing() stays true -- it was
+    // never told to stop, it just stopped collecting (see rf433_common.h).
+    // Left unchecked, the UI would show "Capturing..." forever with no new
+    // edges ever arriving, and the interrupt would sit half-torn-down until
+    // the user happened to tap Stop. Check every tick and complete the
+    // teardown ourselves the moment it happens.
+    if (Rf433Common::overrun()) {
+        Serial.printf("quarky-tab5: [rf433-scan] Capture overrun -- ISR hit the edge "
+                      "ceiling, stopping\n");
+        set_capture_active(false);
+        if (s_status_label) {
+            lv_label_set_text(s_status_label, "Status: Capture overrun -- check antenna/pin");
+        }
+        return;
+    }
+
     constexpr size_t kDrainChunk = 64;
     // Hard cap on edges processed per poll() tick. Without it the drain loop
     // below re-reads the ring until it is empty, which under a continuous or
@@ -200,6 +286,14 @@ void poll() {
     constexpr size_t kMaxEdgesPerPoll = kMaxEdgesPerSignal;
     Rf433Common::EdgeSample chunk[kDrainChunk];
 
+    // Bounds finalize_burst() calls (the expensive part: synchronous SD
+    // write + LVGL churn), independent of the edge-count cap above -- see
+    // kMaxFinalizesPerPoll's comment. A gap boundary detected once the
+    // budget is spent is simply not finalized this tick: its edges keep
+    // accumulating (bounded by kMaxEdgesPerSignal / the truncated flag) and
+    // get finalized on a later tick once the budget resets.
+    size_t finalizes_this_tick = 0;
+
     size_t processed = 0;
     while (processed < kMaxEdgesPerPoll) {
         size_t n = Rf433Common::capture_read(chunk, kDrainChunk);
@@ -210,11 +304,20 @@ void poll() {
                 // Gap between two real edges exceeded the burst threshold ->
                 // the previous burst is complete. Both timestamps come from the
                 // ISR clock, so this delta is always well-ordered.
-                finalize_burst();
+                if (finalizes_this_tick < kMaxFinalizesPerPoll) {
+                    finalize_burst();
+                    finalizes_this_tick++;
+                }
+                // else: deferred -- see kMaxFinalizesPerPoll's comment.
             }
 
             if (s_accum_edge_count < kMaxEdgesPerSignal) {
                 s_accum_edges[s_accum_edge_count++] = chunk[i];
+            } else if (!s_accum_truncated) {
+                s_accum_truncated = true;
+                Serial.printf("quarky-tab5: [rf433-scan] Burst exceeded %u edges -- "
+                              "further edges in this burst are being dropped\n",
+                              (unsigned)kMaxEdgesPerSignal);
             }
             s_last_edge_time_us = t;
         }
@@ -228,7 +331,7 @@ void poll() {
     // let an edge recorded mid-drain carry a timestamp later than now_us,
     // underflowing this unsigned subtraction to ~4e9 and firing finalize_burst()
     // on almost every tick during active reception.
-    if (s_accum_edge_count > 0) {
+    if (s_accum_edge_count > 0 && finalizes_this_tick < kMaxFinalizesPerPoll) {
         const uint32_t now_us = micros();
         if ((now_us - s_last_edge_time_us) > kBurstGapThresholdUs) {
             finalize_burst();
