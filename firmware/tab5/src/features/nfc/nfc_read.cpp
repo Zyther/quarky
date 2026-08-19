@@ -18,18 +18,22 @@
 #include <cstring>
 #include <Wire.h>
 
-// ST RFAL-based NFC discovery (used to extract ISO14443A/NFC-A UID via
-// technology detection + activation state machine instead of guessing raw
-// register-level anticollision sequences).
-#include <rfal_nfc.h>
-#include <rfal_rfst25r3916.h>
-#include <st25r3916_config.h>
-#include <st_errno.h>
-
-// UniGeek’s cached donor library (via PlatformIO lib_extra_dirs):
-// provides PICC_IsNewCardPresent() + PICC_ReadCardSerial(), and stores
-// the UID bytes in the instance's public `uid` member.
+// Vendored at lib/MFRC522_I2C/ (see that library's src/MFRC522_I2C.h for the
+// upstream repo/commit and why it is in-tree rather than fetched from another
+// project's PlatformIO cache). Used ONLY for the PICC-level anticollision
+// sequence -- this project owns the register level via Ws1850sDriver.
 #include <MFRC522_I2C.h>
+
+// NOTE ON WHAT IS *NOT* INCLUDED HERE. An earlier version of this file drove
+// the NFC unit through ST's RFAL stack (<rfal_nfc.h> / <rfal_rfst25r3916.h>),
+// constructing RfalRfST25R3916Class(&Wire1, -1) with a comment claiming RFAL
+// falls back to worker-based polling without an IRQ pin. That claim was false:
+// RFAL's I2C path returns ERR_PARAM when int_pin < 0 and gates every single
+// interrupt read on digitalRead(int_pin), while the Tab5's HY2.0 PORT.A
+// connector carries only GND/5V/SDA/SCL. The tile was non-functional by
+// construction. The NFC-unit path below now uses this project's own
+// St25r3916::nfca_* API, which polls the chip's IRQ *status registers* instead
+// -- see st25r3916_driver.cpp's SOURCES block for the full story and citations.
 
 extern FeatureRegistry g_registry;
 
@@ -37,175 +41,240 @@ namespace NfcRead {
 
 enum class TargetUnit { NFC, RFID2 };
 
+// Screen-lifetime state machine. Chip bring-up is a one-shot (kBringUp) rather
+// than something poll() re-attempts at 4 Hz, and a bring-up failure LATCHES
+// (kFailed) instead of retrying forever against a socket with nothing in it --
+// both required by this task's review.
+enum class ScanState : uint8_t {
+    kIdle,      // screen open, user has not pressed Scan
+    kBringUp,   // Scan pressed; the next poll() tick performs one-shot bring-up
+    kScanning,  // bring-up done, polling for a tag
+    kFound,     // a tag was read; nothing further happens until Scan is pressed
+    kFailed,    // bring-up failed; latched, no retry until the screen is re-entered
+};
+
 static TargetUnit s_target = TargetUnit::RFID2;
+static ScanState  s_state  = ScanState::kIdle;
 
 static lv_obj_t *s_status_label = nullptr;
 static lv_obj_t *s_result_label = nullptr;
 
-static bool s_scan_armed = false;
-static bool s_tag_found = false;
 static uint32_t s_last_attempt_ms = 0;
 
-// --- ST RFAL state (NFC unit only) -------------------------------------------
-static bool s_rfal_initialized = false;
-static bool s_rfal_discovery_started = false;
-static bool s_nfc_uid_ready = false;
-static uint8_t s_nfc_uid[10] = {0};
-static uint8_t s_nfc_uid_len = 0;
+// True once this screen session has successfully brought its unit up, so
+// teardown knows whether it owes the chip a field_off()/poller_end().
+static bool s_unit_ready = false;
 
-// Create the RFAL reader bound to our I2C bus. The Tab5 NFC connector has no
-// wired IRQ line, so we pass -1 and rely on RFAL's worker-based polling.
-static RfalRfST25R3916Class s_rfal_reader(&Wire1, -1);
-static RfalNfcClass s_rfal_nfc(&s_rfal_reader);
+// Interval between detection attempts. Both units' single detect pass is
+// bounded (RFID2: the donor library's own 36 ms transceive deadline, normally
+// cut short by the chip's 25 ms timer IRQ when nothing is in the field; NFC:
+// St25r3916::nfca_detect()'s own ~25 ms budget), so a tick never approaches
+// the project's ~50 ms poll() ceiling. The gap exists to leave the rest of
+// loop() -- LVGL, the C2 link, RF433 -- plenty of room, not because a single
+// attempt is expensive.
+static constexpr uint32_t kScanIntervalMs = 250;
 
-static void on_nfc_state_change(rfalNfcState state) {
-    if (state != RFAL_NFC_STATE_ACTIVATED) return;
+// The RFID2 unit's PICC-level helper. Construction is trivial (it only stores
+// the address, reset pin and TwoWire pointer -- MFRC522_I2C.cpp:21-28), so a
+// file-scope instance touches no hardware before bring-up runs.
+static MFRC522_I2C s_mfrc(TAB5_RFID2_I2C_ADDR, -1, &Wire1);
 
-    rfalNfcDevice *device = nullptr;
-    if (s_rfal_nfc.rfalNfcGetActiveDevice(&device) != ERR_NONE || device == nullptr) {
+static void set_status(const char *text) {
+    if (s_status_label != nullptr) {
+        lv_label_set_text(s_status_label, text);
+    }
+}
+
+// --- Bring-up ---------------------------------------------------------------
+
+// One-shot, deliberately NOT inside the Scan click handler and deliberately
+// bounded to a single poll() tick.
+//
+// DISCLOSED POLL() BUDGET EXCEPTION (the project's ~50 ms rule allows one if
+// it is commented): this single tick can run long -- for RFID2, up to ~205 ms
+// (Ws1850sDriver::init()'s 50 ms settle + up to 3x50 ms soft-reset poll + nine
+// register writes + 4 ms post-init settle); for the NFC unit, ~30 ms
+// (St25r3916::nfca_poller_begin()'s ~35 register writes at 100 kHz, a 10 ms
+// oscillator wait and the 5 ms NFC-A guard time). It happens at most ONCE per
+// screen session, and its result latches either way, which is the whole point:
+// the version this replaced called Ws1850sDriver::init() from inside every
+// scan attempt and so paid that cost four times a second, forever, whenever no
+// unit was attached.
+static void run_bring_up() {
+    bool ok = false;
+
+    if (s_target == TargetUnit::RFID2) {
+        // Antenna field enable is part of init(); field_on() is called
+        // explicitly so teardown's field_off() is the obvious counterpart.
+        ok = Ws1850sDriver::init() && Ws1850sDriver::field_on();
+    } else {
+        ok = St25r3916::nfca_poller_begin();
+    }
+
+    if (!ok) {
+        s_state = ScanState::kFailed;
+        s_unit_ready = false;
+        const char *msg = (s_target == TargetUnit::RFID2)
+                              ? "RFID2 unit not responding"
+                              : "NFC unit not responding";
+        set_status(msg);
+        if (s_result_label != nullptr) {
+            lv_label_set_text(s_result_label,
+                              "Check that the unit is plugged into PORT.A.\n"
+                              "Leave and re-enter this screen to retry.");
+        }
+        Serial.printf("quarky-tab5: [nfc-read] %s -- bring-up failed, latched "
+                      "(no 4 Hz retry)\n", msg);
         return;
     }
 
-    if (device->nfcidLen == 0 || device->nfcidLen > 10) return;
-    if (device->nfcid == nullptr) return;
-
-    s_nfc_uid_len = device->nfcidLen;
-    std::memcpy(s_nfc_uid, device->nfcid, s_nfc_uid_len);
-    s_nfc_uid_ready = true;
+    s_unit_ready = true;
+    s_state = ScanState::kScanning;
+    s_last_attempt_ms = millis();
+    set_status("Scanning...");
 }
 
-static void set_scan_state(bool armed, bool found) {
-    s_scan_armed = armed;
-    s_tag_found = found;
-    if (s_status_label) {
-        if (!armed) {
-            lv_label_set_text(s_status_label, "Idle");
-        } else if (found) {
-            lv_label_set_text(s_status_label, "Tag found");
-        } else {
-            lv_label_set_text(s_status_label, "Scanning...");
-        }
-    }
-}
+// --- Per-unit detection -----------------------------------------------------
 
-// RFID2: WS1850S is MFRC522/PN512-family silicon. We use UniGeek's proven
-// MFRC522_I2C PICC flow to get UID bytes for Task-4 "baseline tag read".
+// RFID2 / WS1850S. The PICC call sequence below is the donor libraries' own
+// and is deliberately unchanged.
+//
+// ORDERING DEPENDENCY, DO NOT REORDER: correctness here rests on
+// Ws1850sDriver::init() having already applied PCD_Init()'s register programme
+// (soft reset, TX baud rates, timer prescaler/reload, 100% ASK, CRC preset,
+// antenna on) to this same chip. PCD_Init() is deliberately never called on
+// the MFRC522_I2C instance itself -- this project owns the register level, the
+// donor library is used only from PICC_* upwards -- so the PICC calls would be
+// talking to an unconfigured chip if bring-up had not run first.
 static bool try_read_rfid2_uid(NfcCommon::TagInfo *out) {
-    if (out == nullptr) return false;
+    if (out == nullptr) {
+        return false;
+    }
 
-    if (!Ws1850sDriver::init()) return false;
-    // Antenna field enable is part of init(), but keep it explicit and cheap.
-    Ws1850sDriver::field_on();
+    // MFRC522 library contract: PICC_IsNewCardPresent() (which sends REQA and
+    // collects the ATQA) must precede PICC_ReadCardSerial() (the cascade-level
+    // anticollision loop that yields the UID and SAK).
+    if (!s_mfrc.PICC_IsNewCardPresent()) {
+        return false;
+    }
+    if (!s_mfrc.PICC_ReadCardSerial()) {
+        return false;
+    }
 
-    // Create the MFRC522 helper for the real chip at 0x28 on Wire1.
-    // We keep it static so its internal UID struct persists across polls.
-    static MFRC522_I2C s_mfrc(TAB5_RFID2_I2C_ADDR, -1, &Wire1);
-
-    // Ensure RF field for this attempt.
-    s_mfrc.PCD_AntennaOn();
-
-    // MFRC522 library contract: call PICC_IsNewCardPresent() before
-    // PICC_ReadCardSerial().
-    if (!s_mfrc.PICC_IsNewCardPresent()) return false;
-    if (!s_mfrc.PICC_ReadCardSerial()) return false;
-
-    const uint8_t uid_len = s_mfrc.uid.size; // 4, 7, or 10 (per library)
-    if (uid_len == 0 || uid_len > 10) return false;
+    const uint8_t uid_len = s_mfrc.uid.size; // 4, 7 or 10 per the library
+    if (uid_len == 0 || uid_len > sizeof(out->uid)) {
+        return false;
+    }
 
     out->uid_len = uid_len;
     for (uint8_t i = 0; i < uid_len; i++) {
         out->uid[i] = s_mfrc.uid.uidByte[i];
     }
 
-    // Minimal, honest type name: we can refine later once we port more
-    // PICC/MIFARE classification work. For DoD baseline UID read, length
-    // is a meaningful invariant.
-    std::snprintf(out->type_name, sizeof(out->type_name),
-                  "ISO14443A UID (%uB)", (unsigned)uid_len);
+    // Real PICC type from the SAK, not a guess from the UID length. The
+    // returned string lives in flash; on ESP32 __FlashStringHelper* is a plain
+    // mapped pointer, so a normal "%s" read is safe. TagInfo::type_name is 24
+    // bytes (the interface shape this task's brief specified), so the longest
+    // names -- "MIFARE Ultralight or Ultralight C" -- truncate.
+    const uint8_t picc_type = s_mfrc.PICC_GetType(s_mfrc.uid.sak);
+    std::snprintf(out->type_name, sizeof(out->type_name), "%s",
+                  reinterpret_cast<const char *>(s_mfrc.PICC_GetTypeName(picc_type)));
 
-    // Leave the chip in a clean state for the next scan.
+    // Leave the tag halted and crypto state clean for the next scan.
     s_mfrc.PICC_HaltA();
     s_mfrc.PCD_StopCrypto1();
     return true;
 }
 
-// NFC: ST25R3916 is an RF front-end; tag discovery/anticollision should be
-// done via ST's RFAL state machine, not raw register guessing. This Task-4
-// scaffolding intentionally compiles and does RFID2 baseline UID read, but
-// the ST UID extraction is a dedicated porting task to be completed.
+// NFC unit / ST25R3916. Real ISO14443-3A: REQA -> anticollision -> SELECT
+// across as many cascade levels as the UID needs, driven by polling the
+// chip's IRQ status registers (this hardware has no IRQ line). Implemented in
+// St25r3916::nfca_detect(); see st25r3916_driver.cpp for the citations and for
+// what is deliberately not implemented (multi-tag collision resolution).
 static bool try_read_nfc_uid(NfcCommon::TagInfo *out) {
-    (void)out; // currently UID is returned via shared RFAL callback state
-    // RFAL runs as a worker-driven state machine: we must call
-    // rfalNfcWorker() repeatedly until the activation callback fires.
-
-    // Satisfy Task-4's dependency on the project's own ST25R3916 bring-up,
-    // mainly to ensure the PORT.A I2C bus + chip are usable.
-    if (!St25r3916::init()) return false;
-    St25r3916::field_on();
-
-    if (!s_rfal_initialized) {
-        const ReturnCode err = s_rfal_nfc.rfalNfcInitialize();
-        if (err != ERR_NONE) {
-            Serial.printf("quarky-tab5: [nfc-read] rfalNfcInitialize failed: %d\n", (int)err);
-            return false;
-        }
-        s_rfal_initialized = true;
+    if (out == nullptr) {
+        return false;
     }
 
-    if (!s_rfal_discovery_started) {
-        rfalNfcDiscoverParam discover;
-        std::memset(&discover, 0, sizeof(discover));
+    St25r3916::Iso14443aTag tag{};
+    const St25r3916::NfcaResult res = St25r3916::nfca_detect(&tag);
 
-        discover.compMode = RFAL_COMPLIANCE_MODE_NFC;
-        discover.devLimit = RFAL_ESP32_DEFAULT_DEVICE_LIMIT;
-        discover.techs2Find = RFAL_NFC_POLL_TECH_A;
-        discover.totalDuration = RFAL_ESP32_DEFAULT_DISCOVERY_DURATION_MS;
-        discover.notifyCb = on_nfc_state_change;
-
-        s_nfc_uid_ready = false;
-        s_nfc_uid_len = 0;
-
-        const ReturnCode err = s_rfal_nfc.rfalNfcDiscover(&discover);
-        if (err != ERR_NONE) {
-            Serial.printf("quarky-tab5: [nfc-read] rfalNfcDiscover failed: %d\n", (int)err);
+    switch (res) {
+        case St25r3916::NfcaResult::kFound:
+            break;
+        case St25r3916::NfcaResult::kNoTag:
             return false;
-        }
-        s_rfal_discovery_started = true;
+        case St25r3916::NfcaResult::kCollision:
+            set_status("Multiple tags -- present one at a time");
+            return false;
+        case St25r3916::NfcaResult::kProtocolError:
+            set_status("Tag answered but the exchange failed");
+            return false;
+        case St25r3916::NfcaResult::kHardwareError:
+        default:
+            set_status("NFC unit stopped responding");
+            s_state = ScanState::kFailed;
+            Serial.println("quarky-tab5: [nfc-read] ST25R3916 I2C failure mid-scan "
+                           "-- scanning latched off");
+            return false;
     }
 
-    // Drive RFAL one step.
-    s_rfal_nfc.rfalNfcWorker();
-
-    if (!s_nfc_uid_ready) return false;
-    return true; // caller will pull s_nfc_uid via shared state below
+    if (tag.uid_len == 0 || tag.uid_len > sizeof(out->uid)) {
+        return false;
+    }
+    out->uid_len = tag.uid_len;
+    for (uint8_t i = 0; i < tag.uid_len; i++) {
+        out->uid[i] = tag.uid[i];
+    }
+    // No SAK->name table is ported for this path (the RFID2 path gets one for
+    // free from the donor library; writing a second, independent one here
+    // would be inventing a mapping rather than citing one). Report the two
+    // real ISO14443-3 identity bytes instead of a made-up product name.
+    std::snprintf(out->type_name, sizeof(out->type_name), "ISO14443A SAK %02X",
+                  (unsigned)tag.sak);
+    Serial.printf("quarky-tab5: [nfc-read] ATQA=%02X%02X SAK=%02X UID len=%u\n",
+                  tag.atqa[1], tag.atqa[0], tag.sak, (unsigned)tag.uid_len);
+    return true;
 }
 
 static bool try_read_uid(NfcCommon::TagInfo *out) {
-    if (out == nullptr) return false;
-    switch (s_target) {
-        case TargetUnit::RFID2:
-            return try_read_rfid2_uid(out);
-        case TargetUnit::NFC:
-            // NFC path: try_read_nfc_uid updates shared s_nfc_uid/s_len and
-            // returns true when a UID has been captured by the RFAL callback.
-            if (!try_read_nfc_uid(out)) return false;
-            out->uid_len = s_nfc_uid_len;
-            for (uint8_t i = 0; i < out->uid_len; i++) out->uid[i] = s_nfc_uid[i];
-            std::snprintf(out->type_name, sizeof(out->type_name), "ISO14443A UID (%uB)",
-                          (unsigned)out->uid_len);
-            St25r3916::field_off();
-            s_rfal_nfc.rfalNfcDeactivate(true);
-            s_rfal_discovery_started = false;
-            s_nfc_uid_ready = false;
-            return true;
-    }
-    return false;
+    return (s_target == TargetUnit::RFID2) ? try_read_rfid2_uid(out)
+                                           : try_read_nfc_uid(out);
 }
+
+// --- Teardown ---------------------------------------------------------------
+
+// Called from LV_EVENT_DELETE and from nothing else. Every widget pointer is
+// nulled BEFORE any driver call, so a driver that logs or takes a moment can
+// never race a poll() tick into a dangling label.
+static void teardown() {
+    s_status_label = nullptr;
+    s_result_label = nullptr;
+
+    s_state = ScanState::kIdle;
+    s_last_attempt_ms = 0;
+
+    if (s_unit_ready) {
+        // Leaving the screen must not leave the RF field energised.
+        if (s_target == TargetUnit::RFID2) {
+            Ws1850sDriver::field_off();
+        } else {
+            St25r3916::nfca_poller_end();
+        }
+    }
+    s_unit_ready = false;
+}
+
+// --- Screen -----------------------------------------------------------------
 
 static lv_obj_t *build_screen(TargetUnit target) {
     s_target = target;
+    s_state = ScanState::kIdle;
+    s_unit_ready = false;
+    s_last_attempt_ms = 0;
+
     const char *title = (target == TargetUnit::RFID2) ? "RFID2 Tag Read"
-                                                       : "NFC Tag Read";
+                                                      : "NFC Tag Read";
 
     lv_obj_t *content = nullptr;
     lv_obj_t *screen = build_sub_screen(title, &content);
@@ -218,20 +287,26 @@ static lv_obj_t *build_screen(TargetUnit target) {
     lv_obj_t *scan_lbl = lv_label_create(scan_btn);
     lv_label_set_text(scan_lbl, "Scan");
     lv_obj_add_event_cb(scan_btn, [](lv_event_t *) {
-        set_scan_state(true /*armed*/, false /*found*/);
+        // Click handlers stay non-blocking: this only arms the state machine.
+        // The one-shot chip bring-up happens on the next poll() tick, so the
+        // "Bringing up..." label is painted before the chip is touched.
+        if (s_state == ScanState::kFailed) {
+            return; // latched; re-enter the screen to retry
+        }
+        if (s_unit_ready) {
+            s_state = ScanState::kScanning;
+            set_status("Scanning...");
+        } else {
+            s_state = ScanState::kBringUp;
+            set_status("Bringing up unit...");
+        }
     }, LV_EVENT_CLICKED, nullptr);
 
     s_result_label = lv_label_create(content);
     lv_label_set_text(s_result_label, "No tag yet");
 
-    // Teardown: clear UI pointers + in-flight poll state.
-    lv_obj_add_event_cb(content, [](lv_event_t *) {
-        s_status_label = nullptr;
-        s_result_label = nullptr;
-        s_scan_armed = false;
-        s_tag_found = false;
-        s_last_attempt_ms = 0;
-    }, LV_EVENT_DELETE, nullptr);
+    lv_obj_add_event_cb(content, [](lv_event_t *) { teardown(); },
+                        LV_EVENT_DELETE, nullptr);
 
     return screen;
 }
@@ -246,31 +321,45 @@ static void start_rfid2_unit() {
 
 void register_module_nfc_unit() {
     g_registry.register_module({"nfc_read_nfc", "NFC: Tag Read",
-                                 Category::NFC, Affinity::TAB5_NATIVE,
-                                 start_nfc_unit, nullptr});
+                                Category::NFC, Affinity::TAB5_NATIVE,
+                                start_nfc_unit, nullptr});
 }
 
 void register_module_rfid2_unit() {
     g_registry.register_module({"nfc_read_rfid2", "RFID2: Tag Read",
-                                 Category::NFC, Affinity::TAB5_NATIVE,
-                                 start_rfid2_unit, nullptr});
+                                Category::NFC, Affinity::TAB5_NATIVE,
+                                start_rfid2_unit, nullptr});
 }
 
 void poll() {
-    if (!s_scan_armed || s_tag_found) return;
-    if (!s_status_label || !s_result_label) return;
+    // No screen -> nothing to do. This is also the guard that makes poll()
+    // free for every other feature's ticks.
+    if (s_status_label == nullptr || s_result_label == nullptr) {
+        return;
+    }
+
+    if (s_state == ScanState::kBringUp) {
+        run_bring_up();
+        return;
+    }
+    if (s_state != ScanState::kScanning) {
+        return;
+    }
 
     const uint32_t now = millis();
-    if (now - s_last_attempt_ms < 250) return;
+    if (now - s_last_attempt_ms < kScanIntervalMs) {
+        return;
+    }
     s_last_attempt_ms = now;
 
     NfcCommon::TagInfo info{};
-    std::memset(info.uid, 0, sizeof(info.uid));
-    info.uid_len = 0;
-    info.type_name[0] = '\0';
-
     if (!try_read_uid(&info)) {
-        lv_label_set_text(s_status_label, "Scanning...");
+        // try_read_*_uid() may have set a more specific status (collision,
+        // protocol error, hardware failure); only overwrite it while still
+        // actually scanning.
+        if (s_state == ScanState::kScanning) {
+            set_status("Scanning...");
+        }
         return;
     }
 
@@ -278,13 +367,17 @@ void poll() {
     uid_str[0] = '\0';
     NfcCommon::format_uid(info.uid, info.uid_len, uid_str, sizeof(uid_str));
 
-    char result[96];
-    std::snprintf(result, sizeof(result), "%s\nUID: %s", info.type_name, uid_str);
+    char result[128];
+    std::snprintf(result, sizeof(result), "%s\nUID (%u bytes): %s",
+                  info.type_name, (unsigned)info.uid_len, uid_str);
     lv_label_set_text(s_result_label, result);
 
-    s_tag_found = true;
-    lv_label_set_text(s_status_label, "Tag found");
+    Serial.printf("quarky-tab5: [nfc-read] %s tag: %s  UID %s\n",
+                  (s_target == TargetUnit::RFID2) ? "RFID2" : "NFC",
+                  info.type_name, uid_str);
+
+    s_state = ScanState::kFound;
+    set_status("Tag found");
 }
 
 } // namespace NfcRead
-

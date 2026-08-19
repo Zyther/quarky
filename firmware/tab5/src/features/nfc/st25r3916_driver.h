@@ -60,4 +60,62 @@ bool write_register(uint8_t reg, uint8_t val);
 // mode bits -- e.g. Set Default is 0xC1, not 0x01).
 bool execute_command(uint8_t cmd);
 
+// Register space B (added by Phase 3 Task 4's fix round; see the [DS] Figure 26
+// / [REF] st25r3916_com.cpp citations in the .cpp). `reg` is the 6-bit address
+// WITHIN space B (0x00-0x3F) -- do NOT pre-OR the 0x40 space-B marker that
+// [REF]'s own ST25R3916_SPACE_B constant uses, this API keeps the two spaces in
+// separate functions instead of multiplexing one address argument.
+bool read_register_b(uint8_t reg, uint8_t *val_out);
+bool write_register_b(uint8_t reg, uint8_t val);
+
+// --- ISO14443-A / NFC-A polled reader --------------------------------------
+// Added by Phase 3 Task 4's fix round to replace an RFAL-based tag-read path
+// that could never have worked on this hardware: ST's RFAL I2C driver requires
+// a wired IRQ pin (it returns ERR_PARAM from its constructor without one and
+// gates every interrupt read on digitalRead(int_pin)), and the Tab5's HY2.0
+// PORT.A connector is GND/5V/SDA/SCL only. Everything below therefore polls
+// the IRQ *status registers* (0x1A-0x1D, read-and-clear) that the IRQ pin
+// would merely have signalled -- see the .cpp for the exact citations.
+//
+// Scope, stated honestly: this is a SINGLE-TAG reader. The full ISO14443-3
+// bit-frame anticollision loop (walking the UID bit by bit when two tags
+// answer at once) is NOT implemented; a collision is detected and reported as
+// kCollision instead of being resolved. That covers "present one tag to the
+// reader", which is what this phase's tag-read feature does.
+struct Iso14443aTag {
+    uint8_t atqa[2];  // SENS_RES, as received (LSB first, exactly as on the wire)
+    uint8_t uid[10];  // NFCID1, cascade tags stripped
+    uint8_t uid_len;  // 4, 7 or 10
+    uint8_t sak;      // SEL_RES of the final cascade level
+};
+
+enum class NfcaResult : uint8_t {
+    kNoTag,          // nothing answered REQA within FDT -- the normal idle result
+    kFound,          // *out is filled
+    kCollision,      // more than one tag in the field (not resolved -- see above)
+    kProtocolError,  // a tag answered but the exchange did not follow ISO14443-3
+    kHardwareError,  // I2C/chip failure -- the unit is not usable right now
+};
+
+// One-shot bring-up for the NFC-A poller: init(), the ST analog/mode register
+// programme for NFC-A 106 kb/s, then field_on() and the 5 ms guard time.
+// Costs ~35 I2C register writes plus a ~10 ms oscillator wait and the 5 ms
+// guard time (~30 ms total at this bus's 100 kHz) -- call it ONCE when a
+// feature screen starts scanning, never per poll() tick.
+bool nfca_poller_begin();
+
+// Runs one complete detection pass: WUPA -> anticollision -> SELECT, through
+// however many cascade levels the tag's UID needs, then SLP_REQ to park the
+// tag in HALT so the next pass's WUPA can wake it again. (WUPA rather than
+// REQA is load-bearing, not a preference -- see the comment at its call site
+// in the .cpp.) Bounded: the whole call gives up after ~25 ms of wall clock
+// regardless of what the chip does, so it fits inside a poll() tick's ~50 ms
+// budget with margin. Typical real cost is 1-3 ms (no tag) or 6-12 ms (tag
+// found), dominated by I2C, not by RF.
+NfcaResult nfca_detect(Iso14443aTag *out);
+
+// Stops the poller: field_off() plus a Stop-all-activities so no timer or
+// receive state is left running. Safe to call when begin() was never called.
+void nfca_poller_end();
+
 } // namespace St25r3916
