@@ -36,7 +36,7 @@
 //        "Transport: I2C (0x24)" (:415).
 //
 //   [M5] M5STACK'S OWN CURRENT LIBRARY for this unit, github.com/m5stack/
-//        M5Unit-RFID (branch main, read 2026-08-18 via the GitHub API), is
+//        M5Unit-RFID (branch main, read 2026-08-19 via the GitHub API), is
 //        decisive about the family: src/unit/unit_WS1850S.hpp declares
 //        `class UnitWS1850S : public UnitMFRC522` with the doc comment
 //        "Functionally compatible with MFRC522. Supports NFC-A (always) and
@@ -52,14 +52,14 @@
 //
 //   [DS] NXP's own MFRC522 datasheet (rev 3.9, 27 April 2016,
 //        https://www.nxp.com/docs/en/data-sheet/MFRC522.pdf, downloaded and
-//        read 2026-08-18) supplies the primary-source framing that both donor
+//        read 2026-08-19) supplies the primary-source framing that both donor
 //        implementations are implementations OF -- see the citations at each
 //        function below. Sec 2 "General description": "The MFRC522 is a highly
 //        integrated reader/writer IC for contactless communication at
 //        13.56 MHz."
 //
 //   [M5D] M5Stack's product documentation for the unit itself,
-//        docs.m5stack.com/en/unit/rfid2 (retrieved 2026-08-18): "Read/Write
+//        docs.m5stack.com/en/unit/rfid2 (retrieved 2026-08-19): "Read/Write
 //        IC: WS1850S", "Operating Freq: 13.56MHz", "Communication Interface:
 //        I2C @0x28", "Supported Prot: ISO/IEC 14443 Type A/Type B". And for
 //        the previous-generation unit, docs.m5stack.com/en/unit/rfid: chip
@@ -75,21 +75,27 @@
 //      equivalent bring-up readback is VersionReg (0x37), which is precisely
 //      what BOTH donors use for this unit ([B] RFID2.cpp:34 PCD_GetVersion(),
 //      [U] via MFRC522_I2C.cpp:1242 PCD_ReadRegister(VersionReg)).
-//   3. The PN532 hypothesis is still testable, and this file tests it --
-//      pn532_frame_probe() below sends the real frame the brief asked for and
-//      reports what comes back, so the bring-up log contains a demonstration
-//      rather than an argument.
+//   3. The PN532 hypothesis was not merely argued down, it was TESTED. A
+//      pn532_frame_probe() shipped in this file's first commit, sending the
+//      real GetFirmwareVersion frame the brief asked for
+//      (00 00 FF 02 FE D4 02 2A 00) to 0x28, with the framing ported from
+//      UniGeek's own hand-rolled PN532 I2C code
+//      (screens/module/PN532I2cScreen.cpp:927-960 _nfcSendCmdReadAck, :18-24
+//      _nfcReadI2C). On real hardware, 2026-08-19, the unit did not respond to
+//      it, while this file's MFRC522 framing read VersionReg (0x37) = 0x15 --
+//      stable across a control re-read. The probe was then removed, having
+//      served its purpose; git history has it if the question is reopened.
 //
 // SOURCE MANIFEST for every constant and sequence below:
-//   [DS]  NXP MFRC522 datasheet rev 3.9 (primary; register addresses, I2C
-//         framing, VersionReg semantics)
-//   [MV2] RFID_MFRC522v2 (the library Bruce's RFID2.cpp uses), read at
-//         ~/src/firmware/.pio/libdeps/m5stack-cardputer/RFID_MFRC522v2/src/
-//   [MI2] MFRC522_I2C (the library UniGeek's MFRC522Screen.cpp uses), read at
+//   [DS]  NXP MFRC522 datasheet rev 3.9, 27 April 2016,
+//         https://www.nxp.com/docs/en/data-sheet/MFRC522.pdf (primary source:
+//         register addresses, I2C framing, VersionReg semantics). Downloaded
+//         and read 2026-08-19.
+//   [MV2] RFID_MFRC522v2 (the library Bruce's RFID2.cpp uses), read 2026-08-19
+//         at ~/src/firmware/.pio/libdeps/m5stack-cardputer/RFID_MFRC522v2/src/
+//   [MI2] MFRC522_I2C (the library UniGeek's MFRC522Screen.cpp uses), read
+//         2026-08-19 at
 //         ~/src/unigeek-main/firmware/.pio/libdeps/freenove/MFRC522_I2C/src/
-//   [UP]  UniGeek's hand-rolled PN532 I2C frame builder, used ONLY by
-//         pn532_frame_probe(): screens/module/PN532I2cScreen.cpp:927-960
-//         (_nfcSendCmdReadAck) and :18-24 (_nfcReadI2C)
 //
 // NO IRQ LINE (same constraint Task 2 documented for the NFC unit): the
 // HY2.0-4P connector carries GND / 5V / SDA / SCL only. MFRC522 has an IRQ
@@ -277,12 +283,17 @@ namespace Ws1850sDriver {
 
 const char *version_name(uint8_t version) {
     // [MV2] MFRC522v2.cpp:209-218 PCD_GetVersion() / [MI2] MFRC522_I2C.cpp:
-    // 1244-1255 PCD_DumpVersionToSerial(). Names are the donors' own.
+    // 1244-1255 PCD_DumpVersionToSerial(). Every name below is the donors'
+    // own, not this project's gloss -- the "Fudan Semiconductor FM17522"
+    // attribution in particular is [MI2] MFRC522_I2C.cpp:337's own comment
+    // ("case 0x88: // Fudan Semiconductor FM17522 clone"), and the enum names
+    // Version_FM17522 / Version_FM17522_1 / Version_FM17522E are [MV2]
+    // MFRC522Constants.h:114-116.
     switch (version) {
         case kVersionCounterfeit: return "counterfeit chip (donor libs' label for 0x12)";
-        case kVersionFm17522:     return "Fudan FM17522 clone";
-        case kVersionFm17522E:    return "Fudan FM17522E clone";
-        case kVersionFm17522_1:   return "Fudan FM17522 (variant 1)";
+        case kVersionFm17522:     return "Fudan Semiconductor FM17522 clone";
+        case kVersionFm17522E:    return "FM17522E ([MV2] Version_FM17522E)";
+        case kVersionFm17522_1:   return "FM17522 variant 1 ([MV2] Version_FM17522_1)";
         case kVersionMfrc522V0_0: return "MFRC522 v0.0";
         case kVersionMfrc522V1_0: return "MFRC522 v1.0";
         case kVersionMfrc522V2_0: return "MFRC522 v2.0";
@@ -354,21 +365,43 @@ bool init() {
         return false;
     }
 
-    // [MV2] MFRC522v2.cpp:104-133, comments quoted from that source:
-    write_register(kRegTxMode, kInitTxMode);      // reset baud rates
-    write_register(kRegRxMode, kInitRxMode);
-    write_register(kRegModWidth, kInitModWidth);  // reset ModWidthReg
+    // [MV2] MFRC522v2.cpp:104-133, comments quoted from that source.
+    //
+    // Both donors discard every one of these nine writes' status. This file
+    // criticises exactly that habit up in readRegisterRaw() ("both donors
+    // ignore it and read anyway, which is how a missing unit turns into a
+    // plausible-looking 0x00"), so it would be inconsistent to repeat it here
+    // -- the results are accumulated instead. Deliberately accumulated rather
+    // than early-returned: if the bus dies partway through, the programme
+    // should still be attempted in full so the VersionReg read below reports
+    // on the same chip state a donor driver would have produced, and ONE
+    // diagnostic covers the whole block instead of nine.
+    bool programmed = true;
+    programmed &= write_register(kRegTxMode, kInitTxMode);      // reset baud rates
+    programmed &= write_register(kRegRxMode, kInitRxMode);
+    programmed &= write_register(kRegModWidth, kInitModWidth);  // reset ModWidthReg
     // "When communicating with a PICC we need a timeout if something goes
     // wrong. f_timer = 13.56 MHz / (2*TPreScaler+1)."
-    write_register(kRegTMode, kInitTMode);        // TAuto=1
-    write_register(kRegTPrescaler, kInitTPrescaler); // 169 => f_timer 40kHz
-    write_register(kRegTReloadH, kInitTReloadH);  // 0x3E8 = 1000 => 25 ms
-    write_register(kRegTReloadL, kInitTReloadL);
+    programmed &= write_register(kRegTMode, kInitTMode);        // TAuto=1
+    programmed &= write_register(kRegTPrescaler, kInitTPrescaler); // 169 => 40kHz
+    programmed &= write_register(kRegTReloadH, kInitTReloadH);  // 0x3E8 => 25 ms
+    programmed &= write_register(kRegTReloadL, kInitTReloadL);
     // "Force a 100 % ASK modulation independent of the ModGsPReg setting"
-    write_register(kRegTxASK, kInitTxASK);
+    programmed &= write_register(kRegTxASK, kInitTxASK);
     // "Set the preset value for the CRC coprocessor for the CalcCRC command
     // to 0x6363 (ISO 14443-3 part 6.2.4)"
-    write_register(kRegMode, kInitMode);
+    programmed &= write_register(kRegMode, kInitMode);
+    if (!programmed) {
+        // Not fatal on its own -- the VersionReg check below is the real
+        // gate, and a chip that answers it is worth reporting on. But a
+        // partially-programmed PCD gives wrong timeouts and wrong modulation
+        // rather than an obvious failure, so it must not pass silently.
+        Serial.println("quarky-tab5: [ws1850s] at least one PCD_Init register "
+                       "write NACKed -- the chip is only PARTIALLY configured. "
+                       "Timer/ASK/CRC settings may not be what this driver "
+                       "believes. Treat any tag-level result after this as "
+                       "suspect.");
+    }
 
     // Both donors end PCD_Init with the antenna ON ([MV2]:133, [MI2]:226).
     // Kept, so init() leaves the chip in the state every donor flow that
@@ -437,121 +470,6 @@ void field_off() {
     }
     writeRegisterRaw(kRegTxControl,
                      static_cast<uint8_t>(value & ~kTxControlAntennaOn));
-}
-
-// ---------------------------------------------------------------------------
-// FALSIFICATION PROBE -- see the header. This is the ONLY PN532 code in this
-// file, and it exists to be disproved on hardware.
-// ---------------------------------------------------------------------------
-bool pn532_frame_probe(uint8_t out[4]) {
-    if (out == nullptr) {
-        return false;
-    }
-    out[0] = out[1] = out[2] = out[3] = 0;
-
-    nfc_ensure_external_i2c_begun();
-
-    // Frame layout and every byte of it ported from [UP] UniGeek's
-    // PN532I2cScreen.cpp:927-946 (_nfcSendCmdReadAck), which builds the frame
-    // by hand rather than through the Adafruit library:
-    //     packet[0..2] = 00 00 FF        preamble + start code
-    //     packet[3]    = LEN  = cmdlen+1 (the +1 is the TFI byte)
-    //     packet[4]    = LCS  = ~LEN+1
-    //     packet[5]    = 0xD4            TFI, host -> PN532
-    //     packet[6..]  = command bytes
-    //     packet[..]   = DCS  = ~(sum of TFI+cmd bytes)+1
-    //     packet[..]   = 0x00            postamble
-    // Command byte 0x02 = GetFirmwareVersion (Adafruit_PN532.h:31,
-    // PN532_COMMAND_GETFIRMWAREVERSION). Constants 0x00/0x00/0xFF/0xD4/0xD5
-    // are Adafruit_PN532.h:21-27.
-    //
-    // For cmdlen = 1 this is the well-known 9-byte frame
-    //     00 00 FF 02 FE D4 02 2A 00
-    // (LEN=2, LCS=0xFE, DCS = ~(0xD4+0x02)+1 = 0x2A).
-    static const uint8_t kFrame[] = {0x00, 0x00, 0xFF, 0x02, 0xFE,
-                                     0xD4, 0x02, 0x2A, 0x00};
-
-    Wire1.beginTransmission(kI2cAddr);
-    Wire1.write(kFrame, sizeof(kFrame));
-    const uint8_t tx_status = Wire1.endTransmission(true);
-    if (tx_status != 0) {
-        Serial.printf("quarky-tab5: [ws1850s] PN532 probe: frame write to 0x%02X "
-                      "NACKed (status %u) -- nothing is on the bus at all\n",
-                      kI2cAddr, (unsigned)tx_status);
-        return false;
-    }
-    delay(1); // [UP]:942 "I2C tuning (matches Adafruit SLOWDOWN)"
-
-    // [UP]:948-956: a PN532 signals readiness in bit 0 of a status byte that
-    // precedes every read, and answers a command frame with the 6-byte ACK
-    // 00 00 FF 00 FF 00 before the response proper. Poll for ready, briefly:
-    // a real PN532 answers GetFirmwareVersion in single-digit milliseconds,
-    // so 50 ms is generous and keeps a negative result fast.
-    const uint32_t deadline = millis() + 50U;
-    bool ready = false;
-    uint8_t status_byte = 0;
-    while ((int32_t)(millis() - deadline) < 0) {
-        if (Wire1.requestFrom(kI2cAddr, static_cast<size_t>(1)) == 1 && Wire1.available()) {
-            status_byte = static_cast<uint8_t>(Wire1.read());
-            if (status_byte & 0x01) {
-                ready = true;
-                break;
-            }
-        }
-        delay(5);
-    }
-    if (!ready) {
-        Serial.printf("quarky-tab5: [ws1850s] PN532 probe: no PN532 ready bit "
-                      "within 50 ms (last status byte 0x%02X). This is the "
-                      "EXPECTED result for MFRC522-protocol silicon -- on it, "
-                      "that byte is just the content of whatever register the "
-                      "frame's first byte selected.\n", status_byte);
-        return false;
-    }
-
-    // [UP]:958-960 checks the ACK frame 00 00 FF 00 FF 00 after discarding
-    // the leading status byte ([UP]:18-24 _nfcReadI2C).
-    uint8_t ack[7] = {0};
-    if (Wire1.requestFrom(kI2cAddr, static_cast<size_t>(sizeof(ack))) != sizeof(ack)) {
-        return false;
-    }
-    for (size_t i = 0; i < sizeof(ack) && Wire1.available(); i++) {
-        ack[i] = static_cast<uint8_t>(Wire1.read());
-    }
-    const bool ack_ok = (ack[1] == 0x00 && ack[2] == 0x00 && ack[3] == 0xFF &&
-                         ack[4] == 0x00 && ack[5] == 0xFF && ack[6] == 0x00);
-    Serial.printf("quarky-tab5: [ws1850s] PN532 probe: ready bit SET, bytes "
-                  "%02X %02X %02X %02X %02X %02X %02X -- ACK frame %s\n",
-                  ack[0], ack[1], ack[2], ack[3], ack[4], ack[5], ack[6],
-                  ack_ok ? "MATCHES (!!! re-examine the chip identity !!!)"
-                         : "does not match 00 00 FF 00 FF 00");
-    if (!ack_ok) {
-        return false;
-    }
-
-    // Only reachable if this chip really does speak PN532. Read the response
-    // frame and hand back the four GetFirmwareVersion payload bytes (IC, Ver,
-    // Rev, Support) that live after status + 00 00 FF LEN LCS D5 03.
-    uint8_t resp[14] = {0};
-    if (Wire1.requestFrom(kI2cAddr, static_cast<size_t>(sizeof(resp))) != sizeof(resp)) {
-        return false;
-    }
-    for (size_t i = 0; i < sizeof(resp) && Wire1.available(); i++) {
-        resp[i] = static_cast<uint8_t>(Wire1.read());
-    }
-    // resp[0] status, [1..3] 00 00 FF, [4] LEN, [5] LCS, [6] TFI=0xD5,
-    // [7] response code 0x03, [8..11] IC/Ver/Rev/Support.
-    if (resp[6] != 0xD5 || resp[7] != 0x03) {
-        Serial.println("quarky-tab5: [ws1850s] PN532 probe: ACK matched but the "
-                       "response frame is not D5 03 -- do NOT report this as a "
-                       "PN532 without investigating");
-        return false;
-    }
-    out[0] = resp[8];
-    out[1] = resp[9];
-    out[2] = resp[10];
-    out[3] = resp[11];
-    return true;
 }
 
 } // namespace Ws1850sDriver

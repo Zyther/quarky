@@ -29,10 +29,11 @@
 // MFRC522 datasheet. See ws1850s_driver.cpp's header for the full source
 // manifest with file/line citations.
 //
-// The brief's PN532 hypothesis is not merely asserted-wrong here: it is
-// implemented as an explicit falsification probe (pn532_frame_probe() below)
-// so the hardware bring-up can DEMONSTRATE which framing this chip answers,
-// side by side, in one serial trigger.
+// CONFIRMED ON REAL HARDWARE 2026-08-19 (RFID2 unit on PORT.A): this driver's
+// MFRC522 framing reads VersionReg (0x37) = 0x15, stable across a control
+// re-read, while a real PN532 GetFirmwareVersion frame sent to the same
+// address got no response. The correction above is therefore verified at
+// register level, not merely argued from donor source.
 //
 // Bus access reuses hal/nfc_pn532.cpp's nfc_ensure_external_i2c_begun(),
 // which owns the PORT.A EXT_5V_EN power gate and the GPIO53 teardown
@@ -51,6 +52,12 @@ namespace Ws1850sDriver {
 // Inventing one would be exactly the fabrication this project forbids, so the
 // pass/fail test is the donor libraries' own: a read that returns 0x00 or
 // 0xFF means the bus, not the chip, answered (see kVersionCommsFailure*).
+//
+// OBSERVED on this project's hardware, 2026-08-19: 0x15 -- which is NOT one of
+// the values any donor library names (see the constants below). That is a
+// single observation, not a datasheet fact: it is worth knowing and worth
+// logging, but do NOT turn it into a required value. A different production
+// run of the same unit reporting something else would be a pass, not a fault.
 constexpr uint8_t kVersionCommsFailureLow  = 0x00U; // no device / SDA stuck low
 constexpr uint8_t kVersionCommsFailureHigh = 0xFFU; // no device / bus pulled up
 
@@ -93,21 +100,12 @@ bool get_firmware_version(uint8_t out[4]);
 // from an I2C NACK.
 bool get_version(uint8_t *version_out);
 
-// FALSIFICATION PROBE for the brief's PN532 premise -- not a feature.
-//
-// Sends a real PN532 GetFirmwareVersion frame (00 00 FF 02 FE D4 02 2A 00,
-// framing ported from UniGeek's real PN532 I2C code, see the .cpp) to I2C
-// 0x28 and looks for a PN532 ACK + response. Expected result on this unit:
-// FALSE, because it is MFRC522-protocol silicon. Kept in the tree because
-// the plan's own acceptance criterion was "does this chip really speak PN532
-// framing", and a demonstrated negative is worth more than an argued one.
-//
-// Safety of running it: an MFRC522-protocol chip parses the first byte of an
-// I2C write as a register address, so this frame writes into register 0x00,
-// which the MFRC522 datasheet Table 20 lists as "reserved for future use" --
-// no side effect on any register this driver or any later feature uses.
-// init() is nonetheless re-run after it by the serial trigger.
-bool pn532_frame_probe(uint8_t out[4]);
+// (A pn532_frame_probe() lived here between 2026-08-19's two commits: it sent
+// a real PN532 GetFirmwareVersion frame to 0x28 so the plan's premise could be
+// falsified on hardware rather than only in argument. It served its purpose --
+// the unit did not respond to it, recorded above -- and was removed once that
+// result existed, rather than left as permanently-unreachable success-path
+// parsing code. Recover it from git history if the question is ever reopened.)
 
 // Antenna driver (the RF field). MFRC522 TxControlReg (0x14) bits Tx1RFEn /
 // Tx2RFEn. After any reset the field is OFF.

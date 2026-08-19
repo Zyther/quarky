@@ -891,76 +891,64 @@ void loop() {
             // MFRC522-family register-mapped part, not PN532. Full citations
             // in features/nfc/ws1850s_driver.cpp's header.
             //
-            // So this trigger runs BOTH and prints them side by side:
-            //   A. the real MFRC522-protocol readback -- VersionReg (0x37),
-            //      which is exactly what both donors use to identify this
-            //      unit;
-            //   B. the plan's PN532 GetFirmwareVersion frame, as a
-            //      falsification probe, so the negative is demonstrated
-            //      rather than argued.
+            // CONFIRMED ON REAL HARDWARE 2026-08-19: this trigger read
+            // VersionReg (0x37) = 0x15 via MFRC522 framing, stable across a
+            // control re-read, while a real PN532 GetFirmwareVersion frame
+            // sent to the same address got no response. A one-shot
+            // pn532_frame_probe() existed for that second half and was removed
+            // once its result was recorded -- see ws1850s_driver.h.
             //
-            // ACCEPTANCE CRITERION for A -- and note it is deliberately NOT a
+            // ACCEPTANCE CRITERION -- and note it is deliberately NOT a
             // specific expected byte, unlike Task 2's 0x28 ic_type: no public
             // WiseSun/M5Stack document found for this task states what a
             // WS1850S reports in VersionReg, and inventing an expected value
             // is precisely what this project forbids. The donors' own test is
             // used instead: any value other than 0x00 or 0xFF is a real chip
             // answering (both donor libraries treat exactly those two as
-            // "communication probably failed"). Record whatever comes back --
-            // it becomes the citable value for this hardware.
+            // "communication probably failed").
+            //
+            // 0x15 is what THIS unit returned, and it is not a value any donor
+            // library names -- which is the whole reason no expected value is
+            // hard-coded. Do not "tighten" the check to 0x15: that would be a
+            // single observation promoted to a spec.
             Serial.println("quarky-tab5: [debug] Ws1850sDriver bring-up via serial trigger");
             uint8_t version = 0;
             bool init_ok = Ws1850sDriver::init();
             bool read_ok = Ws1850sDriver::get_version(&version);
             if (!read_ok) {
-                Serial.println("quarky-tab5: [ws1850s] *** A: FAIL -- VersionReg "
+                Serial.println("quarky-tab5: [ws1850s] *** FAIL -- VersionReg "
                                "(0x37) could not be read at all; I2C 0x28 on Wire1 "
                                "did not answer. Is the RFID2 unit (not the NFC "
                                "unit, not RF433R) on PORT.A? ***");
             } else if (version == Ws1850sDriver::kVersionCommsFailureLow ||
                        version == Ws1850sDriver::kVersionCommsFailureHigh) {
-                Serial.printf("quarky-tab5: [ws1850s] *** A: FAIL -- VersionReg = "
+                Serial.printf("quarky-tab5: [ws1850s] *** FAIL -- VersionReg = "
                               "0x%02X, which both donor libraries treat as "
                               "'communication probably failed' (a floating or "
                               "stuck SDA reads this way), not as a chip "
                               "version ***\n", version);
             } else {
-                Serial.printf("quarky-tab5: [ws1850s] *** A: PASS -- VersionReg "
+                Serial.printf("quarky-tab5: [ws1850s] *** PASS -- VersionReg "
                               "(0x37) = 0x%02X (%s). The RFID2 unit answers "
                               "MFRC522 register framing. ***\n",
                               version, Ws1850sDriver::version_name(version));
+                if (version != 0x15) {
+                    Serial.println("quarky-tab5: [ws1850s] note: 2026-08-19's unit "
+                                   "read 0x15. A different value is NOT a failure "
+                                   "(no datasheet documents this field for WS1850S) "
+                                   "-- but record it, since it means the observed "
+                                   "set is wider than one.");
+                }
             }
 
-            // B. The falsification probe. Safe against MFRC522 silicon: the
-            // frame's first byte selects register 0x00, which the MFRC522
-            // datasheet's register table lists as reserved, and the remaining
-            // bytes land in that same register (this chip family has no
-            // address auto-increment on writes). No register this driver or
-            // any later feature uses is touched.
-            uint8_t pn532_fw[4] = {0};
-            bool pn532_ok = Ws1850sDriver::pn532_frame_probe(pn532_fw);
-            if (pn532_ok) {
-                Serial.printf("quarky-tab5: [ws1850s] *** B: UNEXPECTED -- the unit "
-                              "ANSWERED a PN532 GetFirmwareVersion frame: IC=0x%02X "
-                              "Ver=0x%02X Rev=0x%02X Support=0x%02X. If this ever "
-                              "prints, the MFRC522 conclusion in ws1850s_driver.cpp "
-                              "must be re-opened before anything is built on it. ***\n",
-                              pn532_fw[0], pn532_fw[1], pn532_fw[2], pn532_fw[3]);
-            } else {
-                Serial.println("quarky-tab5: [ws1850s] *** B: EXPECTED -- no PN532 "
-                               "response. The plan's 'WS1850S is PN532-register-"
-                               "compatible' premise is refuted on hardware, not just "
-                               "in the donor source. ***");
-            }
-
-            // Re-read A after B, as a control: if the probe had disturbed
-            // anything that matters, this second read would differ from the
-            // first. (init() itself is latched and will not re-run, which is
-            // exactly why the check is a re-read rather than a re-init.)
+            // Control re-read: cheap, and it distinguishes "the chip answered
+            // once" from "the chip answers consistently". A one-off good read
+            // on a marginal bus is exactly the kind of result that gets
+            // over-trusted.
             uint8_t version_after = 0;
             if (Ws1850sDriver::get_version(&version_after)) {
-                Serial.printf("quarky-tab5: [ws1850s] control re-read after the "
-                              "PN532 probe: VersionReg = 0x%02X (%s)\n",
+                Serial.printf("quarky-tab5: [ws1850s] control re-read: VersionReg "
+                              "= 0x%02X (%s)\n",
                               version_after,
                               version_after == version ? "unchanged, as expected"
                                                        : "CHANGED -- investigate");
