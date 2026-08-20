@@ -224,8 +224,12 @@
 //          touching a mask register.
 //        - Tables 62/63/64/65 "Main / Timer and NFC / Error and wake-up /
 //          Passive target interrupt register" (1Ah/1Bh/1Ch/1Dh, p.97-100),
-//          all Type: R with the footnote "After register has been read, its
-//          content is set to 0". Bit positions used below:
+//          all Type: R and all read-and-clear -- Tables 63-65's shared
+//          footnote "After register has been read, its content is set to 0"
+//          covers 1Bh/1Ch/1Dh directly; Table 62 (1Ah) carries no such
+//          footnote of its own, but the same behavior for it is documented in
+//          Sec 4.3.1's prose and, separately, in Table 64's footnote. Bit
+//          positions used below:
 //            1Ah: I_osc 7, I_wl 6, I_rxs 5, I_rxe 4, I_txe 3, I_col 2
 //            1Bh: I_dct 7, I_nre 6, I_gpe 5
 //            1Ch: I_crc 7, I_par 6, I_err2 5 (soft framing), I_err1 4 (hard
@@ -734,8 +738,9 @@ bool changeRegisterBitsB(uint8_t reg, uint8_t mask, uint8_t value) {
 
 // --- Polled interrupt status ------------------------------------------------
 // THE substitute for the IRQ pin this hardware does not have. Regs 1Ah..1Dh
-// are read-and-clear ([DS] Tables 62-65's shared footnote), so one 4-byte
-// burst read both samples and consumes the pending interrupt state -- which is
+// are read-and-clear ([DS] Tables 63-65's shared footnote, plus Table 62/1Ah
+// via Sec 4.3.1 prose and Table 64's footnote), so one 4-byte burst read both
+// samples and consumes the pending interrupt state -- which is
 // precisely what [EH] st25r3916ClearInterrupts() (st25r3916_interrupt.cpp:
 // 225-233) does. The only thing the IRQ pin ever contributed was permission to
 // bother reading; on a bus this slow, reading unconditionally costs less than
