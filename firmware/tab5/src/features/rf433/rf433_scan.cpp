@@ -17,12 +17,14 @@ namespace Rf433Scan {
 
 // Session signals buffer -- heap-allocated in PSRAM, NOT a static/global
 // array, and NOT optional polish. Real-hardware finding (2026-08-20):
-// kMaxCapturedSignals(16) * sizeof(CapturedSignal) is ~64KB (edges[512] *
-// 8B/EdgeSample + bookkeeping), which as a plain `static` array lands in
-// internal DRAM. Bisected on real hardware: the last commit before this
-// buffer existed had 214302 bytes of internal DRAM free (51.88% used); the
-// commit that added it as a static array dropped that to 140210 bytes free
-// (68.52% used) -- and that ~74KB drop was enough to intermittently starve
+// kMaxCapturedSignals(16) * sizeof(CapturedSignal) is 65792 bytes (~64KB;
+// edges[512] * 8B/EdgeSample + bookkeeping), which as a plain `static`
+// array lands in internal DRAM. Bisected on real hardware: the last
+// commit before this buffer existed had 214302 bytes of internal DRAM
+// free (51.88% used); the commit that added it as a static array dropped
+// that to 140210 bytes free (68.52% used) -- a 74092-byte whole-commit
+// delta (this buffer plus s_accum_edges and other additions in the same
+// commit, not this buffer alone) that was enough to intermittently starve
 // the BLE controller's own internal-RAM-only allocations (observed as
 // continuous "vhci_drv: ... malloc failed" / "NimBLE: ... rc=17" errors)
 // or, worse, push some other task's stack into PSRAM entirely, which trips
@@ -423,13 +425,18 @@ void start() {
 
 void register_module() {
     // See s_signals' declaration comment for the real-hardware finding this
-    // allocation exists to fix. MALLOC_CAP_SPIRAM is a hard requirement, not
-    // a hint: falling back to internal RAM on failure would silently
-    // reintroduce the exact internal-DRAM exhaustion this is fixing, so
-    // heap_caps_malloc's request is left unqualified by MALLOC_CAP_8BIT/
-    // MALLOC_CAP_DMA (this buffer is never touched by DMA, only plain CPU
-    // reads/writes) and a failure is treated as fatal to this feature only,
-    // not papered over.
+    // allocation exists to fix. heap_caps_malloc's caps argument is a
+    // bitwise AND, not a fallback list -- the returned block must have ALL
+    // requested capabilities, there is no "try this, fall back to that"
+    // behavior to guard against here. MALLOC_CAP_8BIT is omitted because
+    // PSRAM regions already register 8-bit-capable by default (this is a
+    // plain byte-addressed struct array, nothing here needs it spelled
+    // out); MALLOC_CAP_DMA is omitted because nothing DMAs from this
+    // buffer -- transmit() (rf433_replay.cpp) copies it out to its own
+    // heap args on the main task before any task/DMA touches the copy. A
+    // failed allocation is treated as fatal to this feature only, not
+    // papered over with a silent internal-RAM fallback that would
+    // reintroduce the exact exhaustion this fix exists to prevent.
     s_signals = static_cast<CapturedSignal *>(
         heap_caps_malloc(sizeof(CapturedSignal) * kMaxCapturedSignals, MALLOC_CAP_SPIRAM));
     if (!s_signals) {
