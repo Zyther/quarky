@@ -22,6 +22,13 @@
 #include "features/wifi/wifi_evil_portal.h"
 #include "features/nfc/nfc_read.h" // Phase 3 Task 4: NFC/RFID2 tag read UI
 #include "features/rf433/rf433_scan.h" // Phase 3 Task 5: RF433 scan/capture UI
+#include "features/rf433/rf433_replay.h" // Phase 3 Task 6: replay a captured
+                                          // signal on TAB5_RF433T_PIN. No
+                                          // register_module()/launcher tile of
+                                          // its own -- reachable only via the
+                                          // Replay button rf433_scan.cpp wires
+                                          // into its scan-result list (see
+                                          // rf433_replay.h's header comment)
 #include "features/ble/ble_scan.h"
 #include "features/ble/ble_spam.h"
 #include "features/ble/ble_finder.h"
@@ -549,6 +556,13 @@ void loop() {
                         // is open and Scan is armed; drives RFAL/MFRC522 polling
     Rf433Scan::poll();  // Phase 3 Task 5: no-ops unless RF433 scan/capture screen
                         // is open and active; drains edge interrupt ring buffer
+    Rf433Replay::poll(); // Phase 3 Task 6: no-ops unless a transmit task is in
+                          // flight or has just finished; releases the GPIO53
+                          // arbiter claim on completion (main-task-only, see
+                          // hal/gpio53_arbiter.h) -- independent of whether the
+                          // RF433 Scan screen (where Replay is launched from)
+                          // is still open, same as WifiConnectFeature::poll()
+                          // below tolerates its screen closing mid-connect
     WifiSpectrumFeature::poll(); // no-ops unless the WiFi Spectrum screen is open
     WifiConnectFeature::poll();  // no-ops unless a connect is in flight; drains the
                                   // background connect_task()'s result -- real-hardware
