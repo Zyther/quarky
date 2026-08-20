@@ -907,6 +907,14 @@ void loop() {
             }
             Serial.printf("quarky-tab5: [st25r3916] init() returned %s\n",
                           init_ok ? "true" : "false");
+            // This trigger's NFC "session" is over -- release the GPIO53
+            // arbiter claim St25r3916::init()/read_chip_id() made (via
+            // nfc_ensure_external_i2c_begun()), same reasoning as the boot-time
+            // census/detect() release above: without this, RF433's 'r' trigger
+            // would be refused forever after a single 'n' press, since nothing
+            // else releases a kExternalI2c claim made from a serial-debug spike
+            // (there is no screen here for nfc_read.cpp's teardown() to run).
+            nfc_release_external_i2c();
         } else if (c == '2') {
             // Task 3 (Phase 3 plan): the RFID2-unit (WS1850S) bring-up SPIKE.
             // No launcher tile, same shape as 'c'/'h'/'r'/'n' above; serial is
@@ -996,6 +1004,13 @@ void loop() {
 
             Serial.printf("quarky-tab5: [ws1850s] init() returned %s\n",
                           init_ok ? "true" : "false");
+            // Same reasoning as the 'n' handler above and the boot-time
+            // census/detect() release: this trigger's NFC "session" (via
+            // Ws1850sDriver::init()/get_version()) claimed GPIO53's arbiter
+            // ownership and there is no screen here to release it on teardown,
+            // so release explicitly or RF433's 'r' trigger is refused forever
+            // after a single '2' press.
+            nfc_release_external_i2c();
         }
     }
 

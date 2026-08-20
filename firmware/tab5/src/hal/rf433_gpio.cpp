@@ -53,10 +53,13 @@
 // So: call this (or do a bare pinMode) only while an RF433 feature is actually
 // running, and expect whoever wants the I2C bus next to re-establish it. The
 // same applies to Rf433Common::capture_start(), which does its own on-demand
-// pinMode(TAB5_RF433R_PIN, INPUT) -- that is correct, and it is also why
-// pressing the 'r' RF433 trigger invalidates Wire1 for the rest of the boot
-// unless the I2C side re-begins (hal/nfc_pn532.cpp's
-// ensureExternalI2CBegun() detects exactly this and recovers).
+// pinMode(TAB5_RF433R_PIN, INPUT) -- that is correct, and it is also why a
+// successful 'r' RF433 capture invalidates Wire1 for the rest of the boot
+// unless the I2C side re-begins (hal/nfc_pn532.cpp's ensureExternalI2CBegun()
+// detects exactly this and recovers -- as of 2026-08-19 that recovery is
+// itself conditional on hal/gpio53_arbiter.h's claim succeeding, i.e. it
+// refuses instead of recovering while a capture is genuinely still live; see
+// the section below).
 //
 // --- AND THE SAME HAZARD RAN IN REVERSE (also CLOSED, 2026-08-19) --------
 // That I2C recovery takes GPIO53 BACK: i2cInit() calls perimanClearPinBus()
@@ -73,7 +76,8 @@
 // features/rf433/rf433_common.cpp's header for the same history from the
 // capture side.
 //
-// FIXED: both directions now go through hal/gpio53_arbiter.h's
+// FIXED -- FOR THE RECEIVE/CAPTURE PATH ONLY, see qualifier below: both
+// directions of the RECEIVE-side hazard now go through hal/gpio53_arbiter.h's
 // Gpio53Arbiter::claim()/release(), a single runtime owner token shared by
 // hal/nfc_pn532.cpp and features/rf433/rf433_common.cpp -- not a
 // back-reference between hal/ and features/ (both depend on the shared
@@ -81,10 +85,25 @@
 // capture_start() claims Owner::kRf433 and refuses (returns false, no
 // pinMode()) if I2C holds the pin; hal/nfc_pn532.cpp's
 // ensureExternalI2CBegun() claims Owner::kExternalI2c and refuses (returns
-// false, no Wire1 touch) if RF433 holds it. So a pinMode()/Wire1.begin() on
-// GPIO53 can now only happen when the caller has confirmed exclusive
-// ownership first -- neither direction of "took the pin out from under the
-// other, silently" described above can occur anymore.
+// false, no Wire1 touch) if RF433 holds it. So for THAT path, a
+// pinMode()/Wire1.begin() on GPIO53 can now only happen when the caller has
+// confirmed exclusive ownership first -- neither direction of "took the pin
+// out from under the other, silently" described above can occur anymore
+// THROUGH capture_start()/capture_stop() and ensureExternalI2CBegun().
+//
+// QUALIFIER, so this paragraph does not overclaim what is actually true
+// file-wide: Rf433Gpio::init() below -- this file's only function -- is NOT
+// wired into the arbiter. Its pinMode(TAB5_RF433R_PIN, INPUT) /
+// pinMode(TAB5_RF433T_PIN, OUTPUT) calls claim nothing and check nothing, so
+// calling init() while an NFC/RFID2 session holds GPIO53 would silently steal
+// the pin exactly as before this fix, for this one function. This is not
+// presently reachable (nothing calls Rf433Gpio::init() -- see the "DO NOT
+// CALL init() UNCONDITIONALLY AT BOOT" section above and the Task 6 note
+// inside init() below), but it means "closed" above describes the
+// capture_start()/capture_stop() path specifically, not every function in
+// this file. Task 6 (RF433 transmit/replay), init()'s first real caller, must
+// wire its own claim/release(Owner::kRf433) pair around it -- see the note
+// inside init() for exactly where.
 // ===========================================================================
 
 bool Rf433Gpio::init() {

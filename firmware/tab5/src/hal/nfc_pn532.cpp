@@ -255,7 +255,17 @@ bool ensureExternalI2CBegun() {
                       "it.\n",
                       TAB5_EXTERNAL_I2C_SDA_GPIO);
     }
-    return beginExternalI2C();
+    if (!beginExternalI2C()) {
+        // Don't hold GPIO53 hostage for a bus that isn't even usable -- that
+        // would block RF433 from a pin this owner cannot currently do
+        // anything useful with anyway, which is the same "refuse rather than
+        // lie" spirit this whole mechanism is built on. Release immediately
+        // rather than waiting for whatever this owner's normal release point
+        // is.
+        Gpio53Arbiter::release(Gpio53Arbiter::Owner::kExternalI2c);
+        return false;
+    }
+    return true;
 }
 
 const char *labelForExternalI2CAddr(uint8_t a) {
