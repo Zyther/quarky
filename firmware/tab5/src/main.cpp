@@ -554,15 +554,23 @@ void loop() {
     c2link_ble.poll();  // drains BLE frames received on the NimBLE host task
     NfcRead::poll();    // Phase 3 Task 4: no-ops unless NFC/RFID2 tag-read screen
                         // is open and Scan is armed; drives RFAL/MFRC522 polling
-    Rf433Scan::poll();  // Phase 3 Task 5: no-ops unless RF433 scan/capture screen
-                        // is open and active; drains edge interrupt ring buffer
     Rf433Replay::poll(); // Phase 3 Task 6: no-ops unless a transmit task is in
                           // flight or has just finished; releases the GPIO53
                           // arbiter claim on completion (main-task-only, see
                           // hal/gpio53_arbiter.h) -- independent of whether the
                           // RF433 Scan screen (where Replay is launched from)
                           // is still open, same as WifiConnectFeature::poll()
-                          // below tolerates its screen closing mid-connect
+                          // below tolerates its screen closing mid-connect.
+                          // Deliberately polled BEFORE Rf433Scan::poll() (Task 6
+                          // review fix): Rf433Scan::poll()'s
+                          // update_replay_status_ui() reads Rf433Replay::state()
+                          // to render "Transmitting..."/"Done" -- polling replay
+                          // first means a transmit that finished this tick is
+                          // already State::kDone by the time the scan screen
+                          // renders, instead of "Transmitting..." lingering for
+                          // one extra UI tick after the burst actually completed.
+    Rf433Scan::poll();  // Phase 3 Task 5: no-ops unless RF433 scan/capture screen
+                        // is open and active; drains edge interrupt ring buffer
     WifiSpectrumFeature::poll(); // no-ops unless the WiFi Spectrum screen is open
     WifiConnectFeature::poll();  // no-ops unless a connect is in flight; drains the
                                   // background connect_task()'s result -- real-hardware

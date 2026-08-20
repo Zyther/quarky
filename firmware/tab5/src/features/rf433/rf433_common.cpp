@@ -1,4 +1,7 @@
 #include "rf433_common.h"
+#include "rf433_replay.h" // Task 6 review fix: is_busy() -- see capture_start()'s
+                           // RX/TX exclusion check below and this file's header
+                           // comment on the arbiter-alone-isn't-enough hazard
 #include "../../../boards/tab5/pins_config.h"
 #include "../../hal/gpio53_arbiter.h"
 #include <Arduino.h>
@@ -44,6 +47,32 @@
 // either this module holds the pin for the whole capture, or it never touched
 // it in the first place. See ensureExternalI2CBegun() in hal/nfc_pn532.cpp
 // for the mirror-image half of this fix on the I2C side.
+//
+// ---- A SECOND, DIFFERENT HAZARD (2026-08-19/20): RX vs TX, NOT RX vs I2C --
+// The fix above only ever distinguishes "this subsystem" (RF433) from "the
+// external I2C bus". It does NOT distinguish RF433 RECEIVE from RF433
+// TRANSMIT (Task 6's rf433_replay.cpp): both capture_start() (here) and
+// Rf433Replay::transmit() claim the SAME Owner::kRf433 token, correctly,
+// since together they ARE the one subsystem holding exclusivity against I2C.
+// But Gpio53Arbiter::claim() is idempotent per-owner (see its header) --
+// claiming an owner that already holds the pin just returns true again. So
+// the token alone cannot stop a capture's attachInterrupt() handler and a
+// replay's pinMode(OUTPUT)/digitalWrite() from both being live on GPIO53 at
+// once, or from one tearing the pin down (pinMode()/detachInterrupt()) while
+// the other is still using it.
+//
+// FIXED by an explicit, second, RX/TX-specific check layered on top of the
+// arbiter, not inside it: capture_start() (below) refuses if
+// Rf433Replay::is_busy() is true, and Rf433Replay::transmit() refuses if
+// is_capturing() (this file) is true. This check lives HERE, in
+// capture_start(), rather than in Rf433Scan::set_capture_active() --
+// deliberately: this file is the one real arbitration boundary for the pin
+// (set_capture_active() already just forwards to capture_start()/
+// capture_stop() and owns no pin state of its own), and putting both halves
+// of the RX/TX check at the same layer (Rf433Common::capture_start() checks
+// Rf433Replay, Rf433Replay::transmit() checks Rf433Common) keeps the
+// exclusion symmetric instead of split across two different abstraction
+// levels. See rf433_replay.cpp's transmit() for the other half.
 // ===========================================================================
 
 namespace Rf433Common {
@@ -163,6 +192,16 @@ void IRAM_ATTR isr_edge() {
 
 bool capture_start() {
     if (s_capturing) return true;
+    if (Rf433Replay::is_busy()) {
+        // Refused -- a Task 6 replay is currently bit-banging TAB5_RF433T_PIN
+        // (the same physical pin). The arbiter's Owner::kRf433 token would let
+        // this claim through (idempotent re-claim by the same owner), so this
+        // explicit check is what actually prevents attachInterrupt() from
+        // arming on top of a live transmit. See this file's header comment.
+        Serial.println("quarky-tab5: [rf433] capture_start() REFUSED -- a "
+                        "replay (Rf433Replay) is currently transmitting");
+        return false;
+    }
     if (!Gpio53Arbiter::claim(Gpio53Arbiter::Owner::kRf433)) {
         // Refused -- the external I2C bus (NFC/RFID2) currently owns GPIO53.
         // Do NOT call pinMode()/attachInterrupt(): that would tear down Wire1

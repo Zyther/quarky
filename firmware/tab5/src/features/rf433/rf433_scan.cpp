@@ -178,22 +178,43 @@ static void add_signal_to_list(const CapturedSignal &sig) {
 
 // Reflects Rf433Replay's async state onto this screen's replay widgets.
 // Called from poll() every tick regardless of capture state (s_active) --
-// a replay can be in flight whether or not a capture is also running, since
-// the two are mutually exclusive only via the GPIO53 arbiter, not via any
-// UI-level lock here. No-ops if the screen isn't open (widgets null).
+// a replay can be in flight whether or not a capture is also running,
+// though never BOTH: rf433_common.cpp's capture_start() refuses while
+// Rf433Replay::is_busy(), and Rf433Replay::transmit() refuses while
+// Rf433Common::is_capturing() -- an explicit RX/TX check on top of the
+// GPIO53 arbiter, added because the arbiter's single Owner::kRf433 token
+// (idempotent per-owner) cannot by itself tell RX and TX apart. There is
+// still no UI-level lock here; the exclusion is enforced by those two
+// modules, not by this screen. No-ops if the screen isn't open (widgets
+// null).
 static void update_replay_status_ui() {
     if (!s_replay_status_label || !s_replay_btn) return;
+
+    // Suffix appended to the Transmitting/Done text when the in-flight (or
+    // just-finished) replay is of a truncated capture -- see
+    // Rf433Replay::transmit()'s doc comment for why truncated signals are
+    // replayed (their available prefix) rather than refused, and
+    // last_transmit_was_truncated()'s doc comment for this flag's lifetime.
+    const char *trunc_suffix = Rf433Replay::last_transmit_was_truncated()
+                                    ? " [TRUNCATED -- partial burst only]"
+                                    : "";
 
     switch (Rf433Replay::state()) {
         case Rf433Replay::State::kIdle:
             lv_label_set_text(s_replay_status_label, "Replay: Idle");
             break;
-        case Rf433Replay::State::kTransmitting:
-            lv_label_set_text(s_replay_status_label, "Replay: Transmitting...");
+        case Rf433Replay::State::kTransmitting: {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "Replay: Transmitting...%s", trunc_suffix);
+            lv_label_set_text(s_replay_status_label, buf);
             break;
-        case Rf433Replay::State::kDone:
-            lv_label_set_text(s_replay_status_label, "Replay: Done");
+        }
+        case Rf433Replay::State::kDone: {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "Replay: Done%s", trunc_suffix);
+            lv_label_set_text(s_replay_status_label, buf);
             break;
+        }
         case Rf433Replay::State::kFailed: {
             char buf[112];
             std::snprintf(buf, sizeof(buf), "Replay: Failed (%s)",
@@ -301,10 +322,14 @@ static lv_obj_t *build_screen() {
             s_selected_capture_id = 0;
             return;
         }
-        // transmit() itself refuses cleanly (busy / truncated / arbiter-held)
-        // and reports the reason via Rf433Replay::state()/failure_reason(),
-        // which update_replay_status_ui() (driven from poll()) surfaces here
-        // -- no need to duplicate those checks in this click handler.
+        // transmit() itself refuses cleanly (busy / a capture is active /
+        // no edges / arbiter-held) and reports the reason via
+        // Rf433Replay::state()/failure_reason(), which
+        // update_replay_status_ui() (driven from poll()) surfaces here -- no
+        // need to duplicate those checks in this click handler. A truncated
+        // signal is NOT refused: transmit() replays its captured prefix and
+        // update_replay_status_ui() shows a warning instead (see
+        // Rf433Replay::last_transmit_was_truncated()).
         Rf433Replay::transmit(*found);
     }, LV_EVENT_CLICKED, nullptr);
 
@@ -366,9 +391,11 @@ void register_module() {
 
 void poll() {
     // Independent of capture state (s_active): a replay can be in flight
-    // whether or not a capture is also running -- the two are mutually
-    // exclusive only via the GPIO53 arbiter (one holder at a time), not via
-    // any lock in this screen. Must run before the early return below.
+    // whether or not a capture is also running -- but never both at once.
+    // See update_replay_status_ui()'s comment for how RX/TX exclusion is
+    // actually enforced (an explicit is_capturing()/is_busy() check in each
+    // of rf433_common.cpp/rf433_replay.cpp, on top of the GPIO53 arbiter,
+    // not a lock in this screen). Must run before the early return below.
     update_replay_status_ui();
 
     if (!s_active) return;

@@ -43,6 +43,18 @@ struct EdgeSample {
 // WITHOUT calling pinMode()/attachInterrupt() -- no capture is started, and
 // the pin is left untouched. Callers must check the return value and must
 // not assume a capture is running just because this was called.
+//
+// Also returns false, again WITHOUT touching the pin, if a Task 6 replay
+// (Rf433Replay::transmit()) is currently transmitting. Gpio53Arbiter::claim()
+// is idempotent per-OWNER (both capture and replay claim the same
+// Owner::kRf433 token, since they're one subsystem sharing exclusivity
+// against the external I2C bus, not against each other) -- so the arbiter
+// alone cannot tell RX and TX apart, and this explicit check is what
+// actually keeps a capture's attachInterrupt() handler and a replay's
+// pinMode(OUTPUT)/digitalWrite() from touching the same physical pin at the
+// same time. See rf433_replay.cpp's transmit() for the mirror-image check on
+// the transmit side, and this file's .cpp for why that check lives THERE and
+// this one lives HERE (in capture_start(), not Rf433Scan::set_capture_active()).
 bool capture_start();
 
 // Stops the interrupt handler. Safe to call whether or not a capture is

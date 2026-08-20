@@ -98,34 +98,45 @@
 // calling init() while an NFC/RFID2 session holds GPIO53 would silently steal
 // the pin exactly as before this fix, for this one function. This is not
 // presently reachable (nothing calls Rf433Gpio::init() -- see the "DO NOT
-// CALL init() UNCONDITIONALLY AT BOOT" section above and the Task 6 note
-// inside init() below), but it means "closed" above describes the
+// CALL init() UNCONDITIONALLY AT BOOT" section above and the note inside
+// init() below), but it means "closed" above describes the
 // capture_start()/capture_stop() path specifically, not every function in
-// this file. Task 6 (RF433 transmit/replay), init()'s first real caller, must
-// wire its own claim/release(Owner::kRf433) pair around it -- see the note
-// inside init() for exactly where.
+// this file. Task 6 (RF433 transmit/replay) shipped WITHOUT calling
+// Rf433Gpio::init() at all -- rf433_replay.cpp's transmit() does its own
+// on-demand pinMode(TAB5_RF433T_PIN, OUTPUT) post-claim, the same pattern
+// capture_start() already used, rather than reusing this function. So
+// init() remains unwired into the arbiter AND still has no real caller as
+// of Task 6; a future caller that does adopt it still needs its own
+// claim/release(Owner::kRf433) pair around the call, per the note inside
+// init() below.
 // ===========================================================================
 
 bool Rf433Gpio::init() {
-    // NOTE for Task 6 (RF433 transmit/replay), which will be this function's
-    // first real caller: TAB5_RF433R_PIN and TAB5_RF433T_PIN are THE SAME PIN
-    // (both GPIO53 -- one HY2.0 socket, one data line). The INPUT line below is
-    // therefore immediately and entirely overridden by the OUTPUT line, and the
-    // pin always ends up an output. It is kept only so this function still
-    // reads as "configure both roles" against the IRF433 interface, and because
-    // deleting it would make the asymmetry with capture_start() (which sets
-    // INPUT for receive) look deliberate rather than forced. If you need
-    // receive, do not call this -- call Rf433Common::capture_start(), which
-    // sets the pin back to INPUT itself.
+    // NOTE (updated for Task 6, RF433 transmit/replay -- see this file's
+    // header comment's QUALIFIER paragraph): TAB5_RF433R_PIN and
+    // TAB5_RF433T_PIN are THE SAME PIN (both GPIO53 -- one HY2.0 socket, one
+    // data line). The INPUT line below is therefore immediately and entirely
+    // overridden by the OUTPUT line, and the pin always ends up an output.
+    // It is kept only so this function still reads as "configure both
+    // roles" against the IRF433 interface, and because deleting it would
+    // make the asymmetry with capture_start() (which sets INPUT for
+    // receive) look deliberate rather than forced. If you need receive, do
+    // not call this -- call Rf433Common::capture_start(), which sets the
+    // pin back to INPUT itself.
     //
-    // ALSO for Task 6: this function does not go through hal/gpio53_arbiter.h
-    // and is not itself the arbitration boundary -- Rf433Common::capture_start()
-    // is (see this file's header comment). Whoever builds
-    // Rf433Replay::transmit() must claim Gpio53Arbiter::Owner::kRf433 (and
-    // release it when transmit finishes) around its own use of this pin, the
-    // same pattern capture_start()/capture_stop() use for receive -- do not
-    // assume calling Rf433Gpio::init() alone is safe against a concurrent
-    // NFC/RFID2 session just because capture_start() checks the arbiter.
+    // ALSO: this function does not go through hal/gpio53_arbiter.h and is
+    // not itself the arbitration boundary -- Rf433Common::capture_start()
+    // is (see this file's header comment). Task 6 (RF433 transmit/replay,
+    // rf433_replay.cpp) ended up NOT calling this function at all -- its
+    // transmit() does its own on-demand pinMode(TAB5_RF433T_PIN, OUTPUT)
+    // after claiming Gpio53Arbiter::Owner::kRf433 directly, mirroring
+    // capture_start()'s own pattern, rather than reusing init(). init()
+    // therefore still has no real caller in this codebase and remains
+    // unarbitrated; any future caller must claim/release(Owner::kRf433)
+    // around its own use of this function, exactly as capture_start()/
+    // capture_stop() do for receive -- do not assume calling
+    // Rf433Gpio::init() alone is safe against a concurrent NFC/RFID2
+    // session.
     pinMode(TAB5_RF433R_PIN, INPUT);
     pinMode(TAB5_RF433T_PIN, OUTPUT);
     digitalWrite(TAB5_RF433T_PIN, LOW);

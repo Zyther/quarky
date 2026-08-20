@@ -41,14 +41,59 @@
 // the result through a few `volatile` cross-task scalars, and drain/report
 // it from a poll() called out of main.cpp's loop() -- same shape, same
 // stack-size reasoning (4096, matching connect_task's driver-layer-call
-// headroom reasoning), same priority (1, matching loopTask -- no reason to
-// preempt the UI).
+// headroom reasoning).
 //
 // The transmit task is deliberately never subscribed to the task watchdog
 // (only loopTask and the idle tasks are, by default, in this Arduino-ESP32
 // framework -- nothing here calls esp_task_wdt_add() for it), so its own
 // several-hundred-ms busy-wait cannot trip that watchdog either. No
 // deviation from the plan's default recommendation was needed here.
+//
+// ---- WHY PRIORITY/CORE ARE *NOT* COPIED FROM connect_task (Task 6 review
+// fix, 2026-08-20) --------------------------------------------------------
+// connect_task (wifi_connect.cpp) spends its whole life blocked inside
+// delay() calls -- it never needs to preempt anything, so priority 1
+// (matching loopTask) and no core pin (tskNO_AFFINITY, xTaskCreate's
+// default) are both fine for it. This task's correctness is the opposite
+// shape: transmit_task() is a tight digitalWrite()/delayMicroseconds()
+// busy-wait reproducing microsecond-precision OOK pulse timing, for up to
+// ~509ms per Task 1's real-hardware measurement (512 edges in 509ms
+// sustained). delayMicroseconds() busy-waits rather than yielding, but that
+// only protects the CPU it is actually running ON -- at priority 1 with no
+// core affinity, the FreeRTOS scheduler is free to place this task on
+// EITHER core and to preempt it mid-pulse for any other ready priority-1
+// task on the same core.
+//
+// The concrete collision: loopTask -- the task that runs both LVGL's
+// millisecond-scale render tick and this project's own poll() functions --
+// is itself created at priority 1 (verified, not assumed: cores/esp32/
+// main.cpp:113 in framework-arduinoespressif32,
+// `xTaskCreateUniversal(loopTask, "loopTask", ..., 1, &loopTaskHandle,
+// ARDUINO_RUNNING_CORE)`), and pinned to
+// ARDUINO_RUNNING_CORE == CONFIG_ARDUINO_RUNNING_CORE == 1 (verified in the
+// prebuilt target's own config: framework-arduinoespressif32-libs/esp32p4/
+// sdkconfig:804). A same-priority, no-affinity transmit_task can therefore
+// land on core 1 right alongside loopTask and get round-robin preempted by
+// an LVGL tick mid-burst, stretching a real ~300us pulse by an order of
+// magnitude -- real OOK receivers reject that.
+//
+// FIXED by xTaskCreatePinnedToCore(): pin transmit_task to the core loopTask
+// is NOT on (computed from ARDUINO_RUNNING_CORE rather than hardcoded, so
+// this stays correct if that sdkconfig value ever changes), and raise its
+// priority above loopTask's 1. This project has no prior precedent for an
+// elevated-priority task, so kTransmitTaskPriority's value was chosen, not
+// copied: configMAX_PRIORITIES is 25 on this target (verified:
+// framework-arduinoespressif32-libs/esp32p4/include/freertos/config/include/
+// freertos/FreeRTOSConfig.h:93), so priority 5 sits comfortably above every
+// priority-1 task in this codebase (loopTask, connect_task) while leaving
+// deep headroom below the range ESP-IDF's own internal driver/ISR-adjacent
+// tasks typically occupy -- no need to crowd that ceiling for a task whose
+// real defense is running on an otherwise-idle core, not raw priority.
+// Priority is kept as defense-in-depth (in case anything else is ever
+// scheduled onto that core), not the primary fix -- pinning to a different
+// PHYSICAL core than loopTask means an LVGL tick literally cannot preempt
+// this task, regardless of relative priority, because they are running in
+// parallel on separate cores rather than time-sliced on one.
 // ===========================================================================
 
 namespace Rf433Replay {
@@ -71,6 +116,21 @@ struct TransmitArgs {
 // is not watchdog-subscribed.
 constexpr uint32_t kMaxSingleDelayUs = 1000000; // 1s
 
+// Task priority/core -- see this file's header comment ("WHY PRIORITY/CORE
+// ARE NOT COPIED FROM connect_task") for the full real-hardware-preemption
+// citation trail behind both of these.
+constexpr UBaseType_t kTransmitTaskPriority = 5; // > loopTask's 1 (cores/esp32/
+                                                  // main.cpp:113); configMAX_
+                                                  // PRIORITIES is 25 on this
+                                                  // target (FreeRTOSConfig.h:93)
+// The core loopTask (LVGL tick + this project's poll() functions) runs on --
+// computed from the real ARDUINO_RUNNING_CORE macro (== CONFIG_ARDUINO_
+// RUNNING_CORE == 1 on this target's sdkconfig:804) rather than hardcoded, so
+// pinning transmit_task to the OTHER core stays correct if that value ever
+// changes.
+constexpr BaseType_t kLoopTaskCore = ARDUINO_RUNNING_CORE;
+constexpr BaseType_t kTransmitTaskCore = (kLoopTaskCore == 0) ? 1 : 0;
+
 volatile bool s_task_running = false; // true from a successful task launch
                                        // until poll() processes its completion
 volatile bool s_task_done = false;    // set by transmit_task() right before
@@ -81,6 +141,7 @@ volatile bool s_task_done = false;    // set by transmit_task() right before
 // `volatile` qualification.
 State s_state = State::kIdle;
 char s_failure_reason[80] = "";
+bool s_last_truncated = false; // see last_transmit_was_truncated()
 
 void set_failure(const char *reason) {
     std::strncpy(s_failure_reason, reason, sizeof(s_failure_reason) - 1);
@@ -118,11 +179,15 @@ void transmit(const Rf433Scan::CapturedSignal &sig) {
         return; // leave the in-flight transmit's state alone
     }
 
-    if (sig.truncated) {
-        Serial.printf("quarky-tab5: [rf433-replay] transmit() REFUSED -- signal "
-                      "#%u is truncated (its edges[] do not represent the whole "
-                      "burst)\n", (unsigned)sig.capture_id);
-        set_failure("Truncated signal -- refusing to replay incomplete data");
+    if (Rf433Common::is_capturing()) {
+        // Refused -- see this file's transmit() doc comment (rf433_replay.h)
+        // and rf433_common.cpp's capture_start() for the full RX/TX
+        // exclusion writeup. Do NOT touch pinMode()/digitalWrite(): a live
+        // capture's attachInterrupt() handler is still armed on this exact
+        // pin.
+        Serial.println("quarky-tab5: [rf433-replay] transmit() REFUSED -- an "
+                        "RF433 capture is currently active on the same pin");
+        set_failure("RF433 capture in progress -- stop it before replaying");
         return;
     }
 
@@ -147,6 +212,21 @@ void transmit(const Rf433Scan::CapturedSignal &sig) {
         return;
     }
 
+    // Truncated signals are replayed, not refused -- see this file's header
+    // comment (rf433_replay.h's transmit() doc) for why: truncation only
+    // drops the TAIL of a burst, so the recorded prefix is still a valid
+    // partial reconstruction, and real captures truncate often enough that
+    // outright refusal left ordinary button-holds unreplayable. Set the
+    // query flag the UI reads to show a warning instead of silently
+    // replaying a partial burst as if it were the whole thing.
+    s_last_truncated = sig.truncated;
+    if (sig.truncated) {
+        Serial.printf("quarky-tab5: [rf433-replay] transmit() signal #%u is "
+                      "truncated -- replaying only its captured prefix (%u "
+                      "edges); the real burst's tail was not recorded\n",
+                      (unsigned)sig.capture_id, (unsigned)sig.edge_count);
+    }
+
     pinMode(TAB5_RF433T_PIN, OUTPUT);
     digitalWrite(TAB5_RF433T_PIN, LOW);
 
@@ -159,16 +239,25 @@ void transmit(const Rf433Scan::CapturedSignal &sig) {
     s_task_done = false;
     s_task_running = true;
 
-    BaseType_t created = xTaskCreate(transmit_task, "rf433_tx", 4096, args, 1, nullptr);
+    // Priority/core: see this file's header comment ("WHY PRIORITY/CORE ARE
+    // NOT COPIED FROM connect_task") for the full citation trail. Pinned to
+    // kTransmitTaskCore (the core loopTask/LVGL is NOT on) so an LVGL render
+    // tick cannot preempt a pulse mid-burst; priority kTransmitTaskPriority
+    // (> loopTask's 1) is defense-in-depth on top of that.
+    BaseType_t created = xTaskCreatePinnedToCore(transmit_task, "rf433_tx", 4096,
+                                                  args, kTransmitTaskPriority,
+                                                  nullptr, kTransmitTaskCore);
     if (created != pdPASS) {
-        // xTaskCreate() failed (heap exhaustion) -- undo everything transmit()
-        // already did so this doesn't leave the arbiter claimed or the UI
-        // stuck showing "Transmitting..." forever with no task to finish it.
+        // xTaskCreatePinnedToCore() failed (heap exhaustion) -- undo
+        // everything transmit() already did so this doesn't leave the
+        // arbiter claimed or the UI stuck showing "Transmitting..." forever
+        // with no task to finish it.
         delete args;
         s_task_running = false;
+        s_last_truncated = false; // this launch failed outright; not a truncation issue
         Gpio53Arbiter::release(Gpio53Arbiter::Owner::kRf433);
-        Serial.println("quarky-tab5: [rf433-replay] xTaskCreate() FAILED -- "
-                        "out of memory?");
+        Serial.println("quarky-tab5: [rf433-replay] xTaskCreatePinnedToCore() "
+                        "FAILED -- out of memory?");
         set_failure("Failed to start transmit task (out of memory?)");
     }
 }
@@ -178,6 +267,8 @@ bool is_busy() { return s_task_running; }
 State state() { return s_state; }
 
 const char *failure_reason() { return s_failure_reason; }
+
+bool last_transmit_was_truncated() { return s_last_truncated; }
 
 void poll() {
     if (!s_task_running) return;
