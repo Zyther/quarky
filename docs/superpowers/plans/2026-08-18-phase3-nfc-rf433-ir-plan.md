@@ -723,3 +723,54 @@ Write the chip identity, address, and citation into `ir_unit.h`'s header comment
 - [ ] **Step 3: Commit**
 
 **Model:** Direct (documentation task, no implementer dispatch needed — matches Phase 1's Task 21 precedent, "controller had full context from the ledger").
+
+---
+
+## Task 21: SD file format interop (.sub / .ir)
+
+> **Numbered non-sequentially, added 2026-08-20 — deliberate, not a numbering mistake** (matches this project's established precedent for Phase 10's non-sequential number, per this file's own header history). Inserted after the original Task 1-20 sequence was drafted, once real-hardware testing surfaced a genuine gap: this plan as originally written never gave RF433 a tag-library equivalent to Task 10's NFC one, and never gave either RF433 or IR a way to load a signal from an arbitrary SD file rather than only a signal captured in the current session. **Sequencing: execute this task after Task 7, before Task 8** (Task 7's own decode logic is a natural building block here, and this is mostly host-testable like Task 7, so it fits before diving into the hardware-heavy remaining tasks) — despite its number.
+
+**Files:**
+- Create: `firmware/tab5/src/features/rf433/rf433_sub_format.h` / `.cpp` — Flipper's real "Flipper SubGhz RAW File" text format (`Filetype:`/`Frequency:`/`Preset:`/`Protocol:`/`RAW_Data:` lines) ↔ `Rf433Scan::CapturedSignal`, both directions (read AND write — write matters for real interop, not just consumption).
+- Extend: whatever Task 18 built for `.ir` parsing (Flipper-IRDB format) — confirm/extend it to load a single standalone `.ir` file from an arbitrary SD path, not only the bundled community database it was originally scoped for.
+- Test: `firmware/tab5/test/test_rf433_sub_format.cpp` — host-native, round-trip (`write` then `read` returns the identical `CapturedSignal`, and a real sample `.sub` file — see Context below — parses into the expected edge sequence).
+
+**Interfaces:**
+- Consumes: `Rf433Scan::CapturedSignal`/`EdgeSample` (Task 5), Task 18's `.ir` parser output type (whatever concrete type that task produces).
+- Produces: `namespace Rf433SubFormat { bool write(const Rf433Scan::CapturedSignal &sig, const char *path); bool read(const char *path, Rf433Scan::CapturedSignal *out); }` (or the real shape the Flipper format's actual field set demands — this signature is a starting assumption, not fixed, same caveat this plan already uses elsewhere for tasks gated on real-world research); an equivalent standalone-file load path for `.ir`, shape TBD by what Task 18 already exposes.
+
+**Context — read before starting, this task has a real, disclosed research gap:** neither of this project's two donor checkouts (`~/src/unigeek-main`, `~/src/firmware` [Bruce]) contains a real `.sub`/`.ir` sample file or a parser for the raw FILE format itself — both only have protocol/pulse-DECODE logic (UniGeek's `SubGhzDecoders.cpp`, ported from Flipper Zero's `lib/subghz/protocols/`, GPLv3 — see the licensing note below) operating on already-parsed pulse-duration arrays, not the surrounding text-file format that wraps them. Confirmed by a direct search of both checkouts before writing this task. The Flipper file formats themselves are real and are publicly documented by Flipper Devices (their own firmware repository and file-format documentation), but this task's implementer must research and cite that real source directly at implementation time — do not invent field names, delimiters, or the RAW_Data pulse-encoding convention from memory. If no citable real source can be found within reasonable scope, report BLOCKED and disclose the gap (per this plan's established Task 12/SRIX precedent: "a real, disclosed gap, not a fabricated pass") rather than guess at a format that would silently fail to interoperate with real Flipper files or real other tools.
+
+**Licensing note, surfaced for the project owner, not decided here:** UniGeek's `SubGhzDecoders.cpp` (the brand/protocol pulse-decode logic — Came/Nice/Chamberlain/Holtek/Ansonic/etc. — that Task 7 already ports from, separately from this task's file-format work) is itself ported from Flipper Zero firmware and is GPLv3-licensed per its own header comment. This is the first GPLv3-sourced content flowing into this codebase (every other donor port so far has been public-domain or a from-scratch reimplementation citing a datasheet). Whether that's acceptable for this project's overall licensing posture is the project owner's call, not an implementation detail — flag it, do not silently proceed as if it were equivalent to this project's other donor sourcing.
+
+- [ ] **Step 1: Research and cite the real Flipper `.sub` RAW file format**, then implement `Rf433SubFormat::write()`/`read()`.
+- [ ] **Step 2: Extend Task 18's `.ir` parser for standalone-file loading, if it doesn't already support an arbitrary path**
+- [ ] **Step 3: Write host-native round-trip tests** (write→read identity; and a real sample `.sub` file if one can be sourced/cited — a fresh real capture from this session's own hardware testing, re-encoded to the real Flipper format, is an acceptable fixture if no external sample is available)
+- [ ] **Step 4: Run the host-native test suite, expect PASS**
+- [ ] **Step 5: PAUSE FOR HARDWARE, then verify a real round-trip from the Tab5 UI itself** — save a real capture in `.sub` format, confirm it's readable, confirm a signal loaded from a `.sub` file (not just a same-session capture) can still drive `Rf433Replay::transmit()` correctly.
+- [ ] **Step 6: Commit**
+
+**Model:** Sonnet for the parsing/round-trip logic; escalate to Opus if the real file-format research proves to have genuine ambiguity (e.g. multiple incompatible format revisions in the wild) rather than a single citable spec.
+
+---
+
+## Task 22: Generic SD file browser + wire into RF433/IR replay
+
+> **Also numbered non-sequentially, added 2026-08-20, same reasoning as Task 21.** **Sequencing: execute after Task 21** (needs Task 21's `.sub`/`.ir` load functions to have something real to wire a "load this" action to), **before Task 8.**
+
+**Files:**
+- Create: a reusable SD file-browser UI component — exact location/name is this task's own call (e.g. `firmware/tab5/src/ui/file_browser.h`/`.cpp`), generalizing the picker pattern rather than duplicating it per-feature.
+- Modify: `firmware/tab5/src/features/rf433/rf433_scan.cpp` / `rf433_replay.cpp` — add a "Load from SD" path alongside the existing "replay a session capture" path.
+- Modify: whichever IR feature ends up owning replay/clone (Task 18, `ir_clone.cpp`) — same "browse and load" capability, generalized rather than reimplemented.
+
+**Interfaces:** TBD by implementation, but must follow the established `IStorage::list_files()`/`read_file()` abstraction (`hal/storage_sd.h`) — no new storage abstraction invented.
+
+**Context:** `firmware/tab5/src/features/wifi/wifi_evil_portal.cpp`'s template picker is this codebase's real, proven, already-cited-elsewhere-in-this-plan precedent for "list files via `IStorage`, let the user pick one, load it" — but it is scoped to one fixed folder and one file type. This task generalizes that pattern to arbitrary directories (the user needs to navigate into `/quarky/captures/rf433/`, `/quarky/captures/ir/`, or wherever they've copied external `.sub`/`.ir` files onto the SD card) rather than reinventing file-listing UI from scratch. Read `wifi_evil_portal.cpp`'s picker in full before designing this — the goal is one shared component two features call into, not two similar-but-different pickers.
+
+- [ ] **Step 1: Build the generic file-browser component** (directory listing + navigate-into-subdirectory + pick-a-file, backed by `IStorage`)
+- [ ] **Step 2: Wire "Load from SD" into the RF433 Scan/Replay screen**, using Task 21's `Rf433SubFormat::read()`
+- [ ] **Step 3: Wire the same capability into the IR clone/replay screen**, using Task 21's extended `.ir` standalone-file loader
+- [ ] **Step 4: PAUSE FOR HARDWARE, then verify both** — browse to and load a real `.sub` file, confirm replay works identically to a session-captured signal; browse to and load a real standalone `.ir` file (not from the bundled database), confirm it transmits correctly.
+- [ ] **Step 5: Commit**
+
+**Model:** Sonnet.
