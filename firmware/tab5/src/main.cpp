@@ -383,6 +383,18 @@ void setup() {
     nfc_scan_external_i2c_bus();
     nfc_unit.detect("NFC");
     rfid2_unit.detect("RFID2");
+    // Release the GPIO53 arbiter claim these three calls made (via
+    // ensureExternalI2CBegun()) now that boot-time detection is done.
+    // Deliberate, not an oversight: nothing else runs at boot to conflict, so
+    // holding the claim through boot would be harmless on its own -- but
+    // never releasing it would mean the FIRST 'r' (RF433 capture) after boot
+    // is refused forever, since nothing else in this codebase releases a
+    // kExternalI2c claim except features/nfc/nfc_read.cpp's screen teardown,
+    // which only runs if an NFC/RFID2 screen was actually opened and closed.
+    // Releasing here keeps GPIO53 unclaimed (Owner::kNone) after boot, which
+    // is the correct resting state: neither subsystem has an active session
+    // yet.
+    nfc_release_external_i2c();
 
     // rf433.init() is DELIBERATELY NOT CALLED HERE. Do not "helpfully" put it
     // back -- doing so reintroduces a real, observed bug.
@@ -822,8 +834,15 @@ void loop() {
                                   (unsigned)(s_rf433_captures_completed + 1));
                 }
                 Serial.println("quarky-tab5: [debug] Rf433Common::capture_start() via serial trigger");
-                Rf433Common::capture_start();
-                s_rf433_capture_started_ms = millis();
+                if (Rf433Common::capture_start()) {
+                    s_rf433_capture_started_ms = millis();
+                } else {
+                    // Refused (GPIO53 arbiter -- an NFC/RFID2 session owns the
+                    // pin right now). Do NOT start the auto-stop timer for a
+                    // capture that never actually started.
+                    Serial.println("quarky-tab5: [debug] capture_start() refused -- "
+                                    "GPIO53 owned by external I2C (NFC/RFID2)");
+                }
             }
         } else if (c == 'n') {
             // Task 2 (Phase 3 plan): the ST25R3916 chip-ID readback SPIKE.

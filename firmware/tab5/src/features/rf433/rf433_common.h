@@ -35,6 +35,14 @@ struct EdgeSample {
 // project's established "refuse rather than lie" idempotent-start
 // convention, e.g. BleHidSpike::start()). Returns true once a capture is
 // active.
+//
+// Can also return false: TAB5_RF433R_PIN (GPIO53) is shared with the
+// external I2C bus (NFC/RFID2, see hal/gpio53_arbiter.h), and this function
+// claims that pin via Gpio53Arbiter before touching it. If an NFC/RFID2
+// session currently owns GPIO53, the claim is refused and this returns false
+// WITHOUT calling pinMode()/attachInterrupt() -- no capture is started, and
+// the pin is left untouched. Callers must check the return value and must
+// not assume a capture is running just because this was called.
 bool capture_start();
 
 // Stops the interrupt handler. Safe to call whether or not a capture is

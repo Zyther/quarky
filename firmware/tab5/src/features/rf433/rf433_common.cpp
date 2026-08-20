@@ -1,13 +1,17 @@
 #include "rf433_common.h"
 #include "../../../boards/tab5/pins_config.h"
+#include "../../hal/gpio53_arbiter.h"
 #include <Arduino.h>
 #include <driver/gpio.h> // gpio_intr_disable() -- the ISR self-disarm below
 
 // ===========================================================================
-// HAZARD: A CAPTURE CAN BE INVALIDATED FROM OUTSIDE, SILENTLY (2026-08-18)
+// HAZARD: A CAPTURE COULD BE INVALIDATED FROM OUTSIDE, SILENTLY (2026-08-18,
+// CLOSED 2026-08-19 by hal/gpio53_arbiter.h)
 // ===========================================================================
 // If you are here because a capture returned zero edges, or returned edges
-// that decode to nonsense, read this before debugging the ring buffer.
+// that decode to nonsense, read this before debugging the ring buffer -- but
+// note the actual defect this section used to describe is now closed; if
+// you're seeing that symptom, look elsewhere first.
 //
 // TAB5_RF433R_PIN is GPIO53, which is ALSO TAB5_EXTERNAL_I2C_SDA_GPIO -- the
 // SDA line of the external HY2.0 PORT.A I2C bus. One physical pin, because
@@ -15,30 +19,31 @@
 // of the sharing and its consequences is the canonical block in
 // hal/rf433_gpio.cpp.
 //
-// The direction that matters HERE is I2C taking the pin back. capture_start()
-// claims GPIO53 with pinMode(), which tears down the Wire1 peripheral. The NFC
-// side detects that and re-initializes Wire1 on its next access
-// (hal/nfc_pn532.cpp's ensureExternalI2CBegun()), and that re-init routes
-// GPIO53 to the I2C peripheral again -- possibly while a capture is still
-// running.
+// The direction that mattered HERE was I2C taking the pin back mid-capture.
+// capture_start() claims GPIO53 with pinMode(), which tears down the Wire1
+// peripheral; the NFC side detects that and re-initializes Wire1 on its next
+// access (hal/nfc_pn532.cpp's ensureExternalI2CBegun()), and that re-init
+// routes GPIO53 to the I2C peripheral again. Left undefended, this module
+// would never be notified -- s_capturing would stay true and the
+// attachInterrupt() handler would stay installed, because the peripheral
+// manager's GPIO deinit callback (gpioDetachBus(),
+// cores/esp32/esp32-hal-gpio.c:105-107) is a no-op returning true -- it
+// detaches nothing. Depending on whether the I2C driver's pin setup masks the
+// GPIO interrupt (inside the prebuilt i2c_new_master_bus(); not verified),
+// the capture would then either record ~0 edges or -- worse -- timestamp I2C
+// bus traffic and return fake but plausible-looking pulse data, with neither
+// case setting overrun() or any other error flag. That silent-corruption
+// scenario is what "not defended against" meant below, historically.
 //
-// THIS MODULE IS NOT NOTIFIED. s_capturing stays true and the attachInterrupt()
-// handler stays installed, because the peripheral manager's GPIO deinit
-// callback (gpioDetachBus(), cores/esp32/esp32-hal-gpio.c:105-107) is a no-op
-// returning true -- it detaches nothing. So this module keeps believing it
-// owns a pin that I2C now drives. Depending on whether the I2C driver's pin
-// setup masks the GPIO interrupt (inside the prebuilt i2c_new_master_bus();
-// not verified), the capture then either records ~0 edges or -- worse --
-// timestamps I2C bus traffic and returns fake but plausible-looking pulse
-// data. Neither case sets overrun() or any other error flag.
-//
-// Not defended against in code on purpose: the fix is proper arbitration of
-// GPIO53 (a claim/release owner token shared by both subsystems), not a
-// back-reference from either side. Unreachable in practice today -- both RF433
-// and NFC are serial-trigger spikes with no launcher tile, so nothing can run
-// concurrently with a capture -- and it becomes reachable the moment either
-// grows a UI that stays open while the other runs. Whoever builds that owns
-// this problem; do not assume the current quiet is a guarantee.
+// FIXED: GPIO53 now has a single runtime owner, tracked by
+// hal/gpio53_arbiter.h's Gpio53Arbiter::claim()/release(), shared between this
+// module and hal/nfc_pn532.cpp. capture_start() claims Owner::kRf433 as its
+// first action and refuses to touch the pin (returns false, no pinMode(), no
+// attachInterrupt()) if the external I2C side currently holds it;
+// capture_stop() releases it. So the failure mode above can no longer occur:
+// either this module holds the pin for the whole capture, or it never touched
+// it in the first place. See ensureExternalI2CBegun() in hal/nfc_pn532.cpp
+// for the mirror-image half of this fix on the I2C side.
 // ===========================================================================
 
 namespace Rf433Common {
@@ -158,6 +163,17 @@ void IRAM_ATTR isr_edge() {
 
 bool capture_start() {
     if (s_capturing) return true;
+    if (!Gpio53Arbiter::claim(Gpio53Arbiter::Owner::kRf433)) {
+        // Refused -- the external I2C bus (NFC/RFID2) currently owns GPIO53.
+        // Do NOT call pinMode()/attachInterrupt(): that would tear down Wire1
+        // out from under an active NFC/RFID2 session, exactly the hazard this
+        // arbiter exists to prevent. See this file's header comment.
+        Serial.printf("quarky-tab5: [rf433] capture_start() REFUSED -- GPIO%d "
+                      "is currently owned by the external I2C bus (NFC/RFID2 "
+                      "session in progress). Close that screen and retry.\n",
+                      TAB5_RF433R_PIN);
+        return false;
+    }
     pinMode(TAB5_RF433R_PIN, INPUT);
     portENTER_CRITICAL(&s_mux);
     s_head = 0;
@@ -186,6 +202,7 @@ void capture_stop() {
     if (!s_capturing) return;
     detachInterrupt(digitalPinToInterrupt(TAB5_RF433R_PIN));
     s_capturing = false;
+    Gpio53Arbiter::release(Gpio53Arbiter::Owner::kRf433);
     Serial.printf("quarky-tab5: [rf433] edge capture stopped (%u edges serviced"
                   " this session)%s\n",
                   (unsigned)s_edges_this_capture,

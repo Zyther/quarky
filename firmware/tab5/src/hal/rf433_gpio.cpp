@@ -58,26 +58,33 @@
 // unless the I2C side re-begins (hal/nfc_pn532.cpp's
 // ensureExternalI2CBegun() detects exactly this and recovers).
 //
-// --- AND THE SAME HAZARD RUNS IN REVERSE ---------------------------------
+// --- AND THE SAME HAZARD RAN IN REVERSE (also CLOSED, 2026-08-19) --------
 // That I2C recovery takes GPIO53 BACK: i2cInit() calls perimanClearPinBus()
 // on both pins (esp32-hal-i2c-ng.c:107) and re-routes GPIO53 to the I2C
-// peripheral. If an RF433 capture is running at that moment it is NOT told --
-// the peripheral manager's GPIO deinit callback (gpioDetachBus(),
-// cores/esp32/esp32-hal-gpio.c:105-107) is a no-op returning true, so
-// Rf433Common keeps s_capturing == true and keeps its ISR installed while the
-// pin belongs to someone else. The capture then records ~0 edges, or -- if the
-// I2C driver's pin setup leaves the GPIO interrupt unmasked (inside the
-// prebuilt i2c_new_master_bus(); not verified) -- timestamps I2C traffic and
-// returns fake but plausible pulse data. No error flag is set in either case.
-// See features/rf433/rf433_common.cpp's header for the same warning from the
+// peripheral. Left undefended, if an RF433 capture were running at that
+// moment it would NOT be told -- the peripheral manager's GPIO deinit
+// callback (gpioDetachBus(), cores/esp32/esp32-hal-gpio.c:105-107) is a no-op
+// returning true, so Rf433Common would keep s_capturing == true and keep its
+// ISR installed while the pin belonged to someone else. The capture would
+// then record ~0 edges, or -- if the I2C driver's pin setup leaves the GPIO
+// interrupt unmasked (inside the prebuilt i2c_new_master_bus(); not
+// verified) -- timestamp I2C traffic and return fake but plausible pulse
+// data, with no error flag set in either case. See
+// features/rf433/rf433_common.cpp's header for the same history from the
 // capture side.
 //
-// Neither direction is defended against in code, deliberately: the real fix is
-// arbitration of GPIO53 (a claim/release owner token both subsystems respect),
-// not back-references between hal/ and features/. It is unreachable today --
-// both RF433 and NFC are serial-trigger spikes with no launcher tile, so
-// nothing runs concurrently -- and becomes reachable the moment either grows a
-// UI that can stay open while the other runs.
+// FIXED: both directions now go through hal/gpio53_arbiter.h's
+// Gpio53Arbiter::claim()/release(), a single runtime owner token shared by
+// hal/nfc_pn532.cpp and features/rf433/rf433_common.cpp -- not a
+// back-reference between hal/ and features/ (both depend on the shared
+// hal/ arbiter module; hal/ still never calls into features/). RF433's
+// capture_start() claims Owner::kRf433 and refuses (returns false, no
+// pinMode()) if I2C holds the pin; hal/nfc_pn532.cpp's
+// ensureExternalI2CBegun() claims Owner::kExternalI2c and refuses (returns
+// false, no Wire1 touch) if RF433 holds it. So a pinMode()/Wire1.begin() on
+// GPIO53 can now only happen when the caller has confirmed exclusive
+// ownership first -- neither direction of "took the pin out from under the
+// other, silently" described above can occur anymore.
 // ===========================================================================
 
 bool Rf433Gpio::init() {
@@ -91,6 +98,15 @@ bool Rf433Gpio::init() {
     // INPUT for receive) look deliberate rather than forced. If you need
     // receive, do not call this -- call Rf433Common::capture_start(), which
     // sets the pin back to INPUT itself.
+    //
+    // ALSO for Task 6: this function does not go through hal/gpio53_arbiter.h
+    // and is not itself the arbitration boundary -- Rf433Common::capture_start()
+    // is (see this file's header comment). Whoever builds
+    // Rf433Replay::transmit() must claim Gpio53Arbiter::Owner::kRf433 (and
+    // release it when transmit finishes) around its own use of this pin, the
+    // same pattern capture_start()/capture_stop() use for receive -- do not
+    // assume calling Rf433Gpio::init() alone is safe against a concurrent
+    // NFC/RFID2 session just because capture_start() checks the arbiter.
     pinMode(TAB5_RF433R_PIN, INPUT);
     pinMode(TAB5_RF433T_PIN, OUTPUT);
     digitalWrite(TAB5_RF433T_PIN, LOW);

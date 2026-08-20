@@ -7,6 +7,7 @@
 
 #include "ws1850s_driver.h"
 #include "st25r3916_driver.h"
+#include "../../hal/nfc_pn532.h" // nfc_release_external_i2c() -- GPIO53 arbiter
 
 #include "../../../boards/tab5/pins_config.h"
 
@@ -263,6 +264,15 @@ static void teardown() {
         }
     }
     s_unit_ready = false;
+
+    // This screen's NFC/RFID2 "session" is over -- release the GPIO53 claim
+    // (Gpio53Arbiter::Owner::kExternalI2c) so RF433 can claim the pin
+    // afterward. Unconditional, not gated on s_unit_ready: the claim happens
+    // inside ensureExternalI2CBegun(), which any bring-up attempt above may
+    // have already triggered even if it never got as far as setting
+    // s_unit_ready. nfc_release_external_i2c() is a safe no-op if this
+    // screen's session never actually claimed the pin.
+    nfc_release_external_i2c();
 }
 
 // --- Screen -----------------------------------------------------------------
