@@ -40,7 +40,26 @@ constexpr BruteProtocol kBruteProtocols[] = {
     {"Ansonic 12bit",    12, {-1111, 555}, {-555, 1111}, {-19425, 555}, {0, 0}       },
     {"Holtek 12bit",     12, {-870, 430},  {-430, 870},  {-15480, 430}, {0, 0}       },
     {"Linear 10bit",     10, {500, -1500}, {1500, -500}, {0, 0},        {500, -21500}},
-    {"Chamberlain 9bit", 9,  {-870, 430},  {-430, 870},  {0, 0},        {-3000, 1000}},
+    // KNOWN-SUSPECT ENCODING (flagged in task-8-report.md's "Cross-donor
+    // corroboration" section, not fixed there per the controller's explicit
+    // "don't let it become a rabbit hole" -- caveat added here per the Task 8
+    // review round instead): the other five rows above match their
+    // independently-sourced Task 7/UniGeek-Flipper `SubGhzDecoders.cpp`
+    // te_short/te_long constants exactly. This row does NOT -- it is
+    // byte-for-byte identical to the Holtek row just above it (same 430/870
+    // pulse pair, same shape), while Task 7's real decode_chamberlain()
+    // (SubGhzDecoders.cpp:1174-1228) expects a structurally different 4-bit-
+    // symbol DIP-code encoding (each symbol one of 0b0111/0b0011/0b0001 at
+    // multiples of a 1000us base unit), not a positional MSB-first binary
+    // code at all. Bruce's own donor table (rf_bruteforce.h:17-25) appears to
+    // have mislabeled a second Holtek-shaped entry as "Chamberlain" rather
+    // than encoding real Chamberlain/DIP-switch timing. A candidate this
+    // module generates for this row will very likely NOT be recognized by
+    // Task 7's decoder, and may not match a real Chamberlain device's actual
+    // wire format either -- hence "(unverified encoding)" appended to the
+    // dropdown label below, so a user selecting it sees the caveat before
+    // running a sweep against real hardware.
+    {"Chamberlain 9bit (unverified encoding)", 9, {-870, 430}, {-430, 870}, {0, 0}, {-3000, 1000}},
 };
 // clang-format on
 constexpr int kBruteProtocolCount = sizeof(kBruteProtocols) / sizeof(kBruteProtocols[0]);
@@ -124,6 +143,52 @@ void append_pulse(SignalBuilder &b, int32_t duration_us) {
     b.next_timestamp_us += magnitude;
 }
 
+// Critical fix (Task 8 review round, 2026-08-20): appends one more
+// terminating edge, forcing LOW, at b.next_timestamp_us -- i.e. exactly
+// where the pulse most recently appended via append_pulse() would end.
+//
+// WHY this is necessary, not cosmetic: append_pulse()'s own comment
+// (above) documents that the LAST pulse appended to a signal has its hold
+// time left unrepresented in edges[] -- an EdgeSample only records the
+// level a transition moves TO, so there is no edge recording how long the
+// final level was held. Rf433Replay::transmit_task() (rf433_replay.cpp:
+// 152-171) matches that contract exactly: it writes edges[i].level, then
+// delays for (edges[i+1].timestamp - edges[i].timestamp), then writes
+// edges[i+1].level -- so the hold time AFTER the last edge is never
+// delayed at all; transmit_task() forces the pin LOW immediately after
+// writing the last edge's level.
+//
+// For a REAL capture (Task 5) this is harmless: the last recorded edge is
+// the transition INTO Task 5's own >25ms trailing silence gap
+// (kBurstGapThresholdUs), so dropping that hold time doesn't corrupt any
+// real protocol data -- it only shortens silence nobody was measuring.
+//
+// For a SYNTHESIZED bruteforce candidate, the last append_pulse() call
+// inside build_candidate()'s loop is NOT silence -- it's the final data
+// bit's meaningful HIGH/LOW pulse (Came/Nice/Ansonic/Holtek/Linear/
+// Chamberlain all encode real data right up to the stop symbol, when they
+// have one), so dropping its hold time transmitted a corrupted final
+// pulse on every single candidate this module generated. Fix: append one
+// more edge -- forced LOW, with no semantic meaning of its own beyond
+// "settle low" -- so the true last DATA pulse (the one before this call)
+// gets a real, correctly-timed edge marking the end of ITS hold time.
+// This new terminator edge becomes the signal's new "last edge", and its
+// own (synthetic, don't-care) hold time is the one now silently dropped
+// by transmit_task() -- exactly as intended.
+void append_terminator(SignalBuilder &b) {
+    if (!b.have_first) return; // no pulses were ever appended (shouldn't happen: every
+                                // protocol here has bits > 0)
+    if (b.sig->edge_count >= Rf433Scan::kMaxEdgesPerSignal) return; // defensive; see
+                                                                      // build_candidate()'s
+                                                                      // comment -- never fires
+
+    size_t idx = b.sig->edge_count;
+    b.sig->edges[idx].timestamp_us = b.next_timestamp_us;
+    b.sig->edges[idx].level = false; // force LOW; idle-safe, matches transmit_task()'s
+                                      // own post-burst digitalWrite(..., LOW)
+    b.sig->edge_count = idx + 1;
+}
+
 // Builds candidate `code`'s full pulse sequence for `proto` into `sig`,
 // reusing this module's one static candidate buffer (see its declaration
 // below). Real keyspace-walk/encoding sequence ported from rf_brute_start()'s
@@ -133,8 +198,9 @@ void append_pulse(SignalBuilder &b, int32_t duration_us) {
 //
 // Edge-count ceiling, cited rather than assumed: the largest protocol here
 // is 12 bits (Came/Nice/Ansonic/Holtek). One repeat is at most
-// 2 (pilot) + 12*2 (bits) + 2 (stop) = 28 pulses/edges. At
-// kRepeatsPerCode == 1 that is 28 edges total, nowhere near
+// 2 (pilot) + 12*2 (bits) + 2 (stop) = 28 pulses/edges, plus one more for
+// append_terminator()'s trailing settle-LOW edge (see its own comment) =
+// 29 edges. At kRepeatsPerCode == 1 that is 29 edges total, nowhere near
 // Rf433Scan::kMaxEdgesPerSignal (512) -- sig.truncated is unconditionally
 // false below because this can never actually truncate.
 void build_candidate(int protocol_idx, uint32_t code, Rf433Scan::CapturedSignal &sig) {
@@ -166,6 +232,15 @@ void build_candidate(int protocol_idx, uint32_t code, Rf433Scan::CapturedSignal 
             append_pulse(b, proto.stop[1]);
         }
     }
+
+    // Critical fix (Task 8 review round): terminate once, after ALL repeats
+    // (not once per repeat) -- see append_terminator()'s own comment for why
+    // this is needed at all. Terminating inside the loop instead would
+    // insert a spurious forced-LOW settle edge BETWEEN repeats, corrupting
+    // back-to-back repeat framing for any future kRepeatsPerCode > 1; the
+    // real last pulse needing its hold time restored is only the very last
+    // one emitted across the whole candidate.
+    append_terminator(b);
 }
 
 // ── Run state ────────────────────────────────────────────────────────────
@@ -234,10 +309,19 @@ void update_ui() {
 
 void finish_run(EndReason reason) {
     s_active = false;
-    if (!s_status_label) {
-        update_ui(); // still flips dropdown/button state even if the label is gone
-        return;
-    }
+    // Important fix (Task 8 review round): update_ui() must run BEFORE the
+    // terminal message is written below, not after. update_ui() has its own
+    // unconditional status-label write (the "Running .../ Idle -- ..."
+    // text) -- calling it AFTER composing the terminal message clobbered
+    // that message immediately in the same call, so e.g. the transmit-
+    // failure reason below never actually reached the screen (only the
+    // serial log). update_ui() still does the real work this function
+    // needs beyond the label: flips the protocol dropdown back to enabled
+    // and the toggle button back to "Start", and (harmlessly) repaints the
+    // progress bar/status label with the generic idle text that gets
+    // overwritten immediately after.
+    update_ui();
+    if (!s_status_label) return;
 
     const BruteProtocol &proto = kBruteProtocols[s_protocol_idx];
     char buf[112];
@@ -257,7 +341,6 @@ void finish_run(EndReason reason) {
             break;
     }
     lv_label_set_text(s_status_label, buf);
-    update_ui();
 }
 
 void toggle_click_cb(lv_event_t *) {
@@ -318,17 +401,38 @@ lv_obj_t *build_screen() {
     // Teardown on delete (Back button, same convention as rf433_scan.cpp's
     // build_screen()). Null widget pointers FIRST -- update_ui()/finish_run()
     // already no-op on null widgets, so this removes any ordering dependency
-    // on LVGL's event-callback sequencing. A run in progress is left
-    // running: like Rf433Replay's own background transmit task (see
-    // rf433_scan.cpp's identical note on its Replay button), poll() below
-    // tolerates the screen being closed mid-run and keeps walking the
-    // keyspace with no UI to update until/unless this screen reopens.
+    // on LVGL's event-callback sequencing.
+    //
+    // Important fix (Task 8 review round): a run in progress IS stopped here
+    // now, mirroring rf433_scan.cpp's build_screen() teardown, which calls
+    // set_capture_active(false) when was_active on its own screen's DELETE
+    // event. The original "leave it running, like Rf433Replay's background
+    // transmit task" reasoning does not actually transfer from that
+    // precedent: Rf433Replay's in-flight task is a single, sub-second,
+    // uncancellable burst already committed to hardware by the time the
+    // screen could close. This sweep is a cancellable, potentially
+    // multi-minute operation (a full 12-bit keyspace at ~50ms/code is
+    // ~3.4 minutes) -- leaving it running silently after the user backs out
+    // is a real UX/safety issue (the Tab5 keeps transmitting with no visible
+    // indication), and it interacts badly with the rest of this subsystem:
+    // if something else claims the GPIO53 arbiter mid-sweep (e.g. opening
+    // the NFC screen), the sweep would silently self-terminate via
+    // transmit()'s refusal path with no UI open to report it. Setting
+    // s_active = false directly (not via finish_run(), which would touch
+    // already-nulled widgets pointlessly) is sufficient: poll() no-ops the
+    // instant s_active is false, so no in-flight candidate is left queued.
     lv_obj_add_event_cb(content, [](lv_event_t *) {
+        bool was_active = s_active;
         s_status_label = nullptr;
         s_progress_bar = nullptr;
         s_protocol_dropdown = nullptr;
         s_toggle_btn = nullptr;
         s_toggle_label = nullptr;
+        if (was_active) {
+            Serial.println("quarky-tab5: [rf433-bruteforce] Screen closed mid-run -- "
+                            "stopping sweep");
+            s_active = false;
+        }
     }, LV_EVENT_DELETE, nullptr);
 
     return screen;

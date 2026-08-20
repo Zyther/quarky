@@ -45,6 +45,24 @@ namespace Rf433Bruteforce {
 // Registers this module's launcher tile (Category::RF433, Affinity::
 // TAB5_NATIVE). Call once from setup(), before Shell::build() -- same
 // convention as every other register_module() in this codebase.
+//
+// Deferred (controller ruling, Task 8 review round, 2026-08-20): this
+// plan's Task 8 "Consumes" line lists Rf433ProtocolDecode::DecodedCode
+// (rf433_protocol_decode.h) as an interface this module consumes, but no
+// call into Rf433ProtocolDecode exists anywhere in this module -- every
+// run always starts a full keyspace sweep from code 0, regardless of
+// whether a real capture was recently decoded on the Scan screen. This was
+// considered and deliberately deferred as a real UX nicety, not a
+// correctness issue: it would let a partially-recognized real signal (a
+// DecodedCode with a matching protocol_name but a code the decoder
+// couldn't fully confirm) seed a targeted sweep -- e.g. pre-select this
+// screen's protocol dropdown to match, and/or start s_current_code at the
+// decoded value instead of 0 -- rather than always starting a full
+// keyspace from zero. Not implemented this round; a future task wiring
+// this up would need a way to pass a DecodedCode (or just a protocol name
+// + starting code) from rf433_scan.cpp's screen into this one, most
+// naturally via ScreenStack::push() taking construction params, since
+// today start() takes none.
 void register_module();
 
 // Called from main.cpp's loop(), after Rf433Replay::poll() (so this tick's
