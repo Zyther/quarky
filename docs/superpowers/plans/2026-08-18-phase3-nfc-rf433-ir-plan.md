@@ -774,3 +774,26 @@ Write the chip identity, address, and citation into `ir_unit.h`'s header comment
 - [ ] **Step 5: Commit**
 
 **Model:** Sonnet.
+
+---
+
+## Task 23: Battery percentage stub — real HAL + status-bar wiring
+
+> **Numbered non-sequentially, added 2026-08-20** — same reasoning as Tasks 21/22. Not NFC/RF433/IR peripheral work; the project owner asked for it to be tacked onto this phase's close-out rather than opened as a separate phase, given it's small, self-contained, and this is a natural point to fold it in. **Sequencing: independent of every other task in this plan (touches unrelated files: `ui/shell.cpp` + a new battery HAL module) — run whenever convenient, but before Task 20**, since Task 20's DoD/documentation pass should cover this fix too.
+
+**Files:**
+- Create: `firmware/tab5/src/hal/battery.h` / `.cpp` (new HAL module — battery/power monitoring was never part of Phase 1's HAL scope, greenfield, same situation Task 15 is in for the IR unit).
+- Modify: `firmware/tab5/src/ui/shell.cpp` — wire a real periodic update into the status bar instead of the permanent hardcoded stub.
+- Modify: `firmware/tab5/src/main.cpp` — instantiate + poll, same pattern as every other HAL instance.
+
+**Context:** Confirmed directly (2026-08-20) that `Shell::build()` (`ui/shell.cpp:70-73`) creates the status bar's battery label with a **permanently hardcoded** `"Battery: --%"` string — `battery_label` is a plain local variable, not even stored the way `Shell::status_bar_` is, and nothing anywhere in the tree ever calls `lv_label_set_text()` on it again. This is not a wiring bug on top of working battery-sense hardware; it is a complete stub — no HAL module, no ADC/fuel-gauge/PMIC read exists anywhere in this codebase for battery state. Confirmed by a repo-wide grep for `battery`/`Battery`/`BAT_` before writing this task: the only other hits are unrelated (BLE battery-service *spoofing* in `ble_sourapple.cpp`/`ble_findmy.cpp`/`ble_fastpair_exploit.cpp` — those fake a battery level in an advertised payload, they don't read this device's own).
+
+**Real hardware unknown, spike-class, matching Task 2/Task 15's risk tier:** the Tab5's actual battery-monitoring hardware (a dedicated fuel-gauge/coulomb-counter IC such as commonly used in M5Stack products, a simple ADC voltage-divider pin, or a PMIC register readable over the existing internal I2C bus alongside the already-discovered IO-expanders) is not yet identified in this codebase. Research and cite the real answer the same way Phase 1 resolved the display panel/touch controller/IO-expander identities and Task 2 resolved the NFC chip identity — M5Stack's own official Tab5 documentation/schematic is the right starting point (the same source class already cited repeatedly in `pins_config.h`), not assumption. Do not invent a register map or ADC scaling formula — if a real, citable source can't be found within reasonable scope, report BLOCKED and disclose the gap rather than guess (this plan's established Task-12/SRIX precedent).
+
+- [ ] **Step 1: Identify the real battery-monitoring hardware** (chip/pin, I2C address if applicable) from a real, citable source (M5Stack's own Tab5 documentation/schematic, cross-checked against any other real source the way this project already double/triple-sources its hardware findings).
+- [ ] **Step 2: Implement the HAL read** (`hal/battery.h`/`.cpp`), citing the real register/ADC-scaling source for every constant, matching this project's established citation style (see `st25r3916_driver.cpp`'s header for the depth of citation expected).
+- [ ] **Step 3: Wire a real periodic update into the status bar** — store the label the way `Shell::status_bar_` already is (a static member, or an equivalent retrievable handle) so a `poll()`-driven update can reach it; pick a sane refresh interval (battery percentage does not need per-tick updates — every few seconds is plenty, document the choice) and wire it into `main.cpp`'s `loop()` the same way every other HAL/feature poll is.
+- [ ] **Step 4: PAUSE FOR HARDWARE, then verify against real battery state** — confirm the displayed percentage is plausible with the Tab5 running on battery, and (if practical) that it actually changes as the battery charges/discharges rather than reading a frozen or trivially-wrong value.
+- [ ] **Step 5: Commit**
+
+**Model:** Opus for Step 1 (real hardware-identification research under initial uncertainty, same risk class as Task 2/15) — Sonnet is fine for Steps 2-3 once the chip/interface is known.
