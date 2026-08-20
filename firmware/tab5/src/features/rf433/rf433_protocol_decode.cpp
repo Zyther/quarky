@@ -21,6 +21,8 @@
 //   decode_ansonic()                  SubGhzDecoders.cpp:292-323
 //   chamb_to_bit() + decode_chamberlain()
 //                                     SubGhzDecoders.cpp:1174-1228
+//   decode_holtek_ht12x()  (Holtek    SubGhzDecoders.cpp:1102-1136
+//                    HT12X, 12-bit)
 //   kDecoders[] table ordering        SubGhzDecoders.cpp:1813-1861
 //   SubGhzDecoders::decode() engine   SubGhzDecoders.cpp:1864-1882
 //     (two-phase try loop, count < 8 => no match)
@@ -28,9 +30,22 @@
 // The donor decoders are tried "most-specific first" (SubGhzDecoders.cpp:
 // 1809-1812 comment) so a loose-tolerance decoder can't grab a frame another
 // would parse correctly; this file preserves the SAME RELATIVE ORDER among
-// the six ported here: Holtek, CAME, Nice FLO, Chamberlain, Ansonic, then
-// Linear last (Linear is explicitly commented "loose tolerance -- last" at
-// SubGhzDecoders.cpp:1860).
+// the seven ported here: Holtek, Holtek HT12X, CAME, Nice FLO, Chamberlain,
+// Ansonic, then Linear last (Linear is explicitly commented "loose
+// tolerance -- last" at SubGhzDecoders.cpp:1860).
+//
+// decode_holtek_ht12x was added in a round-2 review fix, not the original
+// port: the donor's own kDecoders[] table (SubGhzDecoders.cpp:1846-1849)
+// carries an explicit comment that HT12X MUST be tried immediately before
+// CAME, because the two share IDENTICAL 320/640us bit timing and are
+// distinguished only by preamble length -- HT12X's sync window
+// (ts=320, DDIFF(d, ts*28) < td*20 => 4960-12960us) sits entirely inside
+// CAME's (te_short=320, DDIFF(d, te_short*56) < te_delta*63 =>
+// 8450-27370us). Without HT12X ported and ordered ahead of CAME, a real
+// HT12X remote's frame would silently decode AS "CAME" -- a confidently
+// wrong answer, not a "no match" -- because CAME's wider preamble window
+// also accepts HT12X's shorter one. Preserved here the same way the donor
+// orders it: immediately before decode_came.
 // ===========================================================================
 
 namespace Rf433ProtocolDecode {
@@ -243,6 +258,80 @@ bool decode_holtek(const unsigned int *dur, uint16_t n, uint8_t phase, Match &m)
                         data = data << 1 | 1;
                         cnt++;
                         step = SaveDur;
+                    } else {
+                        step = Reset;
+                    }
+                } else {
+                    step = Reset;
+                }
+                break;
+        }
+    }
+    return false;
+}
+
+// ── Holtek HT12X ─────────────────────────────────────────────────────────
+// Port of decode_holtek_ht12x. 12-bit, double-frame (a real code is only
+// accepted once the SAME 12-bit value repeats back-to-back -- last_data ==
+// data -- matching the donor exactly, not a simplification). Distinct from
+// decode_holtek() above (that one is the 40-bit Holtek HT12 with a fixed
+// 0x5 header nibble; this one is the 12-bit HT12X sibling with shared
+// 320/640us bit timing -- see this file's header comment for why HT12X must
+// be tried before decode_came() below). SubGhzDecoders.cpp:1102-1136.
+bool decode_holtek_ht12x(const unsigned int *dur, uint16_t n, uint8_t phase, Match &m) {
+    const uint32_t ts = 320, tl = 640, td = 200;
+    enum { Reset, Start, Save, Check };
+    uint32_t step = Reset, te_last = 0;
+    uint64_t data = 0, last_data = 0;
+    uint8_t cnt = 0;
+
+    for (uint16_t i = 0; i < n; i++) {
+        bool level = sample_level(i, phase);
+        uint32_t d = dur[i];
+        switch (step) {
+            case Reset:
+                if (!level && DDIFF(d, ts * 28) < td * 20) step = Start;
+                break;
+            case Start:
+                if (level && DDIFF(d, ts) < td) {
+                    step = Save;
+                    data = 0;
+                    cnt = 0;
+                } else step = Reset;
+                break;
+            case Save:
+                if (!level) {
+                    if (d >= ts * 10 + td) {
+                        if (cnt == 12) {
+                            if (last_data == data && last_data) {
+                                m.name = "Holtek_HT12X";
+                                m.key = data;
+                                m.bits = cnt;
+                                return true;
+                            }
+                            last_data = data;
+                        }
+                        data = 0;
+                        cnt = 0;
+                        step = Start;
+                        break;
+                    }
+                    te_last = d;
+                    step = Check;
+                } else {
+                    step = Reset;
+                }
+                break;
+            case Check:
+                if (level) {
+                    if (DDIFF(te_last, tl) < td * 2 && DDIFF(d, ts) < td) {
+                        data = data << 1 | 1;
+                        cnt++;
+                        step = Save;
+                    } else if (DDIFF(te_last, ts) < td && DDIFF(d, tl) < td * 2) {
+                        data = data << 1 | 0;
+                        cnt++;
+                        step = Save;
                     } else {
                         step = Reset;
                     }
@@ -481,15 +570,20 @@ bool decode_chamberlain(const unsigned int *dur, uint16_t n, uint8_t phase, Matc
 
 // ── Engine ───────────────────────────────────────────────────────────────
 // SubGhzDecoders.cpp:1813-1861 orders decoders most-specific-first; this
-// preserves the same relative order among the six ported here.
+// preserves the same relative order among the seven ported here.
 typedef bool (*DecoderFn)(const unsigned int *, uint16_t, uint8_t, Match &);
 const DecoderFn kDecoders[] = {
-    decode_holtek,      // 40-bit, header mask -- most specific
-    decode_came,        // 12/24-bit family
-    decode_nice_flo,    // 12-bit
-    decode_chamberlain, // 7/8/9-DIP symbol code
-    decode_ansonic,      // 12-bit
-    decode_linear,       // 10-bit, loose tolerance -- last
+    decode_holtek,        // 40-bit, header mask -- most specific
+    decode_holtek_ht12x,  // 12-bit, double-frame -- MUST precede decode_came:
+                           //   identical 320/640us bit timing, distinguished
+                           //   only by preamble length (donor comment,
+                           //   SubGhzDecoders.cpp:1846-1849; see this file's
+                           //   header comment for the full reasoning).
+    decode_came,           // 12/24-bit family
+    decode_nice_flo,       // 12-bit
+    decode_chamberlain,    // 7/8/9-DIP symbol code
+    decode_ansonic,        // 12-bit
+    decode_linear,         // 10-bit, loose tolerance -- last
 };
 constexpr uint8_t kNumDecoders = sizeof(kDecoders) / sizeof(kDecoders[0]);
 
@@ -520,23 +614,80 @@ constexpr size_t kMaxDurations = Rf433Scan::kMaxEdgesPerSignal - 1;
 // between edges[i-1] and edges[i] is edges[i-1].level, matching the donor
 // decoders' "alternating HIGH/LOW durations" semantics exactly).
 //
-// The FIRST edge sample is deliberately skipped, not synthesized: it records
-// only the level the pin transitioned TO, with no earlier timestamp in this
-// CapturedSignal to measure how long the signal dwelled at the level before
-// it -- there is no real duration to compute for it, and inventing one would
-// be exactly the kind of fabricated timing value this project's "real
+// There is no leading duration for edges[0]: it records only the level the
+// pin transitioned TO, with no earlier timestamp in this CapturedSignal to
+// measure how long the signal dwelled at the level before it. edges[0]
+// ITSELF is still used -- it is duration[0]'s start point, not skipped --
+// what is unavailable is the (unrecorded) pulse that preceded it, not a
+// pulse this code fails to use. Inventing a value for that unrecorded pulse
+// would be exactly the kind of fabricated timing value this project's "real
 // sources only" discipline forbids. This costs at most one leading pulse's
 // worth of decode context, which every decoder above tolerates (each self-
 // syncs on its own header/preamble rather than requiring the capture's very
 // first edge to be meaningful).
+//
+// MERGE FIX (round-2 review finding, checkable without hardware): the donor
+// decoders assume level alternates strictly by array-index parity
+// (sample_level() above) because the donor's own capture front end (the ESP32
+// RMT peripheral) guarantees alternating levels by construction -- consecutive
+// RMT items are always opposite polarity, so index parity alone is a safe
+// stand-in for real level. This project's ISR-timestamped GPIO CHANGE capture
+// carries NO such guarantee: real receiver-module squelch/glitch chatter can
+// produce two or more CONSECUTIVE EdgeSamples with the SAME .level, which
+// breaks the alternating-parity assumption every ported decoder above relies
+// on. This is not theoretical -- the real fixture in
+// test_rf433_protocol_decode.cpp has 143 of its 353 consecutive edge samples
+// sharing the same .level as the sample immediately before them, in runs up
+// to 26 samples long (almost certainly receiver chatter, not real signal).
+// The old version of this function threw away EdgeSample.level entirely and
+// handed the decoders one raw gap per adjacent edge pair, letting
+// sample_level()'s parity guess silently mis-assign which gaps are "HIGH"
+// and which are "LOW" every time a same-level run occurred.
+//
+// Fix: merge consecutive gaps that share the same held level (per
+// EdgeSample.level -- the one piece of ground truth this project's capture
+// actually has, which the donor's RMT-native pipeline never needed) into one
+// true pulse, summing their durations, before handing the array to the
+// decoders. The merged output is guaranteed to alternate level from one
+// entry to the next by construction (a run of same-held-level gaps collapses
+// to exactly one entry), which is what makes sample_level(i, phase)'s
+// index-parity assumption valid again for the two-phase try loop below --
+// decode() still doesn't know the capture's ABSOLUTE starting polarity, so
+// it still tries both phases; this fix only restores the RELATIVE
+// alternation between consecutive entries that the donor's hardware
+// guaranteed and this project's does not.
 size_t build_durations(const Rf433Scan::CapturedSignal &sig, unsigned int *out, size_t max_out) {
     if (sig.edge_count < 2) return 0;
-    size_t n = sig.edge_count - 1;
-    if (n > max_out) n = max_out;
-    for (size_t i = 0; i < n; i++) {
-        out[i] = static_cast<unsigned int>(sig.edges[i + 1].timestamp_us - sig.edges[i].timestamp_us);
+
+    size_t out_count = 0;
+    uint32_t merged_duration = 0;
+    bool merged_level = false;
+    bool have_pulse = false;
+
+    for (size_t i = 1; i < sig.edge_count; i++) {
+        uint32_t gap = static_cast<unsigned int>(sig.edges[i].timestamp_us - sig.edges[i - 1].timestamp_us);
+        bool held_level = sig.edges[i - 1].level;
+
+        if (!have_pulse) {
+            merged_duration = gap;
+            merged_level = held_level;
+            have_pulse = true;
+        } else if (held_level == merged_level) {
+            // Same level as the run already in progress -- squelch/glitch
+            // chatter, not a real transition. Fold into the pulse in
+            // progress instead of handing decoders a spurious extra gap.
+            merged_duration += gap;
+        } else {
+            if (out_count >= max_out) return out_count;
+            out[out_count++] = merged_duration;
+            merged_duration = gap;
+            merged_level = held_level;
+        }
     }
-    return n;
+    if (have_pulse && out_count < max_out) {
+        out[out_count++] = merged_duration;
+    }
+    return out_count;
 }
 
 } // namespace
@@ -544,6 +695,12 @@ size_t build_durations(const Rf433Scan::CapturedSignal &sig, unsigned int *out, 
 bool decode(const Rf433Scan::CapturedSignal &sig, DecodedCode *out) {
     if (out == nullptr) return false;
 
+    // static, not stack-local: kMaxDurations (511) * sizeof(unsigned int) is
+    // ~2KB, which is fine to keep off the stack, but it does mean this
+    // buffer lives in .bss and decode() is NOT reentrant/thread-safe -- two
+    // concurrent callers would clobber each other's duration array. This
+    // project calls decode() from a single task's poll loop today, so it is
+    // not a live bug, just a constraint worth a caller reading this to know.
     static unsigned int dur[kMaxDurations];
     size_t count = build_durations(sig, dur, kMaxDurations);
     // SubGhzDecoders::decode()'s own guard, count < 8: SubGhzDecoders.cpp:1866.

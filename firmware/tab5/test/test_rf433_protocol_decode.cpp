@@ -2,6 +2,7 @@
 #include "features/rf433/rf433_common.h"
 #include "features/rf433/rf433_protocol_decode.h"
 #include "features/rf433/rf433_scan.h"
+#include <cstring>
 
 // ===========================================================================
 // Host-native tests for Rf433ProtocolDecode::decode() (Phase 3 Task 7).
@@ -70,26 +71,7 @@ void test_decode_rejects_uniform_pulse_train() {
     TEST_ASSERT_FALSE(Rf433ProtocolDecode::decode(sig, &out));
 }
 
-// ── Real-hardware fixture -- BLOCKED on controller ─────────────────────────
-//
-// TODO(controller): this project's "real sources only" discipline (see
-// task-7-controller-notes.md) forbids inventing plausible-looking capture
-// data here, so this fixture is intentionally left unfilled rather than
-// faked. Task 5/6's real hardware session today captured 5 real signals
-// (edge counts 512/512/512/397/32 -- three truncated, two clean) but the raw
-// EdgeSample byte data was not available to the agent that wrote this file,
-// only summary counts.
-//
-// To complete this test: replace the TEST_IGNORE_MESSAGE() call below with
-// a real Rf433Scan::CapturedSignal populated from one of those captures (or
-// a fresh one), and fill in the commented-out assertions with the real
-// expected Rf433ProtocolDecode::DecodedCode -- protocol_name/code/bit_length
-// -- that a known real remote's brand should produce. If the real capture
-// does not match any of the six brands ported so far (Holtek/CAME/Nice FLO/
-// Chamberlain/Ansonic/Linear -- see rf433_protocol_decode.cpp's header
-// comment), decode() returning false is itself real, useful information:
-// assert TEST_ASSERT_FALSE and note in task-7-report.md which protocol
-// would need porting next from SubGhzDecoders.cpp's kDecoders[] table.
+// ── Real-hardware fixture ────────────────────────────────────────────────
 // Real capture, burst #17, 354 edges. Captured 2026-08-20 by the controller
 // directly from the on-device RF433 Scan screen (RF433R unit on PORT.A, a
 // single real remote-control press) during this session's hardware testing,
@@ -192,19 +174,42 @@ constexpr Rf433Common::EdgeSample kFixtureEdges[kFixtureEdgeCount] = {
 };
 
 // Ground truth established by actually running this fixture through
-// decode() (controller, 2026-08-20, host-native `pio test -e native` with a
-// temporary debug printf -- not assumed): it does NOT match any of the 6
-// ported brands (Holtek/CAME/Nice FLO/Chamberlain/Ansonic/Linear). Per this
-// file's own header note ("decode() returning false is itself real, useful
-// information"), that is exactly what's asserted here -- this is real
-// negative information about a real remote, not an unimplemented test. The
-// remote's actual protocol is unidentified: could be a 7th OOK brand not
-// yet ported from SubGhzDecoders.cpp's kDecoders[] table, could be FSK
-// (which this project's 6 ported decoders don't cover at all, per
-// rf433_protocol_decode.cpp's header), or could be a brand-specific
-// preamble/sync variant this capture's single button-press didn't fully
-// exercise. Whoever next extends the ported decoder set should treat this
-// fixture as a real candidate to identify, not assume it's already covered.
+// decode() (re-confirmed after the round-2 review's build_durations() merge
+// fix and the addition of decode_holtek_ht12x -- both re-checked against
+// this exact fixture, not assumed to still hold): it does NOT match any of
+// the 7 ported brands (Holtek/Holtek HT12X/CAME/Nice FLO/Chamberlain/
+// Ansonic/Linear). Per this file's own header note ("decode() returning
+// false is itself real, useful information"), that is exactly what's
+// asserted here -- this is real negative information about a real remote,
+// not an unimplemented test.
+//
+// The most likely concrete cause, checked directly rather than left as pure
+// speculation: after the merge fix collapses this fixture's 353 raw
+// edge-to-edge gaps down to 210 real alternating pulses, the LARGEST
+// resulting gap is 5392us (5.392ms). Every ported decoder's Reset state
+// requires a gap at or above a brand-specific minimum sync/preamble
+// threshold before it will even leave Reset -- CAME's is the widest-net
+// among the original six at 8470us minimum, so none of the original six
+// ever leave Reset on this data at all. The one exception is the newly
+// ported decode_holtek_ht12x, whose window (4960-12960us) is the only one
+// of the seven that 5392us falls inside -- its Reset state DOES trigger
+// (twice, at merged-duration indices 164 and 188 under phase 1), but the
+// state machine never completes a full 12-bit double-frame match (HT12X
+// requires the same 12-bit value twice in a row) before running out of
+// data. So this fixture reaches further into a decoder's state machine than
+// it did before this fix round, without ever producing a false match --
+// itself a small piece of evidence the merge fix and the HT12X ordering fix
+// are both behaving as intended, not just cosmetic.
+//
+// The remote's actual protocol remains unidentified: could be one of the
+// ~42 still-unported SubGhzDecoders.cpp brands (this project's OOK-only
+// front end rules out the 2 FSK-only ones but not the ~40 other OOK
+// brands, including Princeton -- see rf433_protocol_decode.h's SCOPE note),
+// could be a brand whose real sync gap this single button-press's capture
+// window simply didn't include intact, or could be an artifact of receiver
+// noise on this particular capture. Whoever next extends the ported decoder
+// set should treat this fixture as a real, still-open candidate to
+// identify, not assume it's already covered.
 void test_decode_real_capture_fixture() {
     Rf433Scan::CapturedSignal sig{};
     for (size_t i = 0; i < kFixtureEdgeCount; i++) {
@@ -215,8 +220,68 @@ void test_decode_real_capture_fixture() {
     sig.capture_id = 17;
     sig.truncated = false;
 
+    // Sentinel-fill *out first so a false return that nonetheless writes
+    // through the pointer (violating the header's "on no match, *out is
+    // left untouched" contract) would be caught here rather than silently
+    // passing just because the return value happened to be right.
     Rf433ProtocolDecode::DecodedCode out{};
+    std::memset(&out, 0xAA, sizeof(out));
+    Rf433ProtocolDecode::DecodedCode sentinel;
+    std::memset(&sentinel, 0xAA, sizeof(sentinel));
+
     TEST_ASSERT_FALSE(Rf433ProtocolDecode::decode(sig, &out));
+    TEST_ASSERT_EQUAL_MEMORY(&sentinel, &out, sizeof(out));
+}
+
+// ── Positive test: decode() can actually return true ────────────────────
+// Every test above this line asserts TEST_ASSERT_FALSE -- decode() could be
+// permanently stubbed to `return false` and all of them would still pass.
+// This one is constructed, not a hardware capture: synthesized directly
+// from decode_came()'s own real, cited timing constants (te_short=320,
+// te_long=640, te_delta=150; sync-gap multiple 56; end-of-frame gap
+// >= te_short*4 -- all from SubGhzDecoders.cpp:14-73, ported verbatim in
+// rf433_protocol_decode.cpp's decode_came()), matching this project's
+// existing discipline for distinguishing real captures from
+// real-constant-derived synthetic test vectors: every value here traces to
+// a real cited source, nothing is invented.
+//
+// Encodes a real CAME "1" bit twelve times (decode_came()'s CheckDur branch:
+// SaveDur=te_long(640) followed by CheckDur=te_short(320) => data = data<<1
+// | 1), giving the 12-bit code 0xFFF -- one of decode_came()'s real valid
+// bit counts (12/18/24/25/42), which reports plain "CAME" (Prastel is
+// 25/42, Airforce is 18). Preceded by the real sync gap (56 * te_short) and
+// start pulse (te_short), followed by the real end-of-frame gap
+// (te_short * 4) that makes decode_came() see cnt == 12 and return true.
+void test_decode_accepts_synthesized_came_signal() {
+    Rf433Scan::CapturedSignal sig{};
+    size_t idx = 0;
+    uint32_t t = 0;
+
+    auto push_edge = [&](uint32_t duration, bool level_after) {
+        t += duration;
+        sig.edges[idx++] = Rf433Common::EdgeSample{t, level_after};
+    };
+
+    sig.edges[idx++] = Rf433Common::EdgeSample{t, false}; // held LOW during the sync gap
+    push_edge(320u * 56u, true);                          // sync gap: te_short * 56
+    push_edge(320u, false);                                // start pulse: te_short
+
+    for (int bit = 0; bit < 12; bit++) {
+        push_edge(640u, true);  // SaveDur LOW pulse == te_long
+        push_edge(320u, false); // CheckDur HIGH pulse == te_short -> bit '1'
+    }
+    push_edge(320u * 4u, true); // end-of-frame gap: te_short * 4
+
+    sig.edge_count = idx;
+    sig.captured_at_ms = 0;
+    sig.capture_id = 0;
+    sig.truncated = false;
+
+    Rf433ProtocolDecode::DecodedCode out{};
+    TEST_ASSERT_TRUE(Rf433ProtocolDecode::decode(sig, &out));
+    TEST_ASSERT_EQUAL_STRING("CAME", out.protocol_name);
+    TEST_ASSERT_TRUE(out.code == 0xFFFULL);
+    TEST_ASSERT_EQUAL_UINT8(12, out.bit_length);
 }
 
 int main(int argc, char **argv) {
@@ -226,5 +291,6 @@ int main(int argc, char **argv) {
     RUN_TEST(test_decode_rejects_short_noise);
     RUN_TEST(test_decode_rejects_uniform_pulse_train);
     RUN_TEST(test_decode_real_capture_fixture);
+    RUN_TEST(test_decode_accepts_synthesized_came_signal);
     return UNITY_END();
 }
