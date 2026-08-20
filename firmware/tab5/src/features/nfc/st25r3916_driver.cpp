@@ -139,13 +139,19 @@
 //     same digitalRead() (lines 189, 264, 344, 416).
 //   * [M5] (above) The Unit NFC's HY2.0-4P connector carries GND/5V/SDA/SCL.
 //     There is no IRQ wire to give it.
-// The substitute is the one the datasheet itself sanctions: the IRQ *status*
-// registers are read-and-clear registers on the I2C bus ([DS] Sec 4.5
-// "Interrupt handling" / Tables 42-45, addresses 1Ah-1Dh), and the library's
-// own st25r3916ClearInterrupts() ([EH] st25r3916_interrupt.cpp:225-233) reads
-// exactly those four registers with a plain multi-register read and no GPIO
-// involvement. Polling them IS reading the interrupt state; the pin is only an
-// optimisation that tells you when it would be worth reading.
+// The substitute is the one the datasheet itself sanctions: reading the IRQ
+// *status* registers over I2C is exactly what [DS] Sec 4.3.1 "Interrupt
+// interface" (p.46) and Tables 62-65 (pp.97-100, addresses 1Ah-1Dh) describe
+// as presenting the interrupt state. Reading also clears it -- Tables 63-65
+// each carry an explicit "After register has been read, its content is set to
+// 0" footnote; Table 62 (the Main interrupt register, 1Ah) has no such
+// footnote of its own, but the same read-clears-it behavior for it is
+// documented in Sec 4.3.1's prose and, separately, in Table 64's footnote.
+// Either way, the library's own st25r3916ClearInterrupts() ([EH]
+// st25r3916_interrupt.cpp:225-233) reads exactly those four registers with a
+// plain multi-register read and no GPIO involvement. Polling them IS reading
+// the interrupt state; the pin is only an optimisation that tells you when it
+// would be worth reading.
 //
 // [DS] additional sections used. Same document and same copy as above
 //      (DS12484 Rev 3, the mikroe mirror), re-downloaded and text-extracted on
@@ -206,6 +212,16 @@
 //          Function reads "1: Mask IRQ due to ...", i.e. after Set Default
 //          every interrupt is UNmasked. This driver therefore never has to
 //          write a mask register to make a status bit appear.
+//        - Sec 4.3.1 "Interrupt interface" (p.46), verbatim: "In case of
+//          masking a certain interrupt source the IRQ line is not set high,
+//          but the interrupt status bit is still set in IRQ status
+//          registers. Reading the IRQ status registers presents and clears
+//          also the masked interrupt bits." A stronger, mask-INDEPENDENT
+//          reason the polled read-back design works: even if a mask register
+//          were ever written away from its Tables 58/59 default, the status
+//          bits this file polls would still be set and still be visible on
+//          read. The design's foundation does not rest on nobody ever
+//          touching a mask register.
 //        - Tables 62/63/64/65 "Main / Timer and NFC / Error and wake-up /
 //          Passive target interrupt register" (1Ah/1Bh/1Ch/1Dh, p.97-100),
 //          all Type: R with the footnote "After register has been read, its
@@ -251,11 +267,14 @@
 //        - rfal_rfst25r3916.cpp:2097-2201 rfalISO14443ATransceiveAnticollision-
 //          Frame() -- set ISO14443A_NFC.antcl and AUX.no_crc_rx, transmit
 //          without CRC, and on collision read 20h for the byte/bit position
-//        - rfal_rfst25r3916_analogConfigTbl.h:263-315,384-387 -- ST's own
+//        - rfal_rfst25r3916_analogConfigTbl.h:263-315 -- ST's own
 //          analog-configuration table; the values applied by
 //          apply_nfca_analog_config() below are copied from the CHIP_INIT,
 //          CHIP_POLL_COMMON, NFC-A Rx common, NFC-A Tx 106 and NFC-A Rx 106
-//          entries, verbatim
+//          entries, verbatim. (The table's ANTICOL entry, :384-387, is NOT
+//          applied -- see DELIBERATE SIMPLIFICATIONS #5 below; it is cited
+//          here only for honesty about what was read, not as something this
+//          driver does.)
 //        - rfal_nfca.cpp:87-100 -- SEL_CMD per cascade level (93h/95h/97h),
 //          "Digital 1.1 Table 15"
 //        - rfal_nfca.cpp:209-366 rfalNfcaPollerSingleCollisionResolution() --
@@ -285,6 +304,23 @@
 //   4. No RC/regulator calibration. [EH] rfalCalibrate()/AdjustRegulators()
 //      drive direct commands whose completion is signalled by the DCT
 //      interrupt, i.e. exactly the thing this hardware cannot deliver.
+//   5. CORR_CONF1.corr_s6 (space-B 0Ch, part of the register programme below)
+//      is left at bring-up's 0x51 (corr_s6 SET) for every exchange, including
+//      the anticollision one. ST's own analog-config table has a
+//      POLL | TECH_NFCA | BITRATE_COMMON | ANTICOL entry
+//      ([EH] rfal_rfst25r3916_analogConfigTbl.h:384-387) that clears corr_s6
+//      -- ST's own comment: "Set collision detection level different from
+//      data" -- and RFAL applies it immediately before every anticollision
+//      frame (rfal_rfst25r3916.cpp:2115), restoring it afterward. This driver
+//      does not port that adjustment, so with two tags present I_col may not
+//      assert as reliably as it would with corr_s6 cleared for that one
+//      exchange; a user presenting two tags at once is more likely to see a
+//      BCC-mismatch kProtocolError than the intended kCollision "present one
+//      tag at a time" message. Noted rather than silently missed. Correctness
+//      does not depend on this: simplification #1 above already treats any
+//      collision indication (I_col, or a BCC mismatch that looks like one) as
+//      "not a single clean tag" and reports accordingly -- only the precision
+//      of which error message the user sees is affected.
 // ===========================================================================
 
 namespace {
@@ -445,7 +481,9 @@ constexpr uint8_t kRegTxDriver     = 0x28U;
 // {read,write}RegisterBRaw, not baked into these values)
 constexpr uint8_t kRegBCorrConf1   = 0x0CU;
 constexpr uint8_t kRegBCorrConf2   = 0x0DU;
-constexpr uint8_t kRegBAuxMod      = 0x28U;
+// (0x28, space-B AUX_MOD, is deliberately NOT defined: this driver never
+// writes it -- see DELIBERATE SIMPLIFICATIONS #3 above. Same unused-constant
+// policy as the 0xC2/0xC6/collision-register notes elsewhere in this file.)
 constexpr uint8_t kRegBResAmMod    = 0x2AU;
 constexpr uint8_t kRegBOvershoot1  = 0x30U;
 constexpr uint8_t kRegBOvershoot2  = 0x31U;
@@ -497,7 +535,10 @@ constexpr uint8_t kTxDriverAmMod12Percent = 0x07U << 4;
 // order ([DS] Tables 62-65; values identical to [REF] st25r3916_interrupt.h:
 // 68-89, which is where the 32-bit packing convention comes from).
 constexpr uint32_t kIrqRxe  = 0x00000010U; // 1Ah bit 4
-constexpr uint32_t kIrqTxe  = 0x00000008U; // 1Ah bit 3
+// (1Ah bit 3, I_txe, is deliberately NOT defined: transceive() waits on a
+// combined terminal mask that does not include end-of-transmission -- see the
+// comment at its call site. Same unused-constant policy as the 0xC2/0xC6/
+// collision-register notes elsewhere in this file.)
 constexpr uint32_t kIrqCol  = 0x00000004U; // 1Ah bit 2
 constexpr uint32_t kIrqNre  = 0x00004000U; // 1Bh bit 6
 constexpr uint32_t kIrqErr1 = 0x00100000U; // 1Ch bit 4 (hard framing)
@@ -1238,13 +1279,27 @@ bool nfca_poller_begin() {
     // field_on() first, not last: it is what starts and stabilises the
     // oscillator, and the Mode definition register cannot be written until
     // osc_ok is set ([DS] Table 22 note 1). The ~12 ms during which the
-    // carrier is up with the power-up (NFCIP-1) modulation settings is
-    // harmless -- nothing is being addressed yet, and the NFC-A guard time
-    // below starts after the configuration lands.
+    // carrier is up before apply_nfca_config() lands is harmless -- and
+    // more benign than this comment used to claim: [DS] Table 22's Default
+    // column shows the chip's power-up modulation setting IS ISO14443A/OOK
+    // already, not the NFCIP-1 setting once assumed here, so this window
+    // isn't even running a different modulation than the one being
+    // configured. Nothing is being addressed yet either way, and the NFC-A
+    // guard time below starts after the configuration lands.
     if (!field_on()) {
         return false;
     }
     if (!apply_nfca_config()) {
+        // field_on() has already energised the RF field. nfca_poller_end()
+        // would normally be what turns it back off, but it early-returns on
+        // !s_nfca_ready -- which is still false here -- and nothing else in
+        // this file or in nfc_read.cpp's teardown() calls it on THIS specific
+        // partial-bring-up-failure path (nfc_read.cpp only calls
+        // nfca_poller_end() when s_unit_ready is true, and a failed begin()
+        // leaves that false too). Without this, a single I2C hiccup anywhere
+        // in the ~20-entry analog-config programme would leave the carrier on
+        // with nothing anywhere that will ever switch it off.
+        field_off();
         return false;
     }
     // [EH] rfal_rf.h:230 RFAL_GT_NFCA: 5 ms guard time from field-on before

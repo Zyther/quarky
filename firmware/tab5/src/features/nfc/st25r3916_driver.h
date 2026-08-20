@@ -97,21 +97,27 @@ enum class NfcaResult : uint8_t {
     kHardwareError,  // I2C/chip failure -- the unit is not usable right now
 };
 
-// One-shot bring-up for the NFC-A poller: init(), the ST analog/mode register
-// programme for NFC-A 106 kb/s, then field_on() and the 5 ms guard time.
-// Costs ~35 I2C register writes plus a ~10 ms oscillator wait and the 5 ms
-// guard time (~30 ms total at this bus's 100 kHz) -- call it ONCE when a
-// feature screen starts scanning, never per poll() tick.
+// One-shot bring-up for the NFC-A poller: init(), then field_on() (which
+// starts and stabilises the oscillator), then the ST analog/mode register
+// programme for NFC-A 106 kb/s, then the 5 ms guard time. field_on() runs
+// BEFORE the register programme, not after -- deliberately, since the Mode
+// definition register cannot be written until the oscillator reports
+// osc_ok (see the .cpp for the citation). Costs ~35 I2C register writes plus
+// a ~10 ms oscillator wait and the 5 ms guard time (~30 ms total at this
+// bus's 100 kHz) -- call it ONCE when a feature screen starts scanning, never
+// per poll() tick.
 bool nfca_poller_begin();
 
 // Runs one complete detection pass: WUPA -> anticollision -> SELECT, through
 // however many cascade levels the tag's UID needs, then SLP_REQ to park the
 // tag in HALT so the next pass's WUPA can wake it again. (WUPA rather than
 // REQA is load-bearing, not a preference -- see the comment at its call site
-// in the .cpp.) Bounded: the whole call gives up after ~25 ms of wall clock
-// regardless of what the chip does, so it fits inside a poll() tick's ~50 ms
-// budget with margin. Typical real cost is 1-3 ms (no tag) or 6-12 ms (tag
-// found), dominated by I2C, not by RF.
+// in the .cpp.) Bounded: each exchange's wait-for-IRQ loop gives up after
+// ~25 ms of wall clock regardless of what the chip does; the I2C transaction
+// time layered on top of that wait is not itself counted against the bound,
+// so the true worst case can run a few ms past ~25 ms. That is still well
+// inside a poll() tick's ~50 ms budget with margin. Typical real cost is
+// 1-3 ms (no tag) or 6-12 ms (tag found), dominated by I2C, not by RF.
 NfcaResult nfca_detect(Iso14443aTag *out);
 
 // Stops the poller: field_off() plus a Stop-all-activities so no timer or
