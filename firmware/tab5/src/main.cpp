@@ -29,6 +29,11 @@
                                           // Replay button rf433_scan.cpp wires
                                           // into its scan-result list (see
                                           // rf433_replay.h's header comment)
+#include "features/rf433/rf433_bruteforce.h" // Phase 3 Task 8: fixed-code
+                                              // keyspace bruteforce, transmits
+                                              // via Rf433Replay::transmit()
+                                              // (own launcher tile, unlike
+                                              // Replay above)
 #include "features/ble/ble_scan.h"
 #include "features/ble/ble_spam.h"
 #include "features/ble/ble_finder.h"
@@ -368,6 +373,9 @@ void setup() {
     // Task 5 (Phase 3): RF433 scan/capture UI (Category::RF433).
     Rf433Scan::register_module();
 
+    // Task 8 (Phase 3): RF433 fixed-code bruteforce UI (Category::RF433).
+    Rf433Bruteforce::register_module();
+
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
     Serial.println("quarky-tab5: lvgl ready");
@@ -571,6 +579,10 @@ void loop() {
                           // one extra UI tick after the burst actually completed.
     Rf433Scan::poll();  // Phase 3 Task 5: no-ops unless RF433 scan/capture screen
                         // is open and active; drains edge interrupt ring buffer
+    Rf433Bruteforce::poll(); // Phase 3 Task 8: no-ops unless a bruteforce run
+                             // is active; after Rf433Replay::poll() above so
+                             // is_busy()/state() are fresh this tick before
+                             // deciding whether to fire the next candidate
     WifiSpectrumFeature::poll(); // no-ops unless the WiFi Spectrum screen is open
     WifiConnectFeature::poll();  // no-ops unless a connect is in flight; drains the
                                   // background connect_task()'s result -- real-hardware
