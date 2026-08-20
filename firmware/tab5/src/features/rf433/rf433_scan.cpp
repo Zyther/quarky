@@ -6,6 +6,7 @@
 #include <feature_registry.h>
 #include <lvgl.h>
 #include <Arduino.h>
+#include <esp_heap_caps.h> // heap_caps_malloc()/MALLOC_CAP_SPIRAM -- see s_signals' allocation comment
 #include <cstdio>
 #include <cstring>
 
@@ -14,8 +15,45 @@ extern StorageSD storage;
 
 namespace Rf433Scan {
 
-// Session signals buffer
-static CapturedSignal s_signals[kMaxCapturedSignals];
+// Session signals buffer -- heap-allocated in PSRAM, NOT a static/global
+// array, and NOT optional polish. Real-hardware finding (2026-08-20):
+// kMaxCapturedSignals(16) * sizeof(CapturedSignal) is ~64KB (edges[512] *
+// 8B/EdgeSample + bookkeeping), which as a plain `static` array lands in
+// internal DRAM. Bisected on real hardware: the last commit before this
+// buffer existed had 214302 bytes of internal DRAM free (51.88% used); the
+// commit that added it as a static array dropped that to 140210 bytes free
+// (68.52% used) -- and that ~74KB drop was enough to intermittently starve
+// the BLE controller's own internal-RAM-only allocations (observed as
+// continuous "vhci_drv: ... malloc failed" / "NimBLE: ... rc=17" errors)
+// or, worse, push some other task's stack into PSRAM entirely, which trips
+// a real ESP-IDF safety abort the instant anything disables the flash
+// cache: `assert failed: spi_flash_disable_interrupts_caches_and_other_cpu
+// cache_utils.c:127 (esp_task_stack_is_sane_cache_disabled())` -- a hard
+// crash-and-reboot loop, 100% reproducible on every boot once enough of
+// this session's other work piled onto the same internal-DRAM budget.
+//
+// The "obvious" fix -- EXT_RAM_BSS_ATTR, which is supposed to place a
+// static/global variable's .bss in PSRAM at link time -- does NOT work in
+// this build: it expands to nothing unless
+// CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is set, and this project's
+// sdkconfig (framework-arduinoespressif32-libs/esp32p4/sdkconfig:2022)
+// has it explicitly unset. Verified directly against that file rather
+// than assumed -- using EXT_RAM_BSS_ATTR here would have silently done
+// nothing and shipped the same crash. The real, functional mechanism on
+// this build is an explicit runtime allocation with MALLOC_CAP_SPIRAM
+// (esp_heap_caps.h), which this project's sdkconfig DOES support
+// (CONFIG_SPIRAM=y, CONFIG_SPIRAM_USE_MALLOC=y, both confirmed present).
+//
+// Allocated once, in register_module() (called once from setup(), before
+// any feature use is possible). If the allocation fails -- which would
+// mean PSRAM itself is unusable, a much larger problem -- register_module()
+// logs loudly and does NOT register the module, so the feature is simply
+// absent from the launcher rather than crashing later on a null
+// dereference. Every access below still reads as plain array indexing
+// (s_signals[i]) since a heap pointer and a static array use identical
+// indexing syntax -- only the declaration and the one allocation site
+// changed.
+static CapturedSignal *s_signals = nullptr;
 static size_t s_signal_count = 0;
 
 // UI elements
@@ -384,6 +422,25 @@ void start() {
 }
 
 void register_module() {
+    // See s_signals' declaration comment for the real-hardware finding this
+    // allocation exists to fix. MALLOC_CAP_SPIRAM is a hard requirement, not
+    // a hint: falling back to internal RAM on failure would silently
+    // reintroduce the exact internal-DRAM exhaustion this is fixing, so
+    // heap_caps_malloc's request is left unqualified by MALLOC_CAP_8BIT/
+    // MALLOC_CAP_DMA (this buffer is never touched by DMA, only plain CPU
+    // reads/writes) and a failure is treated as fatal to this feature only,
+    // not papered over.
+    s_signals = static_cast<CapturedSignal *>(
+        heap_caps_malloc(sizeof(CapturedSignal) * kMaxCapturedSignals, MALLOC_CAP_SPIRAM));
+    if (!s_signals) {
+        Serial.printf("quarky-tab5: [rf433-scan] heap_caps_malloc(%u bytes, "
+                      "MALLOC_CAP_SPIRAM) FAILED -- PSRAM appears unusable. "
+                      "RF433 Scan will not be registered (refusing rather than "
+                      "risking the internal-DRAM exhaustion this allocation "
+                      "exists to prevent).\n",
+                      (unsigned)(sizeof(CapturedSignal) * kMaxCapturedSignals));
+        return;
+    }
     g_registry.register_module({"rf433_scan", "RF433 Scan/Capture",
                                  Category::RF433, Affinity::TAB5_NATIVE,
                                  start, nullptr});
