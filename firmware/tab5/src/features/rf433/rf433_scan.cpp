@@ -1,7 +1,9 @@
 #include "rf433_scan.h"
 #include "rf433_replay.h" // Phase 3 Task 6: Replay action for the scan-result list below
+#include "rf433_sub_format.h" // Phase 3 Task 22: "Load from SD" .sub interop (Task 21's read())
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
+#include "../../ui/file_browser.h" // Phase 3 Task 22: generic SD file picker
 #include "../../hal/storage_sd.h"
 #include <feature_registry.h>
 #include <lvgl.h>
@@ -77,6 +79,35 @@ static lv_obj_t *s_replay_btn_label = nullptr;
 static lv_obj_t *s_replay_status_label = nullptr;
 static uint32_t s_selected_capture_id = 0; // 0 = sentinel "nothing selected" --
                                             // capture_id is 1-based (see s_next_capture_id)
+
+// Phase 3 Task 22: "Load from SD" -- browse to and load a real .sub file
+// (Task 21's Rf433SubFormat::read(), Task 22's ui/file_browser.h picker) and
+// replay it. Deliberately a SEPARATE slot/UI group from the live-capture
+// s_signals ring above, not a synthetic entry merged into it: a file loaded
+// from SD is not a live capture, has no ring-eviction/capture_id semantics,
+// and (per task-22-controller-notes.md's explicit guidance) shouldn't quietly
+// inherit s_signals'/find_signal_by_id()'s indexing scheme, which exists for
+// a different purpose. Directory choice: the same folder finalize_burst()
+// already writes live captures into (/quarky/captures/rf433/) -- a real .sub
+// file dropped there by the user (e.g. copied from a PC, or a future "Save as
+// .sub" export) lives alongside this session's own .raw captures; filtering
+// by ".sub" keeps the two file kinds from colliding in the picker.
+static const char kSubFileDir[] = "/quarky/captures/rf433";
+static const char kSubFileExt[] = ".sub";
+static lv_obj_t *s_load_sd_btn = nullptr;
+static lv_obj_t *s_loaded_status_label = nullptr;
+static lv_obj_t *s_loaded_replay_btn = nullptr;
+static lv_obj_t *s_loaded_replay_status_label = nullptr;
+// Not PSRAM-backed like s_signals[] -- this is a single CapturedSignal
+// (~4.1KB: 512 edges * 8 bytes + bookkeeping), not an array of
+// kMaxCapturedSignals(16) of them, so it doesn't reproduce the internal-DRAM
+// exhaustion s_signals' own allocation comment documents. `static` (not a
+// build_screen()-local) so the loaded signal survives Back/reopen, matching
+// s_signals'/s_signal_count's own session-persistence, and so it is never a
+// dangling stack reference by the time a Replay tap reads it.
+static CapturedSignal s_loaded_signal;
+static bool s_has_loaded_signal = false;
+static char s_loaded_path[160];
 
 static bool s_active = false;
 static uint32_t s_last_edge_time_us = 0;
@@ -227,8 +258,16 @@ static void add_signal_to_list(const CapturedSignal &sig) {
 // still no UI-level lock here; the exclusion is enforced by those two
 // modules, not by this screen. No-ops if the screen isn't open (widgets
 // null).
-static void update_replay_status_ui() {
-    if (!s_replay_status_label || !s_replay_btn) return;
+// Formats Rf433Replay's current async state into `label` -- factored out of
+// update_replay_status_ui() (Task 22) so BOTH the live-capture replay area and
+// the new "loaded from SD" replay area (below) can render the SAME shared
+// Rf433Replay engine's state without duplicating the switch. There is only
+// ever one Rf433Replay transmit in flight regardless of which UI group
+// started it (live-capture Replay Selected or Load-from-SD's Replay Loaded),
+// so it is correct -- not merely convenient -- for both labels to show
+// identical text at any given moment.
+static void format_replay_status_text(lv_obj_t *label) {
+    if (!label) return;
 
     // Suffix appended to the Transmitting/Done text when the in-flight (or
     // just-finished) replay is of a truncated capture -- see
@@ -241,36 +280,63 @@ static void update_replay_status_ui() {
 
     switch (Rf433Replay::state()) {
         case Rf433Replay::State::kIdle:
-            lv_label_set_text(s_replay_status_label, "Replay: Idle");
+            lv_label_set_text(label, "Replay: Idle");
             break;
         case Rf433Replay::State::kTransmitting: {
             char buf[64];
             std::snprintf(buf, sizeof(buf), "Replay: Transmitting...%s", trunc_suffix);
-            lv_label_set_text(s_replay_status_label, buf);
+            lv_label_set_text(label, buf);
             break;
         }
         case Rf433Replay::State::kDone: {
             char buf[64];
             std::snprintf(buf, sizeof(buf), "Replay: Done%s", trunc_suffix);
-            lv_label_set_text(s_replay_status_label, buf);
+            lv_label_set_text(label, buf);
             break;
         }
         case Rf433Replay::State::kFailed: {
             char buf[112];
             std::snprintf(buf, sizeof(buf), "Replay: Failed (%s)",
                           Rf433Replay::failure_reason());
-            lv_label_set_text(s_replay_status_label, buf);
+            lv_label_set_text(label, buf);
             break;
         }
     }
+}
 
-    // Disable the button while a transmit is in flight so a second tap can't
+// Reflects Rf433Replay's async state onto this screen's replay widgets --
+// BOTH the live-capture group (s_replay_status_label/s_replay_btn) and the
+// Task 22 loaded-from-SD group (s_loaded_replay_status_label/
+// s_loaded_replay_btn). Called from poll() every tick regardless of capture
+// state (s_active) -- a replay can be in flight whether or not a capture is
+// also running, though never BOTH: rf433_common.cpp's capture_start() refuses
+// while Rf433Replay::is_busy(), and Rf433Replay::transmit() refuses while
+// Rf433Common::is_capturing() -- an explicit RX/TX check on top of the
+// GPIO53 arbiter, added because the arbiter's single Owner::kRf433 token
+// (idempotent per-owner) cannot by itself tell RX and TX apart. There is
+// still no UI-level lock here; the exclusion is enforced by those two
+// modules, not by this screen. No-ops per-widget-group if that group's
+// widgets aren't built (screen isn't open, or -- for the loaded group -- Task
+// 22 support didn't build its widgets for some other reason).
+static void update_replay_status_ui() {
+    format_replay_status_text(s_replay_status_label);
+    format_replay_status_text(s_loaded_replay_status_label);
+
+    // Disable each button while a transmit is in flight so a second tap can't
     // stack a request transmit() would refuse anyway -- belt-and-suspenders
     // over transmit()'s own busy check, not a substitute for it.
-    if (Rf433Replay::is_busy()) {
-        lv_obj_add_state(s_replay_btn, LV_STATE_DISABLED);
-    } else {
-        lv_obj_remove_state(s_replay_btn, LV_STATE_DISABLED);
+    bool busy = Rf433Replay::is_busy();
+    if (s_replay_btn) {
+        if (busy) lv_obj_add_state(s_replay_btn, LV_STATE_DISABLED);
+        else lv_obj_remove_state(s_replay_btn, LV_STATE_DISABLED);
+    }
+    if (s_loaded_replay_btn) {
+        // Additionally stays disabled with nothing successfully loaded yet --
+        // busy is the ONLY thing that can re-disable it once a load succeeds
+        // (transmit() itself refuses on 0 edges too, but disabling here saves
+        // a doomed tap-and-see-it-fail round trip).
+        if (busy || !s_has_loaded_signal) lv_obj_add_state(s_loaded_replay_btn, LV_STATE_DISABLED);
+        else lv_obj_remove_state(s_loaded_replay_btn, LV_STATE_DISABLED);
     }
 }
 
@@ -318,6 +384,55 @@ static void finalize_burst() {
     add_signal_to_list(s_signals[new_idx]);
     s_accum_edge_count = 0;
     s_accum_truncated = false;
+}
+
+// Renders s_loaded_signal/s_has_loaded_signal/s_loaded_path onto
+// s_loaded_status_label. Shared by the file-select callback (fires
+// immediately after a load attempt) and build_screen() (restores the label's
+// text if the screen is reopened after a file was already loaded this
+// session -- s_has_loaded_signal/s_loaded_path/s_loaded_signal are `static`,
+// not build_screen()-local, so they persist across Back/reopen exactly like
+// s_signal_count's own session persistence above).
+static void update_loaded_status_label() {
+    if (!s_loaded_status_label) return;
+    if (!s_has_loaded_signal) {
+        lv_label_set_text(s_loaded_status_label, "Loaded: none");
+        return;
+    }
+    char buf[200];
+    std::snprintf(buf, sizeof(buf), "Loaded: %s (%u edges)%s", s_loaded_path,
+                  (unsigned)s_loaded_signal.edge_count,
+                  s_loaded_signal.truncated ? " [truncated]" : "");
+    lv_label_set_text(s_loaded_status_label, buf);
+}
+
+// FileBrowser::SelectCallback for the "Load from SD" button below. `path` is
+// only valid for the duration of this call (see file_browser.h's doc
+// comment) -- copied into s_loaded_path before use since it's needed again
+// by update_loaded_status_label() on a later reopen.
+static void on_sub_file_selected(const char *path, void * /*user_data*/) {
+    std::strncpy(s_loaded_path, path, sizeof(s_loaded_path) - 1);
+    s_loaded_path[sizeof(s_loaded_path) - 1] = '\0';
+
+    // Rf433SubFormat::read() (Task 21) fully populates *out on success,
+    // including out->truncated if the real file on SD was larger than its
+    // internal read buffer (see rf433_sub_format.h's read() doc comment) --
+    // that's surfaced via update_loaded_status_label()'s "[truncated]" suffix,
+    // the same idiom rf433_scan.cpp's own add_signal_to_list() already uses
+    // for live-capture truncation.
+    bool ok = Rf433SubFormat::read(storage, s_loaded_path, &s_loaded_signal);
+    s_has_loaded_signal = ok;
+    if (!ok) {
+        Serial.printf("quarky-tab5: [rf433-scan] Failed to load .sub file '%s' -- not a "
+                      "well-formed RAW .sub file this module supports, or SD read failed\n",
+                      s_loaded_path);
+    } else {
+        Serial.printf("quarky-tab5: [rf433-scan] Loaded '%s': %u edges%s\n", s_loaded_path,
+                      (unsigned)s_loaded_signal.edge_count,
+                      s_loaded_signal.truncated ? " (TRUNCATED)" : "");
+    }
+    update_loaded_status_label();
+    update_replay_status_ui(); // re-evaluates s_loaded_replay_btn's disabled state
 }
 
 static lv_obj_t *build_screen() {
@@ -376,6 +491,49 @@ static lv_obj_t *build_screen() {
     s_replay_status_label = lv_label_create(content);
     lv_label_set_text(s_replay_status_label, "Replay: Idle");
 
+    // Task 22: "Load from SD" -- a SEPARATE group from the live-capture
+    // replay UI above (see s_loaded_signal's declaration comment for why).
+    // Opens ui/file_browser.h's generic picker over kSubFileDir/kSubFileExt;
+    // on_sub_file_selected() runs Rf433SubFormat::read() and updates the
+    // status label + Replay Loaded button below.
+    s_load_sd_btn = lv_button_create(content);
+    lv_obj_t *load_sd_label = lv_label_create(s_load_sd_btn);
+    lv_label_set_text(load_sd_label, "Load from SD (.sub)");
+    lv_obj_add_event_cb(s_load_sd_btn, [](lv_event_t *) {
+        FileBrowser::push(storage, "Load RF433 .sub file", kSubFileDir, kSubFileExt,
+                           on_sub_file_selected);
+    }, LV_EVENT_CLICKED, nullptr);
+
+    s_loaded_status_label = lv_label_create(content);
+    update_loaded_status_label(); // restores "Loaded: <path>" text if reopening
+
+    s_loaded_replay_btn = lv_button_create(content);
+    lv_obj_t *loaded_replay_label = lv_label_create(s_loaded_replay_btn);
+    lv_label_set_text(loaded_replay_label, "Replay Loaded");
+    lv_obj_add_event_cb(s_loaded_replay_btn, [](lv_event_t *) {
+        if (!s_has_loaded_signal) {
+            Serial.println("quarky-tab5: [rf433-scan] Replay Loaded tapped with no file "
+                            "loaded -- use Load from SD first");
+            return;
+        }
+        // Same shared transmit() path as the live-capture Replay Selected
+        // button -- see rf433_replay.h's doc comment: exactly one
+        // safety-reviewed transmit path (GPIO53 arbiter + RX/TX exclusion),
+        // never a second one for SD-loaded signals.
+        Rf433Replay::transmit(s_loaded_signal);
+    }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_state(s_loaded_replay_btn, LV_STATE_DISABLED); // update_replay_status_ui()
+                                                               // (below) re-derives this
+                                                               // from s_has_loaded_signal
+                                                               // on every poll() tick anyway;
+                                                               // set here too so the very
+                                                               // first frame (before poll()
+                                                               // next runs) isn't briefly
+                                                               // tappable with nothing loaded.
+
+    s_loaded_replay_status_label = lv_label_create(content);
+    lv_label_set_text(s_loaded_replay_status_label, "Replay: Idle");
+
     s_list = lv_list_create(content);
     lv_obj_set_size(s_list, LV_PCT(100), LV_PCT(100));
 
@@ -405,6 +563,10 @@ static lv_obj_t *build_screen() {
         s_replay_btn = nullptr;
         s_replay_btn_label = nullptr;
         s_replay_status_label = nullptr;
+        s_load_sd_btn = nullptr;
+        s_loaded_status_label = nullptr;
+        s_loaded_replay_btn = nullptr;
+        s_loaded_replay_status_label = nullptr;
         // Deliberately NOT clearing s_selected_capture_id here: it is only a
         // lookup key (re-validated via find_signal_by_id() on next use), and
         // an in-flight Rf433Replay transmit task (like WifiConnectFeature's
