@@ -5,6 +5,7 @@
 #include "pairing_screen.h"
 #include "../features/ping_feature.h"
 #include <lvgl.h>
+#include <cstdio>
 #include <cstring>
 #include <utility>
 
@@ -69,6 +70,13 @@ lv_obj_t *Shell::build(FeatureRegistry &registry) {
 
     status_bar_ = lv_obj_create(root);
     lv_obj_set_size(status_bar_, LV_PCT(100), 40);
+    // Task 23: this used to be the PERMANENT value -- a plain local variable
+    // nothing ever called lv_label_set_text() on again. It is now only the
+    // honest pre-first-poll placeholder: main.cpp's loop() calls
+    // update_battery_label() every few seconds once hal/battery.h's real
+    // INA226 read is up, the same "child 0 of status_bar_" label this
+    // function creates here (see update_battery_label() below and
+    // devices_panel.cpp's identical child-index convention for child 1).
     lv_obj_t *battery_label = lv_label_create(status_bar_);
     lv_label_set_text(battery_label, "Battery: --%");
     lv_obj_t *link_label = lv_label_create(status_bar_);
@@ -124,4 +132,21 @@ lv_obj_t *Shell::build(FeatureRegistry &registry) {
     }, LV_EVENT_CLICKED, nullptr);
 
     return root;
+}
+
+void Shell::update_battery_label(bool ok, int percent) {
+    if (!status_bar_) return; // build() hasn't run yet
+    // Child 0 is the battery label -- see build() above, which creates it
+    // first, before the link label (child 1, read the same way by
+    // devices_panel.cpp's update()).
+    lv_obj_t *battery_label = lv_obj_get_child(status_bar_, 0);
+    if (!battery_label) return;
+
+    char buf[24];
+    if (ok) {
+        snprintf(buf, sizeof(buf), "Battery: %d%%", percent);
+    } else {
+        snprintf(buf, sizeof(buf), "Battery: --%%");
+    }
+    lv_label_set_text(battery_label, buf);
 }

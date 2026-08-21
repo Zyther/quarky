@@ -9,6 +9,8 @@
 #include "hal/c2link_ble.h"
 #include "hal/nfc_pn532.h"
 #include "hal/rf433_gpio.h"
+#include "hal/battery.h" // Phase 3 Task 23: real INA226 battery-percentage HAL,
+                          // replacing shell.cpp's permanent "Battery: --%" stub
 #include "ui/lvgl_port.h"
 #include "ui/shell.h"
 #include "ui/screen_stack.h"
@@ -194,6 +196,13 @@ NfcPN532 rfid2_unit(TAB5_RFID2_I2C_ADDR); // 0x28, CONFIRMED on hardware
                                           // confirmed 2026-08-09, Phase 1 Task 18
                                           // follow-up -- what's new here is the
                                           // protocol identity, not the address.)
+Battery battery; // Phase 3 Task 23: INA226 @0x41 on the INTERNAL I2C bus (GPIO
+                 // 31/32) -- see hal/battery.h for the real chip-ID/register/
+                 // formula citations. init() is called in setup(); poll()'d
+                 // (well, read directly -- there is no poll() method, see the
+                 // interval-gated call in loop()) at a multi-second interval,
+                 // not per-tick, since a battery percentage never needs to be
+                 // per-frame-fresh.
 Rf433Gpio rf433; // Intentionally has NO init() call in setup() as of 2026-08-18
                  // -- GPIO53 is shared with the external I2C SDA line and
                  // claiming it at boot tore down Wire1. See the long comment at
@@ -387,6 +396,18 @@ void setup() {
     Serial.println("quarky-tab5: mounting sd card...");
     bool sd_ok = storage.mount() && storage.write_test_file();
     Serial.printf("quarky-tab5: sd mount+write: %s\n", sd_ok ? "OK" : "FAILED");
+
+    // Task 23: battery HAL bring-up. INA226 @0x41 lives on the INTERNAL I2C
+    // bus (the same one display.init()/touch.init() already brought up
+    // above), not the external HY2.0 PORT.A bus the NFC/RFID2 census below
+    // uses -- so this runs before that census, independent of which HY2.0
+    // unit (if any) is plugged in. A failed init() here is not fatal: the
+    // status bar just keeps showing "--%" (see Shell::update_battery_label()
+    // in loop() below), the same "degrade, don't brick" pattern this file
+    // already uses for a down C6/radio link.
+    bool battery_ok = battery.init();
+    Serial.printf("quarky-tab5: battery HAL (INA226 @0x41) init: %s\n",
+                  battery_ok ? "OK" : "FAILED");
 
     // Task 18: HY2.0 peripheral detection (NFC, RFID2, RF433R/T). Detection
     // only -- no read/write/clone/replay logic yet (Phase 3 scope). The NFC
@@ -1106,6 +1127,18 @@ void loop() {
         bool ble_connected = ble_last != 0 && ble_age < 5000;
         int32_t freshest_age = wifi_connected ? (int32_t)wifi_age : (int32_t)ble_age;
         DevicesPanel::update(wifi_connected, ble_connected, freshest_age);
+    }
+
+    // Task 23: battery percentage, re-read every 5s -- plenty for a value
+    // that changes over minutes/hours, not milliseconds, and far cheaper
+    // than the 500ms devices-panel poll above. Reuses `now` from that block,
+    // same tick.
+    static uint32_t s_last_battery_poll_ms = 0;
+    if (now - s_last_battery_poll_ms > 5000) {
+        s_last_battery_poll_ms = now;
+        int percent = 0;
+        bool ok = battery.chip_detected() && battery.percent(&percent);
+        Shell::update_battery_label(ok, percent);
     }
 
     delay(5);
