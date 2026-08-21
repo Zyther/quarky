@@ -1,6 +1,11 @@
 #include "rf433_scan.h"
 #include "rf433_replay.h" // Phase 3 Task 6: Replay action for the scan-result list below
 #include "rf433_sub_format.h" // Phase 3 Task 22: "Load from SD" .sub interop (Task 21's read())
+#include "rf433_protocol_decode.h" // Task 7's decode(), wired into a live "Decode
+                                    // Selected" button below -- previously tested
+                                    // only against a hardcoded fixture, never
+                                    // called from any live screen (rf433_bruteforce.h
+                                    // 's own comment already flagged this exact gap)
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
 #include "../../ui/file_browser.h" // Phase 3 Task 22: generic SD file picker
@@ -77,6 +82,11 @@ static lv_obj_t *s_replay_selected_label = nullptr;
 static lv_obj_t *s_replay_btn = nullptr;
 static lv_obj_t *s_replay_btn_label = nullptr;
 static lv_obj_t *s_replay_status_label = nullptr;
+static lv_obj_t *s_clear_btn = nullptr;
+static lv_obj_t *s_decode_btn = nullptr;
+static lv_obj_t *s_decode_result_label = nullptr;
+static lv_obj_t *s_save_sub_btn = nullptr;
+static lv_obj_t *s_save_sub_status_label = nullptr;
 static uint32_t s_selected_capture_id = 0; // 0 = sentinel "nothing selected" --
                                             // capture_id is 1-based (see s_next_capture_id)
 
@@ -87,12 +97,24 @@ static uint32_t s_selected_capture_id = 0; // 0 = sentinel "nothing selected" --
 // from SD is not a live capture, has no ring-eviction/capture_id semantics,
 // and (per task-22-controller-notes.md's explicit guidance) shouldn't quietly
 // inherit s_signals'/find_signal_by_id()'s indexing scheme, which exists for
-// a different purpose. Directory choice: the same folder finalize_burst()
-// already writes live captures into (/quarky/captures/rf433/) -- a real .sub
-// file dropped there by the user (e.g. copied from a PC, or a future "Save as
-// .sub" export) lives alongside this session's own .raw captures; filtering
-// by ".sub" keeps the two file kinds from colliding in the picker.
-static const char kSubFileDir[] = "/quarky/captures/rf433";
+// a different purpose.
+//
+// Directory choice, CORRECTED 2026-08-21 (real-hardware finding): originally
+// pointed at the same folder finalize_burst() writes its unconditional
+// "sig_<ms>_<edges>.raw" diagnostic dump into (/quarky/captures/rf433/),
+// reasoning that ".sub" extension filtering would keep the two file kinds
+// from colliding in the picker. That reasoning held locally but missed a real
+// interaction with StorageSD::list_files()'s own kMaxEntriesScanned safety
+// cap (256, storage_sd.cpp): after enough real capture sessions (this
+// project's own ambient-433MHz-traffic stress test alone produced dozens of
+// bursts), the raw-dump directory accumulates FAR more than 256 files, and
+// the scan exhausts its entry budget entirely on old .raw files before ever
+// reaching a .sub file -- confirmed on real hardware via temporary
+// diagnostic logging (256 entries visited, all "sig_*.raw", 0 matches, a
+// genuine capture_N.sub file present but never reached). Moved to its own
+// subdirectory so this picker's scan is never at the mercy of how many raw
+// diagnostic dumps the OTHER mechanism has accumulated.
+static const char kSubFileDir[] = "/quarky/captures/rf433/sub";
 static const char kSubFileExt[] = ".sub";
 static lv_obj_t *s_load_sd_btn = nullptr;
 static lv_obj_t *s_loaded_status_label = nullptr;
@@ -183,6 +205,26 @@ static const CapturedSignal *find_signal_by_id(uint32_t capture_id) {
         if (s_signals[i].capture_id == capture_id) return &s_signals[i];
     }
     return nullptr;
+}
+
+// An empty-text label still occupies a full row (font-line height plus the
+// flex container's own row gap) -- with two of these sitting back to back
+// (decode result, save-.sub status) between the live-capture Replay status
+// and the loaded-from-SD group, that showed up as a visibly oversized gap on
+// real hardware. Hidden instead of just emptied when there's nothing to show;
+// shown again the moment there's real text to display.
+static void set_decode_result_text(const char *text) {
+    if (s_decode_result_label == nullptr) return;
+    lv_label_set_text(s_decode_result_label, text);
+    if (text[0] == '\0') lv_obj_add_flag(s_decode_result_label, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_remove_flag(s_decode_result_label, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void set_save_sub_status_text(const char *text) {
+    if (s_save_sub_status_label == nullptr) return;
+    lv_label_set_text(s_save_sub_status_label, text);
+    if (text[0] == '\0') lv_obj_add_flag(s_save_sub_status_label, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_remove_flag(s_save_sub_status_label, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void add_signal_to_list(const CapturedSignal &sig) {
@@ -443,21 +485,64 @@ static lv_obj_t *build_screen() {
     s_status_label = lv_label_create(content);
     lv_label_set_text(s_status_label, "Status: Idle");
 
-    s_toggle_btn = lv_button_create(content);
+    // All 7 action buttons live in a 3-column row-wrap grid instead of each
+    // taking a full-width row -- with this many actions (capture toggle,
+    // clear, replay/decode/save-sub on a selection, load-from-SD, replay
+    // loaded) stacking them individually pushed the actual signal list
+    // (the thing this screen is for) off the bottom of the visible area.
+    // Their result/status labels stay in their own group below the grid
+    // (see after the grid's closing brace) rather than immediately under
+    // each button, so the grid can stay compact.
+    lv_obj_t *btn_grid = lv_obj_create(content);
+    lv_obj_set_width(btn_grid, LV_PCT(100));
+    lv_obj_set_height(btn_grid, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btn_grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_all(btn_grid, 2, 0);
+    lv_obj_set_style_pad_gap(btn_grid, 4, 0);
+
+    s_toggle_btn = lv_button_create(btn_grid);
+    lv_obj_set_width(s_toggle_btn, LV_PCT(32));
     s_toggle_label = lv_label_create(s_toggle_btn);
     lv_label_set_text(s_toggle_label, "Start Capture");
     lv_obj_add_event_cb(s_toggle_btn, [](lv_event_t *) {
         set_capture_active(!s_active);
     }, LV_EVENT_CLICKED, nullptr);
 
-    // Task 6 (RF433 replay): selection label + Replay button + status label,
-    // in that order, ahead of the list -- same idiom as s_status_label/
-    // s_toggle_btn above (a small fixed-height label/button pair living in
-    // this same COLUMN flex container, ahead of the size-flexed list).
-    s_replay_selected_label = lv_label_create(content);
-    lv_label_set_text(s_replay_selected_label, "Selected: none");
+    // "Clear" -- empties the live-capture list (s_signals/s_signal_count),
+    // for when ambient 433 MHz traffic (weather stations, doorbells, other
+    // remotes) has filled it with bursts unrelated to whatever the user
+    // actually wants to test. Deliberately does NOT touch s_loaded_signal
+    // (the SEPARATE Task 22 "Load from SD" slot -- see its own declaration
+    // comment for why live captures and a loaded file are kept apart) and
+    // does NOT stop an in-progress capture (safe either way: accumulation
+    // state is independent of the finalized s_signals list this clears).
+    // Safe to run mid-capture -- finalize_burst() only ever APPENDS to
+    // s_signals, so clearing it here can't race a concurrent append into an
+    // inconsistent state, just an append landing right after a clear.
+    s_clear_btn = lv_button_create(btn_grid);
+    lv_obj_set_width(s_clear_btn, LV_PCT(32));
+    lv_obj_t *clear_lbl = lv_label_create(s_clear_btn);
+    lv_label_set_text(clear_lbl, "Clear");
+    lv_obj_add_event_cb(s_clear_btn, [](lv_event_t *) {
+        s_signal_count = 0;
+        if (s_list != nullptr) {
+            lv_obj_clean(s_list);
+            s_placeholder = lv_list_add_text(s_list, "No signals captured yet");
+        }
+        s_selected_capture_id = 0;
+        if (s_replay_selected_label) {
+            lv_label_set_text(s_replay_selected_label, "Selected: none");
+        }
+        set_decode_result_text("");
+        set_save_sub_status_text("");
+        Serial.println("quarky-tab5: [rf433-scan] capture list cleared");
+    }, LV_EVENT_CLICKED, nullptr);
 
-    s_replay_btn = lv_button_create(content);
+    // Task 6 (RF433 replay): Replay button lives in the grid; its selection/
+    // status labels move to the label group below the grid (see after the
+    // grid's last button) so the grid itself stays a compact 3-column block.
+    s_replay_btn = lv_button_create(btn_grid);
+    lv_obj_set_width(s_replay_btn, LV_PCT(32));
     s_replay_btn_label = lv_label_create(s_replay_btn);
     lv_label_set_text(s_replay_btn_label, "Replay Selected");
     lv_obj_add_event_cb(s_replay_btn, [](lv_event_t *) {
@@ -488,15 +573,90 @@ static lv_obj_t *build_screen() {
         Rf433Replay::transmit(*found);
     }, LV_EVENT_CLICKED, nullptr);
 
-    s_replay_status_label = lv_label_create(content);
-    lv_label_set_text(s_replay_status_label, "Replay: Idle");
+    // "Decode Selected" -- runs Task 7's Rf433ProtocolDecode::decode() against
+    // whatever's currently selected. Prior to this, decode() was tested only
+    // against a hardcoded fixture (its own host-native test) and was never
+    // actually called from any live screen -- rf433_bruteforce.h's own
+    // comment already disclosed this gap explicitly. Same re-validate-by-id
+    // pattern as Replay Selected above (a selection can be evicted from the
+    // ring between being tapped and being acted on).
+    s_decode_btn = lv_button_create(btn_grid);
+    lv_obj_set_width(s_decode_btn, LV_PCT(32));
+    lv_obj_t *decode_lbl = lv_label_create(s_decode_btn);
+    lv_label_set_text(decode_lbl, "Decode Selected");
+    lv_obj_add_event_cb(s_decode_btn, [](lv_event_t *) {
+        if (s_selected_capture_id == 0) {
+            set_decode_result_text("Select a signal first.");
+            return;
+        }
+        const CapturedSignal *found = find_signal_by_id(s_selected_capture_id);
+        if (!found) {
+            set_decode_result_text("Selected signal evicted -- reselect.");
+            return;
+        }
+        Rf433ProtocolDecode::DecodedCode out{};
+        char buf[80];
+        if (Rf433ProtocolDecode::decode(*found, &out)) {
+            std::snprintf(buf, sizeof(buf), "Decoded: %s  code=0x%llX  (%u bits)",
+                          out.protocol_name, (unsigned long long)out.code,
+                          (unsigned)out.bit_length);
+            Serial.printf("quarky-tab5: [rf433-scan] decode: %s code=0x%llX bits=%u\n",
+                          out.protocol_name, (unsigned long long)out.code,
+                          (unsigned)out.bit_length);
+        } else {
+            std::snprintf(buf, sizeof(buf), "No known protocol matched (%u edges)",
+                          (unsigned)found->edge_count);
+            Serial.printf("quarky-tab5: [rf433-scan] decode: no match (%u edges)\n",
+                          (unsigned)found->edge_count);
+        }
+        set_decode_result_text(buf);
+    }, LV_EVENT_CLICKED, nullptr);
+
+    // "Save as .sub" -- Task 21's Rf433SubFormat::write(), previously only
+    // exercised by its own host-native test; this is the first live path that
+    // actually produces a real .sub file on the SD card from a genuine
+    // capture (closing the disclosed gap noted in Task 22's own ledger entry
+    // -- "no Save as .sub export is wired in either"). Filename keyed by
+    // capture_id, matching this project's existing hex/id-based naming
+    // convention (nfc_tag_library.cpp's hex-UID naming, nfc_mifare_crack.cpp's
+    // hex-UID naming) rather than inventing a new one.
+    s_save_sub_btn = lv_button_create(btn_grid);
+    lv_obj_set_width(s_save_sub_btn, LV_PCT(32));
+    lv_obj_t *save_sub_lbl = lv_label_create(s_save_sub_btn);
+    lv_label_set_text(save_sub_lbl, "Save as .sub");
+    lv_obj_add_event_cb(s_save_sub_btn, [](lv_event_t *) {
+        if (s_selected_capture_id == 0) {
+            set_save_sub_status_text("Select a signal first.");
+            return;
+        }
+        const CapturedSignal *found = find_signal_by_id(s_selected_capture_id);
+        if (!found) {
+            set_save_sub_status_text("Selected signal evicted -- reselect.");
+            return;
+        }
+        char path[96];
+        std::snprintf(path, sizeof(path), "%s/capture_%u.sub", kSubFileDir,
+                      (unsigned)s_selected_capture_id);
+        bool ok = Rf433SubFormat::write(storage, path, *found);
+        char buf[128];
+        if (ok) {
+            std::snprintf(buf, sizeof(buf), "Saved to %s", path);
+            Serial.printf("quarky-tab5: [rf433-scan] saved .sub: %s (%u edges)\n",
+                          path, (unsigned)found->edge_count);
+        } else {
+            std::snprintf(buf, sizeof(buf), "Save failed (%s)", path);
+            Serial.printf("quarky-tab5: [rf433-scan] failed to save .sub: %s\n", path);
+        }
+        set_save_sub_status_text(buf);
+    }, LV_EVENT_CLICKED, nullptr);
 
     // Task 22: "Load from SD" -- a SEPARATE group from the live-capture
     // replay UI above (see s_loaded_signal's declaration comment for why).
     // Opens ui/file_browser.h's generic picker over kSubFileDir/kSubFileExt;
     // on_sub_file_selected() runs Rf433SubFormat::read() and updates the
     // status label + Replay Loaded button below.
-    s_load_sd_btn = lv_button_create(content);
+    s_load_sd_btn = lv_button_create(btn_grid);
+    lv_obj_set_width(s_load_sd_btn, LV_PCT(32));
     lv_obj_t *load_sd_label = lv_label_create(s_load_sd_btn);
     lv_label_set_text(load_sd_label, "Load from SD (.sub)");
     lv_obj_add_event_cb(s_load_sd_btn, [](lv_event_t *) {
@@ -504,10 +664,8 @@ static lv_obj_t *build_screen() {
                            on_sub_file_selected);
     }, LV_EVENT_CLICKED, nullptr);
 
-    s_loaded_status_label = lv_label_create(content);
-    update_loaded_status_label(); // restores "Loaded: <path>" text if reopening
-
-    s_loaded_replay_btn = lv_button_create(content);
+    s_loaded_replay_btn = lv_button_create(btn_grid);
+    lv_obj_set_width(s_loaded_replay_btn, LV_PCT(32));
     lv_obj_t *loaded_replay_label = lv_label_create(s_loaded_replay_btn);
     lv_label_set_text(loaded_replay_label, "Replay Loaded");
     lv_obj_add_event_cb(s_loaded_replay_btn, [](lv_event_t *) {
@@ -530,6 +688,26 @@ static lv_obj_t *build_screen() {
                                                                // first frame (before poll()
                                                                // next runs) isn't briefly
                                                                // tappable with nothing loaded.
+
+    // Status/result labels for the grid above, grouped together (rather than
+    // sitting individually under each button) so the button grid itself
+    // stays compact -- see btn_grid's own declaration comment.
+    s_replay_selected_label = lv_label_create(content);
+    lv_label_set_text(s_replay_selected_label, "Selected: none");
+
+    s_replay_status_label = lv_label_create(content);
+    lv_label_set_text(s_replay_status_label, "Replay: Idle");
+
+    s_decode_result_label = lv_label_create(content);
+    lv_label_set_long_mode(s_decode_result_label, LV_LABEL_LONG_WRAP);
+    set_decode_result_text(""); // starts hidden -- see the helper's own comment
+
+    s_save_sub_status_label = lv_label_create(content);
+    lv_label_set_long_mode(s_save_sub_status_label, LV_LABEL_LONG_WRAP);
+    set_save_sub_status_text(""); // starts hidden
+
+    s_loaded_status_label = lv_label_create(content);
+    update_loaded_status_label(); // restores "Loaded: <path>" text if reopening
 
     s_loaded_replay_status_label = lv_label_create(content);
     lv_label_set_text(s_loaded_replay_status_label, "Replay: Idle");
@@ -557,12 +735,17 @@ static lv_obj_t *build_screen() {
         s_status_label = nullptr;
         s_toggle_btn = nullptr;
         s_toggle_label = nullptr;
+        s_clear_btn = nullptr;
         s_list = nullptr;
         s_placeholder = nullptr;
         s_replay_selected_label = nullptr;
         s_replay_btn = nullptr;
         s_replay_btn_label = nullptr;
         s_replay_status_label = nullptr;
+        s_decode_btn = nullptr;
+        s_decode_result_label = nullptr;
+        s_save_sub_btn = nullptr;
+        s_save_sub_status_label = nullptr;
         s_load_sd_btn = nullptr;
         s_loaded_status_label = nullptr;
         s_loaded_replay_btn = nullptr;
