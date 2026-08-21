@@ -38,12 +38,18 @@ static_assert(kIna226ConfigValue == 0x0527,
 // board_M5Tab5 case: `(mv - 3300) * 100 / (float)(4150 - 3350)`.
 constexpr float kPercentFloorMv = 3300.0f;
 constexpr float kPercentRangeDenomMv = (float)(4150 - 3350); // == 800, NOT 850
-static_assert((4150 - 3350) == 800,
+// Binds the actual constant used by percent() below, not a private literal --
+// a static_assert((4150-3350)==800) here would be a tautology over its own
+// operands and would NOT catch a future edit to kPercentRangeDenomMv itself
+// (e.g. changing its initializer to (4150-3300) silently passes such an
+// assert). Review caught this distinction; fixed to reference the real
+// symbol so the regression the comment above warns about actually trips it.
+static_assert(kPercentFloorMv == 3300.0f && kPercentRangeDenomMv == 800.0f,
               "recheck this task's percentage-formula citation before "
-              "changing this constant -- a secondary summary of the real "
-              "M5Unified source paraphrased this as 850 during this task's "
-              "own research and that was wrong; verified against the raw "
-              "fetched source directly");
+              "changing these constants -- a secondary summary of the real "
+              "M5Unified source paraphrased the range denominator as 850 "
+              "during this task's own research and that was wrong; verified "
+              "against the raw fetched source directly");
 
 // ---------------------------------------------------------------------------
 // I2C helpers. INA226's register address is ONE byte (unlike GT911/ST7123's
@@ -114,6 +120,29 @@ bool Battery::init() {
                   kIna226I2cAddr, id, kRegConfig, kIna226ConfigValue,
                   cfg_ok ? "OK" : "FAILED");
     init_ok_ = cfg_ok;
+
+    // Log the raw bus-voltage reading once at bring-up, ahead of the deferred
+    // hardware checkpoint: an unclamped mV number distinguishes "no pack,
+    // reading USB-only VBUS" from "a real 2S pack" immediately, where the
+    // clamped percent() alone cannot (see battery.h's disclosed presence-
+    // detection gap). Best-effort -- init_ok_ is already latched above either
+    // way, this is diagnostic only.
+    if (init_ok_) {
+        int32_t mv = 0;
+        if (bus_voltage_mv(&mv)) {
+            // Total 2S pack voltage, not per-cell (percent() applies the /2
+            // per-cell step separately -- see its own comment). A real pack
+            // reads roughly 6600-8300 mV across its usable range (2 * the
+            // 3300-4150 mV/cell floor/ceiling the percentage formula uses);
+            // this raw number is logged specifically so the deferred
+            // hardware checkpoint can distinguish a real pack from USB-only
+            // VBUS, which the clamped percentage alone cannot (battery.h's
+            // disclosed presence-detection gap).
+            Serial.printf("quarky-tab5: battery HAL: raw bus voltage %ld mV "
+                          "total pack (real 2S pack: ~6600-8300 mV range)\n",
+                          (long)mv);
+        }
+    }
     return init_ok_;
 }
 
