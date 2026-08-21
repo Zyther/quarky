@@ -799,3 +799,28 @@ Write the chip identity, address, and citation into `ir_unit.h`'s header comment
 - [ ] **Step 5: Commit**
 
 **Model:** Opus for Step 1 (real hardware-identification research under initial uncertainty, same risk class as Task 2/15) — Sonnet is fine for Steps 2-3 once the chip/interface is known.
+
+---
+
+## Task 24: NFC tag emulation (NFC unit, Listen Mode)
+
+> **Numbered non-sequentially, added 2026-08-21** — same reasoning as Tasks 21-23. Raised by the project owner while testing Task 10's NFC/RFID2 tag library: shouldn't "select a saved tag" mean "emulate it", not just "view/reload its data"? Real hardware research done before adding this task (not assumed) — see Context below for why this can't be a quick addition to Task 10's existing screen. **Sequencing: independent of every other task in this plan, but gated on real hardware research (Step 1) the same way Task 2/15/23 were before any code is written.**
+
+**Files:**
+- Create: `firmware/tab5/src/features/nfc/nfc_emulate.h` / `.cpp` (new feature — Listen Mode was never part of any prior NFC task's scope; `st25r3916_driver.{h,cpp}` (Tasks 2/4) only implements the polled NFCA-A **reader/poller** path).
+- Modify: `firmware/tab5/src/features/nfc/nfc_tag_library_ui.cpp` — add an "Emulate" action next to the existing load/view action on a saved tag's detail view (Task 10).
+- Modify: `firmware/tab5/src/main.cpp` — register + poll, same pattern as every other feature.
+
+**Context, confirmed directly (2026-08-21) before writing this task, not assumed:**
+- **RFID2 (WS1850S/MFRC522-class) CANNOT do this at all — a hard silicon limit, not a missing feature.** The real, vendored `MFRC522_I2C` command set (`lib/MFRC522_I2C/src/MFRC522_I2C.h`'s `PCD_Command` enum: `PCD_Idle`/`PCD_Mem`/`PCD_GenerateRandomID`/`PCD_CalcCRC`/`PCD_Transmit`/`PCD_NoCmdChange`/`PCD_Receive`/`PCD_Transceive`/`PCD_SoftReset`) has no card-emulation or target-mode command whatsoever. This is genuinely PCD-only (reader-only) silicon — no firmware written against it can make it present as a tag.
+- **The NFC unit (ST25R3916) DOES support this at the silicon level** — confirmed directly in the real reference driver already vendored in this project's own research checkout (`~/src/wilson-elechouse/ST25R3916/ST25R3916_ELECHOUSE/src/rfal_rfst25r3916.h`), which has a full `rfalLm` (Listen Mode) state struct, its own state machine (`rfalLmState`), timing constants (`RFAL_FDT_LISTEN_A_ADJUSTMENT`, `RFAL_LM_GT`, etc.), and dedicated IRQ handling — real, substantial, silicon-level card-emulation support, not a stretch.
+- **But this project's current NFC-unit driver (`st25r3916_driver.{h,cpp}`) only implements the polled NFCA reader/poller path (Tasks 2/4)** — no Listen Mode code exists anywhere in this codebase yet. Per Task 4's own established finding, RFAL itself can't be used unmodified on this hardware (its I2C-mode constructor requires an IRQ pin the Tab5's HY2.0 connector doesn't have) — the reader path was rebuilt as polled-register code sourced from the same real DS12484 Rev 3 datasheet + RFAL reference driver citations `st25r3916_driver.cpp` already uses. **Listen Mode will need the same treatment**: a polled-register port of RFAL's real Listen Mode sequence (Sense-B/Sense-A response, SDD/anticollision response as a PICC, sending back saved-tag data instead of receiving it) rather than a straight RFAL port, sourced from the same real datasheet sections + reference driver as the existing reader path. This is genuinely comparable in research/implementation scope to Task 2's original bring-up spike, not a quick UI addition — treat it as such when scheduling.
+- **Emulation source data**: reuse Task 10's `NfcTagLibrary::TagInfo` records (UID + type) as the minimum viable target — full-memory-content emulation (beyond just answering with the right UID/ATQA/SAK) is a further stretch goal, not this task's Step 1-4 baseline, and should be scoped explicitly if attempted.
+
+- [ ] **Step 1: Research the real ST25R3916 Listen Mode register sequence** — DS12484 Rev 3 (already this project's primary datasheet source) + the real RFAL reference driver's Listen Mode implementation (`rfal_rfst25r3916.c`'s `rfalListenStart()`/`rfalListenSleepStart()`/etc. and the `rfalLm` state machine cited above), cited the same depth as `st25r3916_driver.cpp`'s existing SOURCES block. Confirm concretely what a polled (non-IRQ) Listen Mode loop needs to look like, or report BLOCKED with the specific gap if the polled adaptation isn't feasible within reasonable scope (this plan's established Task-12/SRIX precedent) — do not fabricate a register sequence.
+- [ ] **Step 2: Implement minimum-viable emulation** (answer REQA/WUPA + anticollision/SELECT with a saved tag's real UID/SAK, per Step 1's findings)
+- [ ] **Step 3: Wire "Emulate" into the tag library's saved-tag detail view**
+- [ ] **Step 4: PAUSE FOR HARDWARE, then verify against a real external reader** (e.g. a phone's NFC reader, or the RFID2 unit's own reader path used as an independent verifier) that the Tab5 is actually detected and reports the emulated tag's real UID.
+- [ ] **Step 5: Commit**
+
+**Model:** Opus for Step 1 (real hardware protocol research under genuine uncertainty, same risk class as Task 2) — Sonnet is fine for Steps 2-3 once the register sequence is known.
