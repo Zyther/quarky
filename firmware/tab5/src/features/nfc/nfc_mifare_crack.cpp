@@ -1307,7 +1307,18 @@ void worker_task(void *) {
 
 // ── UI ──────────────────────────────────────────────────────────────────────
 
-lv_obj_t *s_mode_dropdown = nullptr;
+// Real-hardware finding (2026-08-21): an lv_dropdown here reproducibly
+// resolved EVERY row tap to the LAST option regardless of which row was
+// actually tapped -- confirmed with real coordinate logging that the tap
+// genuinely landed within the correct row's own on-screen bounds (per
+// lv_obj_get_coords() on both the dropdown and its list), so this was a bug
+// inside LVGL's own dropdown-list click resolution, not this project's touch/
+// rotation mapping (which every other screen's plain buttons/lists confirm is
+// correct). Replaced with 4 plain checkable buttons -- the same proven
+// UI pattern used everywhere else in this codebase -- rather than chasing an
+// LVGL internals bug with uncertain payoff.
+lv_obj_t *s_mode_buttons[4] = {nullptr, nullptr, nullptr, nullptr};
+lv_obj_t *s_mode_label = nullptr;
 lv_obj_t *s_status_label  = nullptr;
 lv_obj_t *s_progress_bar  = nullptr;
 lv_obj_t *s_counts_label  = nullptr;
@@ -1350,9 +1361,10 @@ void refresh_keys_label() {
 }
 
 void update_ui() {
-    if (s_mode_dropdown != nullptr) {
-        if (s_worker_running) lv_obj_add_state(s_mode_dropdown, LV_STATE_DISABLED);
-        else                  lv_obj_remove_state(s_mode_dropdown, LV_STATE_DISABLED);
+    for (lv_obj_t *btn : s_mode_buttons) {
+        if (btn == nullptr) continue;
+        if (s_worker_running) lv_obj_add_state(btn, LV_STATE_DISABLED);
+        else                  lv_obj_remove_state(btn, LV_STATE_DISABLED);
     }
     if (s_toggle_label != nullptr) {
         lv_label_set_text(s_toggle_label, s_worker_running ? "Stop" : "Start");
@@ -1502,9 +1514,8 @@ void toggle_click_cb(lv_event_t *) {
         Serial.println("quarky-tab5: [mifare-crack] Stop tapped by user");
         return;
     }
-    if (s_mode_dropdown != nullptr) {
-        s_mode = (Mode)lv_dropdown_get_selected(s_mode_dropdown);
-    }
+    // s_mode is already current -- each mode button sets it directly on tap
+    // (see build_screen()), no lazy read-back needed.
     // A fresh run starts from no known keys EXCEPT when the mode needs one
     // (both nested variants read s_found to pick their exploit sector, so a
     // previous Dictionary run's results must survive).
@@ -1529,15 +1540,55 @@ lv_obj_t *build_screen() {
         "whole run. Nested modes need a key from a Dictionary run first.");
     lv_label_set_long_mode(warn, LV_LABEL_LONG_WRAP);
 
-    s_mode_dropdown = lv_dropdown_create(content);
-    // Two of these labels deliberately do not match the donor's own names --
-    // see the DARKSIDE honesty note, and recover_from_ks()'s UNFILTERED
-    // CANDIDATE WALK note, for why each is qualified rather than sold as
-    // more than it is.
-    lv_dropdown_set_options(s_mode_dropdown,
-                            "Dictionary\nNested\nStatic nested (long shot)\n"
-                            "Parity-oracle dictionary");
-    lv_dropdown_set_selected(s_mode_dropdown, (uint32_t)s_mode);
+    // Mode selection: 4 checkable buttons acting as a radio group (mutual
+    // exclusion enforced manually in mode_btn_click_cb() below), replacing an
+    // lv_dropdown that reproducibly mis-resolved row taps on real hardware
+    // (see s_mode_buttons' own declaration comment). Two of these labels
+    // deliberately do not match the donor's own names -- see the DARKSIDE
+    // honesty note, and recover_from_ks()'s UNFILTERED CANDIDATE WALK note,
+    // for why each is qualified rather than sold as more than it is.
+    static const char *const kModeLabels[4] = {
+        "Dictionary", "Nested", "Static nested (long shot)",
+        "Parity-oracle dictionary"};
+    s_mode_label = lv_label_create(content);
+    lv_label_set_long_mode(s_mode_label, LV_LABEL_LONG_WRAP);
+
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *btn = lv_button_create(content);
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_CHECKABLE);
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, kModeLabels[i]);
+        lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+            lv_obj_t *tapped = static_cast<lv_obj_t *>(lv_event_get_target(e));
+            for (int j = 0; j < 4; j++) {
+                if (s_mode_buttons[j] == tapped) {
+                    s_mode = static_cast<Mode>(j);
+                } else if (s_mode_buttons[j] != nullptr) {
+                    lv_obj_remove_state(s_mode_buttons[j], LV_STATE_CHECKED);
+                }
+            }
+            lv_obj_add_state(tapped, LV_STATE_CHECKED); // re-assert own state:
+                                                        // LV_OBJ_FLAG_CHECKABLE
+                                                        // already toggled it on
+                                                        // this click, this just
+                                                        // makes "select the
+                                                        // already-selected mode
+                                                        // again" a no-op instead
+                                                        // of un-checking it
+            if (s_mode_label != nullptr) {
+                char buf[48];
+                std::snprintf(buf, sizeof(buf), "Mode: %s", mode_name(s_mode));
+                lv_label_set_text(s_mode_label, buf);
+            }
+        }, LV_EVENT_CLICKED, nullptr);
+        s_mode_buttons[i] = btn;
+    }
+    lv_obj_add_state(s_mode_buttons[static_cast<int>(s_mode)], LV_STATE_CHECKED);
+    {
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "Mode: %s", mode_name(s_mode));
+        lv_label_set_text(s_mode_label, buf);
+    }
 
     s_status_label = lv_label_create(content);
     lv_label_set_long_mode(s_status_label, LV_LABEL_LONG_WRAP);
@@ -1567,7 +1618,8 @@ lv_obj_t *build_screen() {
     // on the main task (see poll()), because the arbiter release and the
     // Ws1850sDriver::init() restore are both main-task-only.
     lv_obj_add_event_cb(content, [](lv_event_t *) {
-        s_mode_dropdown = nullptr;
+        for (lv_obj_t *&btn : s_mode_buttons) btn = nullptr;
+        s_mode_label = nullptr;
         s_status_label = nullptr;
         s_progress_bar = nullptr;
         s_counts_label = nullptr;
