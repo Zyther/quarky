@@ -1,6 +1,7 @@
 #include "nfc_read.h"
 
 #include "nfc_common.h"
+#include "nfc_tag_library.h"
 
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
@@ -8,6 +9,7 @@
 #include "ws1850s_driver.h"
 #include "st25r3916_driver.h"
 #include "../../hal/nfc_pn532.h" // nfc_release_external_i2c() -- GPIO53 arbiter
+#include "../../hal/storage_sd.h"
 
 #include "../../../boards/tab5/pins_config.h"
 
@@ -37,6 +39,10 @@
 // -- see st25r3916_driver.cpp's SOURCES block for the full story and citations.
 
 extern FeatureRegistry g_registry;
+extern StorageSD storage; // defined in main.cpp (Phase 1 Task 10); handed to
+                          // NfcTagLibrary::save() below, same extern
+                          // nfc_tag_library_ui.cpp already declares for this
+                          // exact real-hardware storage instance.
 
 namespace NfcRead {
 
@@ -59,6 +65,13 @@ static ScanState  s_state  = ScanState::kIdle;
 
 static lv_obj_t *s_status_label = nullptr;
 static lv_obj_t *s_result_label = nullptr;
+static lv_obj_t *s_save_label = nullptr;
+
+// The most recently successfully read tag, valid only while s_state ==
+// kFound (the Save button's click handler re-checks s_state before using
+// this, same defensive discipline as every other cross-tick state this file
+// keeps -- see run_bring_up()'s own latching comment).
+static NfcCommon::TagInfo s_last_found_tag{};
 
 static uint32_t s_last_attempt_ms = 0;
 
@@ -251,6 +264,7 @@ static bool try_read_uid(NfcCommon::TagInfo *out) {
 static void teardown() {
     s_status_label = nullptr;
     s_result_label = nullptr;
+    s_save_label = nullptr;
 
     s_state = ScanState::kIdle;
     s_last_attempt_ms = 0;
@@ -310,10 +324,37 @@ static lv_obj_t *build_screen(TargetUnit target) {
             s_state = ScanState::kBringUp;
             set_status("Bringing up unit...");
         }
+        if (s_save_label != nullptr) {
+            lv_label_set_text(s_save_label, ""); // clear any prior save result
+        }
     }, LV_EVENT_CLICKED, nullptr);
 
     s_result_label = lv_label_create(content);
     lv_label_set_text(s_result_label, "No tag yet");
+
+    lv_obj_t *save_btn = lv_button_create(content);
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, "Save to Library");
+    lv_obj_add_event_cb(save_btn, [](lv_event_t *) {
+        // Re-check s_state at click time rather than trusting that a tag is
+        // still current -- the same defensive pattern the Scan button above
+        // uses against kFailed. s_last_found_tag is only meaningful while
+        // still in kFound (a fresh Scan press moves to kBringUp/kScanning
+        // and would go on to overwrite it with a DIFFERENT tag once found).
+        if (s_state != ScanState::kFound) {
+            if (s_save_label != nullptr) {
+                lv_label_set_text(s_save_label, "Scan a tag first.");
+            }
+            return;
+        }
+        bool ok = NfcTagLibrary::save(storage, s_last_found_tag);
+        if (s_save_label != nullptr) {
+            lv_label_set_text(s_save_label, ok ? "Saved to library." : "Save failed.");
+        }
+    }, LV_EVENT_CLICKED, nullptr);
+
+    s_save_label = lv_label_create(content);
+    lv_label_set_text(s_save_label, "");
 
     lv_obj_add_event_cb(content, [](lv_event_t *) { teardown(); },
                         LV_EVENT_DELETE, nullptr);
@@ -381,6 +422,11 @@ void poll() {
     std::snprintf(result, sizeof(result), "%s\nUID (%u bytes): %s",
                   info.type_name, (unsigned)info.uid_len, uid_str);
     lv_label_set_text(s_result_label, result);
+
+    s_last_found_tag = info;
+    if (s_save_label != nullptr) {
+        lv_label_set_text(s_save_label, ""); // clear any earlier save result
+    }
 
     Serial.printf("quarky-tab5: [nfc-read] %s tag: %s  UID %s\n",
                   (s_target == TargetUnit::RFID2) ? "RFID2" : "NFC",
