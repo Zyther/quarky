@@ -69,16 +69,33 @@ bool parse_token_bounded(const char *p, size_t max_len, int base, bool is_signed
     std::memcpy(tmp, p, n);
     tmp[n] = '\0';
     char *endp = nullptr;
+    long signed_v = 0;
+    unsigned long unsigned_v = 0;
     if (is_signed) {
-        long v = std::strtol(tmp, &endp, base);
-        if (endp == tmp) return false;
-        *out_signed = v;
+        signed_v = std::strtol(tmp, &endp, base);
     } else {
-        unsigned long v = std::strtoul(tmp, &endp, base);
-        if (endp == tmp) return false;
-        *out_unsigned = v;
+        unsigned_v = std::strtoul(tmp, &endp, base);
     }
-    *consumed = static_cast<size_t>(endp - tmp);
+    if (endp == tmp) return false;
+    size_t used = static_cast<size_t>(endp - tmp);
+    // Same reasoning as rf433_sub_format.cpp's parse_long_bounded(): if the
+    // copied buffer was exhausted by digits AND the real input had at least
+    // one more byte, that next byte might continue the same digit run past
+    // what this module supports -- reject rather than silently return a
+    // truncated value split across two bogus tokens.
+    if (used == n && n < max_len) {
+        char next = p[n];
+        bool next_is_digit = (base == 16)
+            ? ((next >= '0' && next <= '9') || (next >= 'a' && next <= 'f') || (next >= 'A' && next <= 'F'))
+            : (next >= '0' && next <= '9');
+        if (next_is_digit) return false; // token longer than this module supports
+    }
+    if (is_signed) {
+        *out_signed = signed_v;
+    } else {
+        *out_unsigned = unsigned_v;
+    }
+    *consumed = used;
     return true;
 }
 
