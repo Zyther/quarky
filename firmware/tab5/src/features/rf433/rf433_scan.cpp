@@ -90,6 +90,19 @@ static lv_obj_t *s_save_sub_status_label = nullptr;
 static uint32_t s_selected_capture_id = 0; // 0 = sentinel "nothing selected" --
                                             // capture_id is 1-based (see s_next_capture_id)
 
+// "Select"/"Combine -> .sub" -- daisy-chains several captured signals into
+// one .sub file. A SEPARATE selection mode from the single-selection above
+// (s_selected_capture_id): row taps toggle membership in this small ordered
+// set instead of replacing a single selection, while Select mode is on.
+constexpr int kMaxChainSignals = 8;
+static bool s_select_mode = false;
+static uint32_t s_chain_ids[kMaxChainSignals] = {0};
+static int s_chain_count = 0;
+static lv_obj_t *s_select_btn = nullptr;
+static lv_obj_t *s_combine_btn = nullptr;
+static lv_obj_t *s_chain_status_label = nullptr;
+static lv_obj_t *s_combine_status_label = nullptr;
+
 // Phase 3 Task 22: "Load from SD" -- browse to and load a real .sub file
 // (Task 21's Rf433SubFormat::read(), Task 22's ui/file_browser.h picker) and
 // replay it. Deliberately a SEPARATE slot/UI group from the live-capture
@@ -227,6 +240,89 @@ static void set_save_sub_status_text(const char *text) {
     else lv_obj_remove_flag(s_save_sub_status_label, LV_OBJ_FLAG_HIDDEN);
 }
 
+static void update_chain_status_label() {
+    if (s_chain_status_label == nullptr) return;
+    if (!s_select_mode && s_chain_count == 0) {
+        lv_obj_add_flag(s_chain_status_label, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_remove_flag(s_chain_status_label, LV_OBJ_FLAG_HIDDEN);
+    char buf[128];
+    int n = std::snprintf(buf, sizeof(buf), "Chain (%d/%d):", s_chain_count, kMaxChainSignals);
+    for (int i = 0; i < s_chain_count && n < (int)sizeof(buf) - 8; i++) {
+        n += std::snprintf(buf + n, sizeof(buf) - (size_t)n, " #%u", (unsigned)s_chain_ids[i]);
+    }
+    lv_label_set_text(s_chain_status_label, buf);
+}
+
+// Toggles capture_id's membership in the chain (add if absent and room
+// remains, remove if already present -- tapping an already-chained row a
+// second time un-chains it, the same "tap again to undo" idiom this project
+// uses elsewhere). Only called while s_select_mode is on.
+static void toggle_chain_membership(uint32_t capture_id) {
+    for (int i = 0; i < s_chain_count; i++) {
+        if (s_chain_ids[i] == capture_id) {
+            // Remove: shift the rest down, preserving chain ORDER (the order
+            // signals were tapped is the order they'll be concatenated in).
+            for (int j = i; j < s_chain_count - 1; j++) s_chain_ids[j] = s_chain_ids[j + 1];
+            s_chain_count--;
+            update_chain_status_label();
+            return;
+        }
+    }
+    if (s_chain_count >= kMaxChainSignals) {
+        Serial.printf("quarky-tab5: [rf433-scan] Chain full (%d signals) -- "
+                      "not adding #%u\n", kMaxChainSignals, (unsigned)capture_id);
+        return;
+    }
+    s_chain_ids[s_chain_count++] = capture_id;
+    update_chain_status_label();
+}
+
+// Concatenates the chained signals' real edge timing (in tap order) into one
+// synthetic CapturedSignal, separated by kBurstGapThresholdUs (the same real
+// 25ms burst-boundary constant this project already uses to decide "this is
+// a new press, not a continuation" -- rf433_scan.cpp's own capture logic,
+// reused here rather than inventing a new gap value). Each segment's OWN
+// relative timing (edge[i].timestamp_us - edge[0].timestamp_us) is preserved
+// exactly; only the gap between segments is synthetic. No edge object needs
+// to be fabricated for the gap itself -- EdgeSample.level is "the level AFTER
+// this edge" (rf433_common.h), so simply offsetting the next segment's
+// timestamps forward already represents the prior level being held for the
+// gap's duration, which is exactly correct silence semantics.
+static bool build_chain_signal(CapturedSignal *out) {
+    *out = CapturedSignal{};
+    uint32_t running_offset = 0;
+    bool any = false;
+    for (int c = 0; c < s_chain_count; c++) {
+        const CapturedSignal *seg = find_signal_by_id(s_chain_ids[c]);
+        if (seg == nullptr || seg->edge_count == 0) {
+            Serial.printf("quarky-tab5: [rf433-scan] Chain signal #%u no longer "
+                          "available (evicted) -- skipped\n", (unsigned)s_chain_ids[c]);
+            continue;
+        }
+        any = true;
+        uint32_t seg_base = seg->edges[0].timestamp_us;
+        size_t i = 0;
+        for (; i < seg->edge_count; i++) {
+            if (out->edge_count >= kMaxEdgesPerSignal) {
+                out->truncated = true;
+                break;
+            }
+            out->edges[out->edge_count].timestamp_us =
+                running_offset + (seg->edges[i].timestamp_us - seg_base);
+            out->edges[out->edge_count].level = seg->edges[i].level;
+            out->edge_count++;
+        }
+        if (out->edge_count >= kMaxEdgesPerSignal) break;
+        uint32_t seg_duration = seg->edges[seg->edge_count - 1].timestamp_us - seg_base;
+        running_offset += seg_duration + kBurstGapThresholdUs;
+        if (seg->truncated) out->truncated = true; // a source segment was itself truncated
+    }
+    out->captured_at_ms = millis();
+    return any && out->edge_count > 0;
+}
+
 static void add_signal_to_list(const CapturedSignal &sig) {
     if (!s_list) return;
 
@@ -273,6 +369,14 @@ static void add_signal_to_list(const CapturedSignal &sig) {
                           "available (evicted from ring)\n", (unsigned)capture_id);
             return;
         }
+        if (s_select_mode) {
+            // Chain mode: tap toggles membership, does not disturb the
+            // separate single-selection (s_selected_capture_id) used by
+            // Replay/Decode/Save-as-.sub.
+            toggle_chain_membership(capture_id);
+            return;
+        }
+
         Serial.printf("quarky-tab5: [rf433-scan] Selected signal #%u (%u edges)\n",
                       (unsigned)capture_id, (unsigned)found->edge_count);
 
@@ -535,6 +639,16 @@ static lv_obj_t *build_screen() {
         }
         set_decode_result_text("");
         set_save_sub_status_text("");
+        s_chain_count = 0; // chained signal IDs point into the ring being
+                            // cleared above; stale IDs would just get
+                            // silently skipped by build_chain_signal()'s own
+                            // eviction check, but resetting here is honest
+                            // rather than leaving a chain that looks intact
+        update_chain_status_label();
+        if (s_combine_status_label) {
+            lv_label_set_text(s_combine_status_label, "");
+            lv_obj_add_flag(s_combine_status_label, LV_OBJ_FLAG_HIDDEN);
+        }
         Serial.println("quarky-tab5: [rf433-scan] capture list cleared");
     }, LV_EVENT_CLICKED, nullptr);
 
@@ -650,6 +764,71 @@ static lv_obj_t *build_screen() {
         set_save_sub_status_text(buf);
     }, LV_EVENT_CLICKED, nullptr);
 
+    // "Select" -- toggles chain mode (see s_select_mode's declaration
+    // comment). Turning it OFF does not clear an already-built chain (so the
+    // user can toggle it off to use Replay/Decode/Save-as-.sub on a single
+    // row without losing chain progress, then toggle back on to keep
+    // building it) -- only "Combine -> .sub" below and "Clear" reset it.
+    s_select_btn = lv_button_create(btn_grid);
+    lv_obj_set_width(s_select_btn, LV_PCT(32));
+    lv_obj_t *select_lbl = lv_label_create(s_select_btn);
+    lv_label_set_text(select_lbl, "Select");
+    lv_obj_add_event_cb(s_select_btn, [](lv_event_t *e) {
+        s_select_mode = !s_select_mode;
+        lv_obj_t *btn = static_cast<lv_obj_t *>(lv_event_get_target(e));
+        lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+        if (lbl) lv_label_set_text(lbl, s_select_mode ? "Select: ON" : "Select");
+        update_chain_status_label();
+    }, LV_EVENT_CLICKED, nullptr);
+
+    // "Combine -> .sub" -- daisy-chains the tapped-in-order signals above
+    // into one file via build_chain_signal() (see its own comment for the
+    // real-gap-reuse reasoning) and Task 21's Rf433SubFormat::write().
+    s_combine_btn = lv_button_create(btn_grid);
+    lv_obj_set_width(s_combine_btn, LV_PCT(32));
+    lv_obj_t *combine_lbl = lv_label_create(s_combine_btn);
+    lv_label_set_text(combine_lbl, "Combine -> .sub");
+    lv_obj_add_event_cb(s_combine_btn, [](lv_event_t *) {
+        if (s_chain_count == 0) {
+            if (s_combine_status_label) {
+                lv_label_set_text(s_combine_status_label, "Chain is empty -- tap Select, then tap signals.");
+                lv_obj_remove_flag(s_combine_status_label, LV_OBJ_FLAG_HIDDEN);
+            }
+            return;
+        }
+        CapturedSignal combined{};
+        bool ok = build_chain_signal(&combined);
+        char buf[128];
+        if (!ok) {
+            std::snprintf(buf, sizeof(buf), "All %d chained signals were evicted -- nothing to combine.",
+                          s_chain_count);
+        } else {
+            char path[96];
+            std::snprintf(path, sizeof(path), "%s/chain_%u.sub", kSubFileDir,
+                          (unsigned)s_chain_ids[0]);
+            bool wrote = Rf433SubFormat::write(storage, path, combined);
+            if (wrote) {
+                std::snprintf(buf, sizeof(buf), "Saved %d-signal chain to %s (%u edges)%s",
+                              s_chain_count, path, (unsigned)combined.edge_count,
+                              combined.truncated ? " [truncated]" : "");
+                Serial.printf("quarky-tab5: [rf433-scan] combined %d signals -> %s (%u edges)%s\n",
+                              s_chain_count, path, (unsigned)combined.edge_count,
+                              combined.truncated ? " TRUNCATED" : "");
+                // Reset the chain on success, same "done, start fresh" idiom
+                // Clear uses for the live-capture list.
+                s_chain_count = 0;
+            } else {
+                std::snprintf(buf, sizeof(buf), "Save failed (%s)", path);
+                Serial.printf("quarky-tab5: [rf433-scan] failed to save combined .sub: %s\n", path);
+            }
+        }
+        if (s_combine_status_label) {
+            lv_label_set_text(s_combine_status_label, buf);
+            lv_obj_remove_flag(s_combine_status_label, LV_OBJ_FLAG_HIDDEN);
+        }
+        update_chain_status_label();
+    }, LV_EVENT_CLICKED, nullptr);
+
     // Task 22: "Load from SD" -- a SEPARATE group from the live-capture
     // replay UI above (see s_loaded_signal's declaration comment for why).
     // Opens ui/file_browser.h's generic picker over kSubFileDir/kSubFileExt;
@@ -706,6 +885,15 @@ static lv_obj_t *build_screen() {
     lv_label_set_long_mode(s_save_sub_status_label, LV_LABEL_LONG_WRAP);
     set_save_sub_status_text(""); // starts hidden
 
+    s_chain_status_label = lv_label_create(content);
+    lv_label_set_long_mode(s_chain_status_label, LV_LABEL_LONG_WRAP);
+    update_chain_status_label(); // starts hidden (select mode off, chain empty)
+
+    s_combine_status_label = lv_label_create(content);
+    lv_label_set_long_mode(s_combine_status_label, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(s_combine_status_label, "");
+    lv_obj_add_flag(s_combine_status_label, LV_OBJ_FLAG_HIDDEN);
+
     s_loaded_status_label = lv_label_create(content);
     update_loaded_status_label(); // restores "Loaded: <path>" text if reopening
 
@@ -746,6 +934,10 @@ static lv_obj_t *build_screen() {
         s_decode_result_label = nullptr;
         s_save_sub_btn = nullptr;
         s_save_sub_status_label = nullptr;
+        s_select_btn = nullptr;
+        s_combine_btn = nullptr;
+        s_chain_status_label = nullptr;
+        s_combine_status_label = nullptr;
         s_load_sd_btn = nullptr;
         s_loaded_status_label = nullptr;
         s_loaded_replay_btn = nullptr;
