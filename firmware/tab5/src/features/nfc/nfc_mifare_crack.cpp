@@ -211,6 +211,16 @@ constexpr char kDictDir[] = "/quarky/dict/nfc";
 constexpr int  kMaxDictFiles = 8;
 constexpr size_t kDictFileMaxBytes = 8192; // ~600 keys/file at 13 bytes/line
 
+// Recovered-key save location, under captures/ (project owner's own output,
+// not a user-supplied input like kDictDir above -- same split
+// wifi_evil_portal.cpp/kDictDir's own comment already documents). Filename is
+// the target UID in hex, matching nfc_tag_library.cpp's own hex-UID naming
+// convention (Task 10). Deliberately written in the SAME colon-separated hex
+// format parse_hex_key() already accepts for dictionary files, so a saved key
+// file can be copied into kDictDir and fed straight back into a future
+// Dictionary/Parity-oracle run without any format conversion.
+constexpr char kSaveDir[] = "/quarky/captures/mifare_keys";
+
 // ── Ported low-level helpers ────────────────────────────────────────────────
 // Byte-for-byte the same in all three donor attack files ([UG-N]:11-107,
 // [UG-S]:11-135, [UG-D]:11-120); ported once here rather than three times.
@@ -1325,6 +1335,8 @@ lv_obj_t *s_counts_label  = nullptr;
 lv_obj_t *s_keys_label    = nullptr;
 lv_obj_t *s_toggle_btn    = nullptr;
 lv_obj_t *s_toggle_label  = nullptr;
+lv_obj_t *s_save_btn      = nullptr;
+lv_obj_t *s_save_status_label = nullptr;
 
 const char *mode_name(Mode m) {
     switch (m) {
@@ -1358,6 +1370,53 @@ void refresh_keys_label() {
     unlock();
     if (shown == 0) std::snprintf(buf, sizeof(buf), "Recovered keys: none yet");
     lv_label_set_text(s_keys_label, buf);
+}
+
+// Writes every currently-known key for the current target card to
+// `kSaveDir/<UID hex>.txt`, one colon-separated hex key per line, deduplicated
+// (a card's 16+ sectors very often share the same default key -- no point
+// writing 32 identical lines). Overwrites any previous save for this same UID
+// (write_capture_file()'s existing overwrite semantics), matching "the
+// current best-known state for this card" rather than an ever-growing log.
+// Main-task only (called from a button click handler) -- s_found is still
+// guarded by lock()/unlock() since the worker can be readING it concurrently
+// via pick_exploit_sector() even when not writing.
+bool save_keys(IStorage &store) {
+    uint64_t seen[2 * kMaxSectors];
+    int seen_count = 0;
+    char text[2 * kMaxSectors * 18 + 32]; // 17 bytes/line ("FF:FF:FF:FF:FF:FF\n") + margin
+    int n = 0;
+
+    lock();
+    for (size_t s = 0; s < s_sector_count; s++) {
+        for (int kt = 0; kt < 2; kt++) {
+            const KeySlot &slot = (kt == 0) ? s_found[s].a : s_found[s].b;
+            if (!slot.known) continue;
+            bool dup = false;
+            for (int i = 0; i < seen_count; i++) {
+                if (seen[i] == slot.key) { dup = true; break; }
+            }
+            if (dup) continue;
+            if (seen_count < (int)(sizeof(seen) / sizeof(seen[0]))) {
+                seen[seen_count++] = slot.key;
+            }
+            uint8_t kb[6];
+            key_to_bytes(slot.key, kb);
+            n += std::snprintf(text + n, sizeof(text) - (size_t)n,
+                               "%02X:%02X:%02X:%02X:%02X:%02X\n",
+                               kb[0], kb[1], kb[2], kb[3], kb[4], kb[5]);
+        }
+    }
+    unlock();
+
+    if (seen_count == 0) {
+        return false;
+    }
+
+    char path[96];
+    std::snprintf(path, sizeof(path), "%s/%08X.txt", kSaveDir, (unsigned)s_uid32);
+    return store.write_capture_file(path, reinterpret_cast<const uint8_t *>(text),
+                                    static_cast<size_t>(n));
 }
 
 void update_ui() {
@@ -1606,6 +1665,35 @@ lv_obj_t *build_screen() {
     s_toggle_label = lv_label_create(s_toggle_btn);
     lv_obj_add_event_cb(s_toggle_btn, toggle_click_cb, LV_EVENT_CLICKED, nullptr);
 
+    s_save_btn = lv_button_create(content);
+    lv_obj_t *save_lbl = lv_label_create(s_save_btn);
+    lv_label_set_text(save_lbl, "Save Keys");
+    lv_obj_add_event_cb(s_save_btn, [](lv_event_t *) {
+        bool ok = save_keys(storage);
+        if (ok) {
+            Serial.printf("quarky-tab5: [mifare-crack] saved keys to %s/%08X.txt\n",
+                          kSaveDir, (unsigned)s_uid32);
+        } else {
+            Serial.println("quarky-tab5: [mifare-crack] Save Keys tapped with "
+                           "nothing recovered yet");
+        }
+        if (s_save_status_label != nullptr) {
+            if (ok) {
+                char msg[64];
+                std::snprintf(msg, sizeof(msg), "Saved to %s/%08X.txt", kSaveDir,
+                              (unsigned)s_uid32);
+                lv_label_set_text(s_save_status_label, msg);
+            } else {
+                lv_label_set_text(s_save_status_label,
+                                  "Nothing to save yet -- run an attack first.");
+            }
+        }
+    }, LV_EVENT_CLICKED, nullptr);
+
+    s_save_status_label = lv_label_create(content);
+    lv_label_set_long_mode(s_save_status_label, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(s_save_status_label, "");
+
     update_ui();
     refresh_keys_label();
 
@@ -1626,6 +1714,8 @@ lv_obj_t *build_screen() {
         s_keys_label = nullptr;
         s_toggle_btn = nullptr;
         s_toggle_label = nullptr;
+        s_save_btn = nullptr;
+        s_save_status_label = nullptr;
         if (s_worker_running) {
             Serial.println("quarky-tab5: [mifare-crack] screen closed mid-run -- "
                            "requesting stop");
