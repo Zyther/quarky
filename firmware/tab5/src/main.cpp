@@ -25,6 +25,8 @@
 #include "features/nfc/nfc_read.h" // Phase 3 Task 4: NFC/RFID2 tag read UI
 #include "features/nfc/nfc_tag_library.h" // Phase 3 Task 10: SD-backed NFC/
                                           // RFID2 tag library (save/list/load)
+#include "features/nfc/nfc_mifare_crack.h" // Phase 3 Task 9: MIFARE Classic
+                                           // key recovery on the RFID2 unit
 #include "features/rf433/rf433_scan.h" // Phase 3 Task 5: RF433 scan/capture UI
 #include "features/rf433/rf433_replay.h" // Phase 3 Task 6: replay a captured
                                           // signal on TAB5_RF433T_PIN. No
@@ -386,6 +388,11 @@ void setup() {
     // 1 table). Category::NFC tile alongside the two above.
     NfcTagLibrary::register_module();
 
+    // Task 9 (Phase 3): MIFARE Classic key recovery (dictionary / nested /
+    // static-nested / parity-oracle dictionary) on the RFID2 unit.
+    // Category::NFC tile alongside the three above.
+    NfcMifareCrack::register_module();
+
     // Task 5 (Phase 3): RF433 scan/capture UI (Category::RF433).
     Rf433Scan::register_module();
 
@@ -590,6 +597,13 @@ void loop() {
     c2link_ble.poll();  // drains BLE frames received on the NimBLE host task
     NfcRead::poll();    // Phase 3 Task 4: no-ops unless NFC/RFID2 tag-read screen
                         // is open and Scan is armed; drives RFAL/MFRC522 polling
+    NfcMifareCrack::poll(); // Phase 3 Task 9: no-ops unless a MIFARE key-recovery
+                            // run is in flight. Does NOT run the attacks itself
+                            // (they live on a worker task -- see that file's
+                            // EXECUTION MODEL block); this streams the worker's
+                            // progress into the screen and, on completion, does
+                            // the main-task-only cleanup: Ws1850sDriver::init()
+                            // restore, field_off(), GPIO53 arbiter release.
     Rf433Replay::poll(); // Phase 3 Task 6: no-ops unless a transmit task is in
                           // flight or has just finished; releases the GPIO53
                           // arbiter claim on completion (main-task-only, see

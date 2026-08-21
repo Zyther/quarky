@@ -1,0 +1,33 @@
+{
+  "name": "crapto1",
+  "version": "0.0.0+vendored.2026-08-21",
+  "description": "CRYPTO1 cipher and LFSR state-recovery math for MIFARE Classic (crapto1). GPLv2+ third-party source, Copyright (C) 2008-2014 bla <blapost@gmail.com>, vendored byte-identical from ~/src/unigeek-main/firmware/src/utils/crypto/. See src/crapto1.h's provenance header for the full citation trail, the canonical-upstream cross-check, and the one function (lfsr_recovery64) that diverges from upstream and must not be called.",
+  "keywords": "mifare, crypto1, rfid",
+  "license": "GPL-2.0-or-later",
+  "authors": [
+    {
+      "name": "bla",
+      "email": "blapost@gmail.com"
+    }
+  ],
+  "_comment": [
+    "MANIFEST FORMAT NOTE: this is a PlatformIO library.json, NOT the Arduino",
+    "library.properties that lib/MFRC522_I2C/ uses. That difference is",
+    "deliberate and was forced by a real build failure, not stylistic. A",
+    "library.properties manifest makes PlatformIO treat the library as",
+    "Arduino-framework-only, so `pio test -e native` reported 'Framework",
+    "incompatible library .../lib/crapto1' and test/test_crapto1/ could not",
+    "even find crapto1.h. This library is plain C with no Arduino dependency",
+    "whatsoever and is genuinely host-testable, so it declares frameworks/",
+    "platforms '*' below and builds under both [env:tab5] and [env:native].",
+    "MFRC522_I2C keeps its upstream library.properties because it really is",
+    "Arduino-only (it includes Arduino.h and Wire.h) and is never built",
+    "natively."
+  ],
+  "frameworks": "*",
+  "platforms": "*",
+  "build": {
+    "srcDir": "src",
+    "includeDir": "src"
+  }
+}
