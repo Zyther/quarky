@@ -215,7 +215,29 @@ static const char *cc_tag_name(uint8_t cc) {
         case 0x12: return "NTAG213";
         case 0x3E: return "NTAG215";
         case 0x6D: return "NTAG216";
-        default: return "Unknown Ultralight/NTAG21x (unrecognised CC byte)";
+        default: return nullptr; // caller falls back to page_count_tag_name()
+    }
+}
+
+// Real-hardware finding (2026-08-21): genuine Amiibo-programmed NTAG215 tags
+// do NOT carry the standard NDEF Capability Container at page 3 that
+// RFID2.cpp's CC-byte detection (cc_tag_name() above) assumes -- Nintendo's
+// proprietary amiibo format writes its own data across that page instead
+// (confirmed against a real Amiibo tag: CC byte read back as 0xFF, not the
+// expected 0x3E, while the actual page count -- driven by the real
+// STATUS_MIFARE_NACK end-of-memory terminator, independent of the CC byte
+// entirely -- came back exactly 135, NTAG215's real capacity). Page count is
+// the MORE reliable signal for a real amiibo in practice, precisely because
+// it does not depend on a region amiibo data itself overwrites. Used only as
+// a fallback when the CC byte itself didn't match a known value -- the CC
+// byte is still tried first since it's the real, standard, documented way to
+// identify a genuinely NDEF-formatted (non-amiibo) NTAG21x tag.
+static const char *page_count_tag_name(int pages) {
+    switch (pages) {
+        case 45:  return "NTAG213";
+        case 135: return "NTAG215";
+        case 231: return "NTAG216";
+        default:  return "Unknown Ultralight/NTAG21x";
     }
 }
 
@@ -227,18 +249,22 @@ static void render_read_result() {
     uid_str[0] = '\0';
     NfcCommon::format_uid(s_uid, s_uid_len, uid_str, sizeof(uid_str));
 
+    const char *cc_name = cc_tag_name(s_cc_byte);
     char buf[256];
-    if (s_cc_total_pages > 0) {
+    if (cc_name != nullptr) {
         std::snprintf(buf, sizeof(buf),
                       "UID: %s\n%s (CC=0x%02X, %d pages)\nCaptured %d pages "
                       "(%d bytes)",
-                      uid_str, cc_tag_name(s_cc_byte), s_cc_byte,
+                      uid_str, cc_name, s_cc_byte,
                       s_cc_total_pages, s_data_pages, s_data_pages * 4);
     } else {
+        // CC byte didn't match a known value -- guess from the real observed
+        // page count instead (see page_count_tag_name()'s own comment).
         std::snprintf(buf, sizeof(buf),
-                      "UID: %s\nUltralight-family tag, CC byte not "
-                      "recognised (0x%02X)\nCaptured %d pages (%d bytes)",
-                      uid_str, s_cc_byte, s_data_pages, s_data_pages * 4);
+                      "UID: %s\n%s (CC byte 0x%02X not recognised, guessed "
+                      "from %d pages)\nCaptured %d pages (%d bytes)",
+                      uid_str, page_count_tag_name(s_data_pages), s_cc_byte,
+                      s_data_pages, s_data_pages, s_data_pages * 4);
     }
     lv_label_set_text(s_result_label, buf);
 }
