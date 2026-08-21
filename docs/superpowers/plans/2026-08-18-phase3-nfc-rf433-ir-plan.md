@@ -583,35 +583,36 @@ Expect real retry/timeout constant tuning during hardware bring-up per the spec'
 
 ---
 
-## Task 15: IR unit chip identification spike
+## Task 15: IR unit bring-up spike
+
+**CORRECTED 2026-08-21** (see `.superpowers/sdd/2026-08-18-phase3-nfc-rf433-ir-plan/progress.md` for the full trail): this task was originally written as an I2C chip-identification spike ("census the external I2C bus", "identify the chip from its I2C address"), on the same wrong inherited premise CLAUDE.md itself carried (that the Tab5 was getting "a dedicated I2C IR receiver/transmitter unit"). A real I2C census on the physically-connected unit came back completely empty — not a bug, a correct result, because the unit is not an I2C device at all. The project owner supplied the real datasheet (`~/Downloads/ir.pdf`, M5Stack "Unit IR", SKU U002) and confirmed directly: the Tab5 has no second physical connector — "port A can be used as simple GPIO 'port B'" (the datasheet's own pin map labels it "PORT.B" per M5Stack's generic per-unit convention, not a claim of a second Tab5 connector). Real datasheet facts: HY2.0-4P pinout is Black=GND, Red=5V, Yellow=IR_TX, White=IR_RX. TX side is a plain transistor (SS8050) driving a 940nm IR LED (R1=150Ω, R2=1KΩ, R3=4.7KΩ) — no chip, nothing to identify. RX side is a real, independently-verified part: IRM-3638T (Everlight Electronics Co., Ltd., confirmed via WebSearch against real distributor listings — DigiKey/Arrow/LCSC/AllDatasheet), a 38kHz carrier-demodulating IR receiver module (PIN diode + preamplifier + demodulator in one epoxy-packaged part, TSOP38-family equivalent) with a direct digital OUT pin — no I2C register interface to query, just a GPIO level to read. Steps below are rewritten against this real hardware; the file/interface list is otherwise unchanged from the original plan.
 
 **Files:**
 - Create: `firmware/tab5/src/hal/ir_unit.h` (new HAL interface — IR was never part of Phase 1's Tab5 HAL scope, greenfield per the spec)
 - Create: `firmware/tab5/src/hal/ir_unit.cpp`
+- Modify: `firmware/tab5/src/hal/gpio53_arbiter.h`/`.cpp` (add a third `Owner::kIr` — done as part of this correction, ahead of the rest of Task 15's implementation, since the arbiter is a shared file every PORT.A consumer touches)
 - Modify: `firmware/tab5/src/main.cpp` (instantiate + wire into `setup()`, same pattern as `nfc_unit`/`rfid2_unit`/`rf433`)
 
 **Interfaces:**
-- Produces: `class IIrUnit { public: virtual ~IIrUnit() = default; virtual bool detect() = 0; };` plus a concrete class once the chip is identified (name TBD — this task's own output).
+- Produces: `namespace IrUnit { bool begin(); void end(); void set_tx(bool level); bool read_rx(); }` against `TAB5_IR_TX_GPIO`/`TAB5_IR_RX_GPIO` (added to `pins_config.h`, GPIO53/54 — same physical pins as external I2C and RF433). A free-function namespace, not a class+interface pair (contrast `IRF433`/`Rf433Gpio`) — deliberate: there is exactly one real IR unit and no substitutable-implementation need, matching `Rf433Common`'s own namespace precedent rather than forcing an interface abstraction nothing will ever implement twice.
 
-**Context:** The IR unit's exact chip/protocol is completely unknown until it physically arrives (ordered same day as this plan's authoring, 2026-08-18). This task cannot start real implementation before then.
+**Context:** The unit is a plain-GPIO IR transceiver on the Tab5's single PORT.A connector, arbitrated the same way RF433 and external I2C already share that connector (`hal/gpio53_arbiter.h`).
 
-- [ ] **Step 1: PAUSE FOR HARDWARE — do not proceed past this point until the IR unit has physically arrived AND the project owner explicitly confirms it's connected to the Tab5.** This is the first and most important checkpoint in this entire plan's IR section — unlike Tasks 1-14, there is no prior confirmed connector state to build on here at all.
+- [x] **Step 1: PAUSE FOR HARDWARE — do not proceed past this point until the IR unit has physically arrived AND the project owner explicitly confirms it's connected to the Tab5.** Done — project owner confirmed connection this session.
 
-- [ ] **Step 2: Census the external I2C bus**
+- [x] **Step 2: Add `TAB5_IR_TX_GPIO`/`TAB5_IR_RX_GPIO` to `pins_config.h`** (both = GPIO53/54, matching `TAB5_EXTERNAL_I2C_SDA_GPIO`/`SCL_GPIO` and `TAB5_RF433R_PIN`/`T_PIN`'s existing precedent of naming the *use*, not just the raw pin number) — cite this task's real datasheet finding (Yellow=IR_TX, White=IR_RX) directly in the comment, matching every other pin-mapping citation already in that file. Done — mapping additionally cross-confirmed via a project-owner-supplied screenshot of M5Stack's own unit-compatibility page mid-task (IR_TX=G53, IR_RX=G54).
 
-Reuse `nfc_scan_external_i2c_bus()` (`hal/nfc_pn532.cpp`, already exists) or extend `labelForExternalI2CAddr()` with the new address once found — this immediately tells you the I2C address, and the address alone is often enough to identify the chip family via a web/datasheet lookup (the same technique that resolved the NFC/RFID2 chip identities in Phase 1).
+- [x] **Step 3: Confirm bare presence via a real GPIO-level test, not an I2C exchange** — mirroring Task 2's `read_chip_id()`-style acceptance-test rigor but adapted to hardware that has no register interface: (a) TX side — toggle `TAB5_IR_TX_GPIO` and visually/electrically confirm the LED lights (a phone camera can usually see 940nm IR as a faint glow); (b) RX side — hold a real IR remote up to the receive diode and confirm `digitalRead(TAB5_IR_RX_GPIO)` transitions during a button press (IRM-3638T's real datasheet-documented behavior: idles HIGH, pulls LOW while a 38kHz-modulated carrier is present — standard for this whole TSOP38-style module family). **CONFIRMED ON REAL HARDWARE 2026-08-21, both halves:** (a) project owner visually confirmed the IR LED blinking through a phone camera during the TX test (two separate runs); (b) the RX sample window recorded 32 real level transitions on one run and 20 on a second run, both while the project owner held a button on a real IR remote pointed at the receiver, idling HIGH and pulling LOW during bursts exactly as the family-standard polarity predicted — this is a real PASS, not an assumption. See the 'i' serial-trigger handler in `main.cpp` and the SDD ledger for the full real-hardware output and a real bug this testing caught (see Step 3.5 below).
 
-- [ ] **Step 3: Identify the chip from its I2C address + any markings/model info the project owner can read off the physical unit**
+- [x] **Step 3.5 (not originally planned, added after a real finding): fix a task-watchdog reset the first test implementation caused.** The first version of the 'i' trigger ran the whole test (6x 500ms `delay()` blink cycles, then a blocking 10s `while()` RX-poll loop) inline in the serial-read handler, holding `loop()` for 3+ seconds without returning. This tripped the ESP32 Arduino task watchdog for `loopTask` and rebooted the board mid-test — confirmed via serial capture ("Task watchdog got triggered... loopTask (CPU 1) did not reset the watchdog in time... Aborting"), a real crash, not hardware flakiness. Root cause: every other multi-second operation in this codebase (RF433 capture, replay, bruteforce) is a `poll()`-driven state machine for exactly this reason, and the new IR spike hadn't followed that established pattern. Fixed by refactoring into a non-blocking state machine (`IrSpikePhase` enum + statics, polled from `loop()`'s existing debug-aid section) matching the RF433 precedent exactly. Re-tested on real hardware after the fix: no reboot, both TX and RX phases completed and reported correctly.
 
-Ask the project owner for the unit's product name/model number and any visible chip markings if the address alone doesn't uniquely identify it (M5Stack sells several IR-capable units under different names — do not guess which one this is without checking).
+- [x] **Step 4: Claim/release the port via `Gpio53Arbiter::Owner::kIr`** in `ir_unit.cpp`'s init/teardown, exactly like `nfc_pn532.cpp` and `rf433_common.cpp` already do for their own owner values — this is a hard requirement, not optional polish, since the IR unit is the third real consumer of the same physical pins. Done — `IrUnit::begin()`/`end()` claim/release `Owner::kIr`; real hardware confirmed `begin()` succeeds when PORT.A is free (boot-time I2C census found nothing, so no other owner was holding it).
 
-- [ ] **Step 4: Confirm bare presence + (if a public datasheet exists) one real register/command exchange**, mirroring Task 2's `read_chip_id()`-style acceptance test — a real, cited, falsifiable check, not just "I2C ACK'd."
+- [x] **Step 5: Document findings and commit the HAL skeleton**
 
-- [ ] **Step 5: Document findings and commit the HAL skeleton**
+Write the real unit identity (M5Stack "Unit IR", SKU U002), the IRM-3638T citation, and the GPIO pin mapping into `ir_unit.h`'s header comment, matching `nfc_pn532.cpp`'s established citation style. Commit. Done.
 
-Write the chip identity, address, and citation into `ir_unit.h`'s header comment, matching `nfc_pn532.cpp`'s established citation style. Commit.
-
-**Model:** Opus — real hardware-identification research under total initial uncertainty, same risk class as Task 2.
+**Model:** Sonnet — hardware identity is now fully resolved from a real datasheet the project owner supplied; remaining work is straightforward GPIO HAL implementation, not open-ended identification research (contrast the original Task 15, sized for Opus under total initial uncertainty — that uncertainty is gone).
 
 ---
 

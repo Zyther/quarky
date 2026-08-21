@@ -11,6 +11,10 @@
 #include "hal/rf433_gpio.h"
 #include "hal/battery.h" // Phase 3 Task 23: real INA226 battery-percentage HAL,
                           // replacing shell.cpp's permanent "Battery: --%" stub
+#include "hal/ir_unit.h" // Phase 3 Task 15: IR unit (M5Stack "Unit IR" SKU U002)
+                         // bring-up. Plain GPIO transceiver on PORT.A -- see
+                         // ir_unit.h's header for the corrected (non-I2C)
+                         // hardware story.
 #include "ui/lvgl_port.h"
 #include "ui/shell.h"
 #include "ui/screen_stack.h"
@@ -260,6 +264,19 @@ static constexpr uint32_t kRf433CaptureMaxMs = 20000; // matches the ~10-20s
                                                       // capture window this
                                                       // spike's acceptance
                                                       // test calls for
+
+// Task 15 (Phase 3 plan): IR unit bring-up spike state, polled from loop()
+// rather than run inline in the 'i' serial-trigger handler -- see that
+// handler's own comment for the real watchdog-reset crash that made this
+// necessary. Same non-blocking-multi-second-operation pattern as the RF433
+// capture/replay/bruteforce statics above.
+enum class IrSpikePhase { kIdle, kBlinking, kRxSampling };
+static IrSpikePhase s_ir_spike_phase = IrSpikePhase::kIdle;
+static uint32_t s_ir_spike_phase_start_ms = 0;
+static int s_ir_spike_blink_count = 0;
+static bool s_ir_spike_blink_on = false;
+static bool s_ir_spike_rx_last = false;
+static uint32_t s_ir_spike_rx_transitions = 0;
 #endif
 
 // Task 9's WiFi STA smoke test still ships with placeholder credentials.
@@ -1099,6 +1116,77 @@ void loop() {
             // so release explicitly or RF433's 'r' trigger is refused forever
             // after a single '2' press.
             nfc_release_external_i2c();
+        } else if (c == 'i') {
+            // Task 15 (Phase 3 plan): the IR unit bring-up SPIKE. No launcher
+            // tile, same shape as 'c'/'h'/'r'/'n'/'2' above; serial is its
+            // only entry point by design.
+            //
+            // 'i' (mnemonic: IR) is free -- k/p/b/w/s/m/g/a/c/h/j/f/r/n/2 are
+            // the fifteen already taken above.
+            //
+            // *** HARDWARE PRECONDITION ***: the IR unit (M5Stack "Unit IR",
+            // SKU U002) -- NOT the NFC unit, NOT the RFID2 unit, NOT RF433R/T
+            // -- must be the thing plugged into the Tab5's single HY2.0
+            // PORT.A socket. Unlike the I2C units above, there is no ACK/NACK
+            // to observe here -- see WHAT THIS TEST IS below for how presence
+            // is actually confirmed for GPIO-only hardware.
+            //
+            // WHAT THIS TEST IS, and why it is not an I2C-style spike: this
+            // unit has no register interface to probe (see ir_unit.h's header
+            // for the corrected, non-I2C hardware story) -- the only real
+            // acceptance test available is a human-observed GPIO-level one:
+            //   (a) TX: blink TAB5_IR_TX_GPIO slowly (500ms on/off, same
+            //       cadence Task 1's real RF433T blink test used) -- a 940nm
+            //       IR LED is invisible to the naked eye but visible through
+            //       most phone camera sensors as a faint pulsing glow. The
+            //       project owner must confirm this visually; firmware cannot
+            //       self-verify an LED actually lit.
+            //   (b) RX: sample TAB5_IR_RX_GPIO continuously for 10 seconds
+            //       and print every level transition with a timestamp, while
+            //       the project owner points a real IR remote at the
+            //       receiver and holds a button. Per ir_unit.h's RX POLARITY
+            //       note, expect transitions to LOW during a button press
+            //       (family-standard active-low for IRM-36xx/TSOP38-class
+            //       modules) -- this run is what turns that from "standard
+            //       for the family" into "confirmed for this unit".
+            //
+            // ACCEPTANCE CRITERION: (a) the project owner visually confirms
+            // the TX LED blinks on camera; (b) at least one real transition
+            // is printed during the RX window while a real remote button is
+            // held. Absence of RX transitions with a real remote present
+            // would mean either the wrong pin, wrong polarity assumption, or
+            // a dead receiver -- do not treat a quiet RX window as a pass.
+            // NON-BLOCKING as of a real hardware finding, same day: the first
+            // version of this handler ran the whole test (6x 500ms delay()
+            // blink cycles, then a blocking 10s while() RX-poll loop) inline,
+            // right here, before returning from loop(). That held the
+            // Arduino runtime's loopTask for 3+ seconds without ever
+            // returning control to it, which tripped the ESP32 task
+            // watchdog and rebooted the board mid-test -- confirmed via
+            // serial capture ("Task watchdog got triggered... loopTask (CPU
+            // 1) did not reset the watchdog in time... Aborting"), not a
+            // hardware/wiring problem. Every other multi-second operation in
+            // this file (RF433 capture, replay, bruteforce) is a poll()-
+            // driven state machine for exactly this reason -- see
+            // s_ir_spike_phase and its poll block near the bottom of loop()
+            // for this same pattern applied here. This handler now only
+            // KICKS OFF the state machine; it must return quickly like every
+            // other branch in this switch.
+            Serial.println("quarky-tab5: [debug] IR unit bring-up via serial trigger");
+            if (!IrUnit::begin()) {
+                Serial.println("quarky-tab5: [ir-unit] *** FAIL -- begin() refused, "
+                               "PORT.A is held by another owner. Release whatever "
+                               "NFC/RFID2/RF433 session is active and retry. ***");
+            } else {
+                Serial.println("quarky-tab5: [ir-unit] TX blink test starting -- 6 "
+                               "cycles, 500ms on/off. Watch the IR LED through a "
+                               "phone camera now.");
+                IrUnit::set_tx(false);
+                s_ir_spike_phase = IrSpikePhase::kBlinking;
+                s_ir_spike_phase_start_ms = millis();
+                s_ir_spike_blink_count = 0;
+                s_ir_spike_blink_on = false;
+            }
         }
     }
 
@@ -1131,6 +1219,54 @@ void loop() {
         s_rf433_capture_started_ms = 0;
         s_rf433_captures_completed++;
         rf433_dump_capture();
+    }
+
+    // Task 15: IR unit bring-up spike poll -- see the 'i' serial-trigger
+    // handler's own comment for why this is a state machine (a real
+    // task-watchdog reset was caused by the first, blocking-delay()
+    // version). Each call here does at most one small step and returns,
+    // exactly like the RF433 timeout check above.
+    if (s_ir_spike_phase == IrSpikePhase::kBlinking) {
+        if (millis() - s_ir_spike_phase_start_ms >= 500) {
+            s_ir_spike_phase_start_ms = millis();
+            s_ir_spike_blink_on = !s_ir_spike_blink_on;
+            IrUnit::set_tx(s_ir_spike_blink_on);
+            if (!s_ir_spike_blink_on) {
+                s_ir_spike_blink_count++;
+                if (s_ir_spike_blink_count >= 6) {
+                    s_ir_spike_phase = IrSpikePhase::kRxSampling;
+                    s_ir_spike_phase_start_ms = millis();
+                    s_ir_spike_rx_last = IrUnit::read_rx();
+                    s_ir_spike_rx_transitions = 0;
+                    Serial.printf("quarky-tab5: [ir-unit] RX sample window -- 10s. "
+                                  "Point a real IR remote at the receiver and hold a "
+                                  "button now. Initial level: %s\n",
+                                  s_ir_spike_rx_last ? "HIGH" : "LOW");
+                }
+            }
+        }
+    } else if (s_ir_spike_phase == IrSpikePhase::kRxSampling) {
+        bool now = IrUnit::read_rx();
+        if (now != s_ir_spike_rx_last) {
+            s_ir_spike_rx_transitions++;
+            Serial.printf("quarky-tab5: [ir-unit] RX transition #%u at t=%ums -> %s\n",
+                          (unsigned)s_ir_spike_rx_transitions,
+                          (unsigned)(millis() - s_ir_spike_phase_start_ms),
+                          now ? "HIGH" : "LOW");
+            s_ir_spike_rx_last = now;
+        }
+        if (millis() - s_ir_spike_phase_start_ms >= 10000) {
+            Serial.printf("quarky-tab5: [ir-unit] RX window done -- %u transition(s) "
+                          "observed. %s\n",
+                          (unsigned)s_ir_spike_rx_transitions,
+                          s_ir_spike_rx_transitions > 0
+                              ? "*** PASS (receiver responded to a real remote) ***"
+                              : "*** FAIL -- no transitions; check pin/polarity/"
+                                "receiver, and confirm a real remote was actually "
+                                "pressed during the window ***");
+            IrUnit::end();
+            s_ir_spike_phase = IrSpikePhase::kIdle;
+        }
     }
     // --- end debug aid ---
 #endif

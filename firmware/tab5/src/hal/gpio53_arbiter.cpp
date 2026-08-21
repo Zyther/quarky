@@ -15,6 +15,7 @@ const char *ownerName(Owner o) {
         case Owner::kNone:       return "none";
         case Owner::kExternalI2c: return "external I2C (NFC/RFID2)";
         case Owner::kRf433:      return "RF433";
+        case Owner::kIr:         return "IR unit";
     }
     return "?";
 }

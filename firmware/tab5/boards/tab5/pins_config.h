@@ -676,6 +676,30 @@
 #define TAB5_RF433R_PIN 53 // CONFIRMED 2026-08-18: interrupt-driven receive test, continuous 433MHz TX from a second Bruce-firmware device
 #endif
 
+// IR unit GPIO pins (real M5Stack "Unit IR", SKU U002 -- see
+// hal/ir_unit.h for the full hardware story and citations). A THIRD real
+// consumer of PORT.A's GPIO53/54 pins, alongside external I2C
+// (SDA=53/SCL=54) and RF433 (both R/T on 53) -- arbitrated the same way
+// via hal/gpio53_arbiter.h's Owner::kIr.
+//
+// Mapping confirmed directly from two real sources, both 2026-08-21: (1)
+// the unit's own datasheet PDF (project owner-supplied,
+// ~/Downloads/ir.pdf), whose schematic/pin-map table gives the unit-side
+// wire colors Yellow=IR_TX, White=IR_RX; (2) a screenshot of M5Stack's own
+// unit-compatibility page (project owner-supplied, same session), which
+// maps those same wire colors directly onto Tab5's PORT.A pins: Unit IR's
+// PORT.B (GND/5V/IR_TX/IR_RX) <-> Tab5 PORT.A (GND/5V/G53/G54) --
+// i.e. IR_TX=G53, IR_RX=G54. Not yet independently re-verified via a
+// real GPIO-level bring-up test on this project's own hardware (Task 15's
+// own next step) -- this mapping is real-source-cited, not a guess, but
+// is still a datasheet claim until that bring-up test confirms it.
+#ifndef TAB5_IR_TX_GPIO
+#define TAB5_IR_TX_GPIO 53
+#endif
+#ifndef TAB5_IR_RX_GPIO
+#define TAB5_IR_RX_GPIO 54
+#endif
+
 // Free GPIOs on the Tab5's rear M5-Bus connector (per docs.m5stack.com/en/
 // core/Tab5's pin table, fetched 2026-08-08), recorded here as the most
 // likely place a future RF433R/T wiring would land, since PORT.A is already
