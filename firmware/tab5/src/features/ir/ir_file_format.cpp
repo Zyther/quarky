@@ -52,6 +52,36 @@ void copy_bounded(char *dst, size_t dst_size, const char *src, size_t src_len) {
     dst[n] = '\0';
 }
 
+// Bounded strtol/strtoul: same real bug class and same fix as
+// rf433_sub_format.cpp's parse_long_bounded() (see its comment for the full
+// reasoning) -- decode()'s own contract (ir_file_format.h) says text[0..len)
+// "need not be NUL-terminated", so calling strtol/strtoul directly on the
+// last token in a value substring with no trailing delimiter would scan
+// past the caller's declared bound. Copies at most kMaxTokenLen-1 bytes into
+// a local NUL-terminated buffer first. kMaxTokenLen=8 comfortably covers
+// this format's own token shapes: a 2-hex-digit byte ("FF") and an unsigned
+// `data` timing (uint16_t, max 5 decimal digits).
+constexpr size_t kMaxTokenLen = 8;
+bool parse_token_bounded(const char *p, size_t max_len, int base, bool is_signed, long *out_signed,
+                          unsigned long *out_unsigned, size_t *consumed) {
+    char tmp[kMaxTokenLen];
+    size_t n = (max_len < kMaxTokenLen - 1) ? max_len : kMaxTokenLen - 1;
+    std::memcpy(tmp, p, n);
+    tmp[n] = '\0';
+    char *endp = nullptr;
+    if (is_signed) {
+        long v = std::strtol(tmp, &endp, base);
+        if (endp == tmp) return false;
+        *out_signed = v;
+    } else {
+        unsigned long v = std::strtoul(tmp, &endp, base);
+        if (endp == tmp) return false;
+        *out_unsigned = v;
+    }
+    *consumed = static_cast<size_t>(endp - tmp);
+    return true;
+}
+
 // Space-separated 2-hex-digit byte tokens, e.g. "EE 87 00 00" -- real
 // spec's own address/command syntax.
 size_t parse_hex_bytes(const char *val, size_t val_len, uint8_t *out, size_t max_out) {
@@ -60,11 +90,11 @@ size_t parse_hex_bytes(const char *val, size_t val_len, uint8_t *out, size_t max
     while (i < val_len && count < max_out) {
         while (i < val_len && (val[i] == ' ' || val[i] == '\t')) i++;
         if (i >= val_len) break;
-        char *endp = nullptr;
-        long v = std::strtol(val + i, &endp, 16);
-        if (endp == val + i) break; // non-hex token -- stop, keep what parsed so far
+        long v = 0;
+        size_t consumed = 0;
+        if (!parse_token_bounded(val + i, val_len - i, 16, true, &v, nullptr, &consumed)) break; // non-hex -- stop
         out[count++] = static_cast<uint8_t>(v & 0xFF);
-        i = static_cast<size_t>(endp - val);
+        i += consumed;
     }
     return count;
 }
@@ -78,15 +108,15 @@ size_t parse_unsigned_list(const char *val, size_t val_len, uint16_t *out, size_
     while (i < val_len) {
         while (i < val_len && (val[i] == ' ' || val[i] == '\t')) i++;
         if (i >= val_len) break;
-        char *endp = nullptr;
-        unsigned long v = std::strtoul(val + i, &endp, 10);
-        if (endp == val + i) break; // non-numeric token -- stop, keep what parsed so far
+        unsigned long v = 0;
+        size_t consumed = 0;
+        if (!parse_token_bounded(val + i, val_len - i, 10, false, nullptr, &v, &consumed)) break; // non-numeric -- stop
         if (count < max_out) {
             out[count++] = static_cast<uint16_t>(v);
         } else if (truncated != nullptr) {
             *truncated = true;
         }
-        i = static_cast<size_t>(endp - val);
+        i += consumed;
     }
     return count;
 }
@@ -105,8 +135,21 @@ size_t decode(const char *text, size_t len, IrSignal *out, size_t max_signals, b
     if (!next_line(text, len, &pos, &line, &line_len) || !line_equals(line, line_len, kVersionLine)) return 0;
 
     size_t out_count = 0;
+    size_t signals_seen = 0; // total signals finalized so far, capped at
+                              // kMaxSignalsPerFile below -- distinct from
+                              // out_count, which is separately capped by
+                              // max_signals
     bool have_current = false;
-    IrSignal current{};
+    // static, not stack-local -- sizeof(IrSignal) is ~2KB; this runs on the
+    // LVGL/Arduino task's stack once Task 22 wires this in, same reasoning
+    // as every static buffer in rf433_sub_format.cpp. Not reentrant, same
+    // real, disclosed, single-caller-today constraint as those. Fields not
+    // explicitly set on this call may retain stale content from a previous
+    // call, which is fine: `current = IrSignal{};` below resets it in full
+    // before each new signal starts, and finalize()'s own copy into out[]
+    // happens only after the caller-visible fields are populated.
+    static IrSignal current{};
+    current = IrSignal{};
 
     auto finalize = [&]() {
         if (!have_current) return;
@@ -115,6 +158,7 @@ size_t decode(const char *text, size_t len, IrSignal *out, size_t max_signals, b
         } else if (out_truncated != nullptr) {
             *out_truncated = true;
         }
+        signals_seen++;
         current = IrSignal{};
         have_current = false;
     };
@@ -134,6 +178,15 @@ size_t decode(const char *text, size_t len, IrSignal *out, size_t max_signals, b
             // (defensive: not every real file necessarily has `#` between
             // every pair, only the cited sample does).
             finalize();
+            if (signals_seen >= kMaxSignalsPerFile) {
+                // Enforced internal-processing bound (kMaxSignalsPerFile,
+                // ir_file_format.h) -- stop scanning further signals
+                // regardless of max_signals/out_count, so a pathological
+                // file with far more signals than either doesn't make
+                // decode() keep processing lines indefinitely.
+                if (out_truncated != nullptr) *out_truncated = true;
+                break;
+            }
             const char *val;
             size_t val_len;
             value_after(line, line_len, 5, &val, &val_len);
@@ -276,7 +329,14 @@ size_t read(IStorage &storage, const char *path, IrSignal *out, size_t max_signa
         if (out_truncated != nullptr) *out_truncated = false;
         return 0;
     }
-    return decode(buf, len, out, max_signals, out_truncated);
+    size_t n = decode(buf, len, out, max_signals, out_truncated);
+    // IStorage::read_file()'s own documented contract (hal/istorage.h):
+    // *out_len is capped at max_len if the real file was longer. len ==
+    // sizeof(buf) is therefore this call's only signal that the file may
+    // have been truncated -- ORed into *out_truncated alongside decode()'s
+    // own (unrelated) truncation reasons rather than adding a second flag.
+    if (len == sizeof(buf) && out_truncated != nullptr) *out_truncated = true;
+    return n;
 }
 
 } // namespace IrFileFormat

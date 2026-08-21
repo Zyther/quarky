@@ -42,6 +42,16 @@
 // (non-RAW) .sub files are a different format this project's capture/replay
 // pipeline has no representation for, and are rejected by read().
 //
+// The real spec also documents a second header shape, "RAW file, custom
+// preset": Preset becomes the literal `FuriHalSubGhzPresetCustom`, and two
+// extra lines -- `Custom_preset_module:` (transceiver identifier, e.g.
+// `CC1101`) and `Custom_preset_data:` (transceiver register bytes) -- are
+// inserted between `Preset:` and `Protocol:`. This project's fixed
+// bit-bang GPIO output never WRITES this shape (kPresetName is always the
+// standard preset), but decode() reads it: header parsing scans for known
+// keys rather than assuming fixed line positions, so a real external file
+// using either shape parses.
+//
 // `RAW_Data` values are SIGNED microsecond durations: positive = level HIGH
 // for that duration, negative = LOW. Must start positive (first segment is
 // always HIGH) and must strictly alternate sign ("interleaved" -- two
@@ -93,12 +103,25 @@ bool encode(const Rf433Scan::CapturedSignal &sig, char *buf, size_t buf_size, si
 // ".sub" RAW text (text[0..len), need not be NUL-terminated) into *out.
 // Returns false if the text isn't a well-formed RAW .sub file this module
 // supports: wrong Filetype/Version, non-RAW Protocol, no RAW_Data lines, a
-// zero-valued duration (spec: "values must be non-zero"), or a malformed
-// (non-numeric) token. On success, *out is fully populated; captured_at_ms
-// and capture_id are left 0 -- the .sub format carries neither, matching
-// this project's own SD-round-trip precedent (rf433_scan.cpp's saved .raw
-// files carry only edges too).
-bool decode(const char *text, size_t len, Rf433Scan::CapturedSignal *out);
+// zero-valued (or out-of-int32_t-range) duration (spec: "values must be
+// non-zero"), or a malformed (non-numeric) token. Header parsing tolerates
+// both real file shapes the spec documents: the standard-preset shape
+// (Frequency/Preset/Protocol) and the "RAW file, custom preset" shape,
+// which inserts Custom_preset_module:/Custom_preset_data: lines between
+// Preset: and Protocol: -- both are scanned for by key, not assumed to sit
+// at fixed line positions. On success, *out is fully populated;
+// captured_at_ms and capture_id are left 0 -- the .sub format carries
+// neither, matching this project's own SD-round-trip precedent
+// (rf433_scan.cpp's saved .raw files carry only edges too).
+//
+// *out_non_alternating (if non-null) is set true if the consumed RAW_Data
+// values did not strictly alternate sign -- the real spec's own quoted
+// example self-contradicts its "interleaved" rule (see this file's SOURCE
+// comment and the .cpp's decode() comment), so this is deliberately a flag,
+// not a rejection: parsing still succeeds, but a caller can distinguish
+// "parsed cleanly" from "parsed, but the input didn't actually alternate."
+bool decode(const char *text, size_t len, Rf433Scan::CapturedSignal *out,
+            bool *out_non_alternating = nullptr);
 
 // SD-backed convenience wrappers around encode()/decode(). Take an IStorage&
 // (dependency injection) rather than reaching for this project's usual
@@ -108,6 +131,13 @@ bool decode(const char *text, size_t len, Rf433Scan::CapturedSignal *out);
 // SD_MMC/Arduino dependency and can be exercised in the host-native test
 // build via a fake IStorage, not just encode()/decode() in isolation.
 bool write(IStorage &storage, const char *path, const Rf433Scan::CapturedSignal &sig);
+// If the real file on SD is larger than read()'s internal working buffer,
+// the excess is silently unreadable through this call -- read() detects
+// that case (the underlying IStorage::read_file() call reports exactly the
+// buffer's capacity, its own documented signal that the file may have been
+// longer) and reports it the same way this module already reports any
+// other lossy read: out->truncated is set true, reusing this project's
+// existing CapturedSignal::truncated idiom rather than adding a new flag.
 bool read(IStorage &storage, const char *path, Rf433Scan::CapturedSignal *out);
 
 } // namespace Rf433SubFormat

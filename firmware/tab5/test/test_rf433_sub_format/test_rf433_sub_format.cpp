@@ -176,9 +176,15 @@ void test_decode_accepts_real_spec_example_fragment() {
                         "Preset: FuriHalSubGhzPresetOok650Async\nProtocol: RAW\n"
                         "RAW_Data: 29262 361 -68 2635 -66 24113 -66 11\n";
     Rf433Scan::CapturedSignal out{};
-    TEST_ASSERT_TRUE(Rf433SubFormat::decode(text, std::strlen(text), &out));
+    bool non_alternating = false;
+    TEST_ASSERT_TRUE(Rf433SubFormat::decode(text, std::strlen(text), &out, &non_alternating));
     TEST_ASSERT_EQUAL_UINT32(9, out.edge_count); // 8 values -> 9 edges
     TEST_ASSERT_FALSE(out.truncated);
+    // Review finding #4: the spec's own example violates its own alternation
+    // rule (29262, 361 both positive back-to-back) -- decode() still accepts
+    // it (see the comment above this test) but must now FLAG that, not just
+    // silently accept it.
+    TEST_ASSERT_TRUE(non_alternating);
 }
 
 void test_decode_parses_multiple_raw_data_lines() {
@@ -190,8 +196,56 @@ void test_decode_parses_multiple_raw_data_lines() {
                         "Preset: FuriHalSubGhzPresetOok650Async\nProtocol: RAW\n"
                         "RAW_Data: 320 -640 320\nRAW_Data: -640 320 -1280\n";
     Rf433Scan::CapturedSignal out{};
-    TEST_ASSERT_TRUE(Rf433SubFormat::decode(text, std::strlen(text), &out));
+    bool non_alternating = true; // deliberately pre-set to true, so a bug that
+                                  // never clears it would fail this assertion
+    TEST_ASSERT_TRUE(Rf433SubFormat::decode(text, std::strlen(text), &out, &non_alternating));
     TEST_ASSERT_EQUAL_UINT32(7, out.edge_count); // 6 total values across both lines -> 7 edges
+    // This sequence (320,-640,320,-640,320,-1280) genuinely alternates sign
+    // throughout, including across the RAW_Data: line boundary -- the
+    // negative case for review finding #4's new flag.
+    TEST_ASSERT_FALSE(non_alternating);
+}
+
+// Real spec's own "RAW file, custom preset" example, quoted verbatim from
+// Flipper Devices' own SubGhzFileFormats.md (dev branch, re-fetched directly
+// 2026-08-20 to get this exact example -- it wasn't in the original task's
+// controller notes, only the standard-preset shape was): the header inserts
+// Custom_preset_module:/Custom_preset_data: lines between Preset: and
+// Protocol:, and Preset: itself becomes FuriHalSubGhzPresetCustom. This is a
+// real, spec-documented file shape review finding #2 reported decode()
+// rejected outright (strict positional parsing assumed line 5 was always
+// exactly "Protocol: RAW"). RAW_Data content reuses the same real fragment
+// (trimmed of the doc's own "..." truncation marker) as
+// test_decode_accepts_real_spec_example_fragment, above, since it's the same
+// cited example's data.
+void test_decode_accepts_real_custom_preset_header() {
+    const char *text =
+        "Filetype: Flipper SubGhz RAW File\nVersion: 1\nFrequency: 433920000\n"
+        "Preset: FuriHalSubGhzPresetCustom\n"
+        "Custom_preset_module: CC1101\n"
+        "Custom_preset_data: 02 0D 03 07 08 32 0B 06 14 00 13 00 12 30 11 32 10 17 18 18 19 18 1D 91 "
+        "1C 00 1B 07 20 FB 22 11 21 B6 00 00 00 C0 00 00 00 00 00 00\n"
+        "Protocol: RAW\n"
+        "RAW_Data: 29262 361 -68 2635 -66 24113 -66 11\n";
+    Rf433Scan::CapturedSignal out{};
+    TEST_ASSERT_TRUE(Rf433SubFormat::decode(text, std::strlen(text), &out));
+    TEST_ASSERT_EQUAL_UINT32(9, out.edge_count); // same 8 values -> 9 edges as the standard-preset fragment
+    TEST_ASSERT_FALSE(out.truncated);
+}
+
+void test_decode_rejects_out_of_int32_range_duration() {
+    // Review finding M2, reproduced: on a 64-bit host (this project's
+    // host-native test target), `long` is 8 bytes, so strtol can fully parse
+    // a value like 4294967296 (2^32) as non-zero -- but naively narrowing it
+    // to int32_t wraps it to exactly 0, bypassing a zero-check performed
+    // BEFORE narrowing. decode() must reject values outside int32_t's range
+    // outright rather than let one silently narrow to a valid-looking (and
+    // wrong) duration.
+    const char *text = "Filetype: Flipper SubGhz RAW File\nVersion: 1\nFrequency: 433920000\n"
+                        "Preset: FuriHalSubGhzPresetOok650Async\nProtocol: RAW\n"
+                        "RAW_Data: 100 -4294967296 100\n";
+    Rf433Scan::CapturedSignal out{};
+    TEST_ASSERT_FALSE(Rf433SubFormat::decode(text, std::strlen(text), &out));
 }
 
 // ── Real-hardware fixture round trip ───────────────────────────────────────
@@ -321,6 +375,18 @@ void test_encode_decode_real_fixture_is_a_fixed_point() {
     Rf433Scan::CapturedSignal roundtripped{};
     TEST_ASSERT_TRUE(Rf433SubFormat::decode(text1, len1, &roundtripped));
 
+    // Review finding M3: the fixed-point check above only proves decode() is
+    // a right-inverse of THIS RUN's encode() output -- a degenerate encoder
+    // that dropped almost every edge would still pass it (its own
+    // (mis-)encoded text would round-trip through decode()->encode() just
+    // as stably). Close that gap with a real expected value computed
+    // independently from the fixture's OWN 354 raw edges (not derived from
+    // text1/len1 above): merge-consecutive-same-level runs the same way
+    // merge_pulses() does, then drop the leading pulse because it's LOW
+    // (level[0] here is false) per build_signed_durations()'s own documented
+    // rule, leaving 209 signed durations -> 210 edges.
+    TEST_ASSERT_EQUAL_UINT32(210, roundtripped.edge_count);
+
     TEST_ASSERT_TRUE(Rf433SubFormat::encode(roundtripped, text2, sizeof(text2), &len2));
 
     TEST_ASSERT_EQUAL_UINT32(len1, len2);
@@ -342,6 +408,57 @@ void test_write_read_real_fixture_via_storage() {
     TEST_ASSERT_TRUE(Rf433SubFormat::read(storage, "/quarky/captures/rf433/burst17.sub", &result));
     TEST_ASSERT_TRUE(result.edge_count > 0);
     TEST_ASSERT_FALSE(result.truncated);
+}
+
+// Review finding #3: Rf433SubFormat::read() (rf433_sub_format.cpp) reads
+// into a fixed 8192-byte buffer with no way to tell "the whole file fit"
+// from "the file was longer and got cut off" by IStorage::read_file()'s own
+// documented max_len cap. This builds a "file" whose first 8192 bytes are,
+// on their own, a complete and independently valid RAW .sub file (the
+// padding needed to hit exactly 8192 bytes lives inside the ignored Preset:
+// value; the RAW_Data: line itself carries only 4 values, far under
+// kMaxDurations' 511-value cap, so decode()'s OWN per-duration truncation
+// logic can't be what trips truncated=true here), with real additional
+// content stored beyond byte 8192 so the "file" is genuinely bigger than
+// read()'s buffer. The only thing that can set truncated=true in this case
+// is read()'s own len==sizeof(buf) file-size check.
+void test_read_sets_truncated_flag_when_file_exceeds_buffer_capacity() {
+    constexpr size_t kBufCapacity = 8192; // matches read()'s static buf[8192]
+    const char *suffix = "Protocol: RAW\nRAW_Data: 100 -100 100 -100\n";
+    char prefix_before_pad[128];
+    int prefix_len = std::snprintf(prefix_before_pad, sizeof(prefix_before_pad),
+                                    "Filetype: Flipper SubGhz RAW File\nVersion: 1\nFrequency: 433920000\n"
+                                    "Preset: FuriHalSubGhzPresetOok650Async");
+    TEST_ASSERT_TRUE(prefix_len > 0);
+    size_t suffix_len = std::strlen(suffix);
+    size_t pad_len = kBufCapacity - static_cast<size_t>(prefix_len) - 1 /* '\n' after Preset */ - suffix_len;
+
+    static char full[kBufCapacity + 64];
+    size_t pos = 0;
+    std::memcpy(full + pos, prefix_before_pad, static_cast<size_t>(prefix_len));
+    pos += static_cast<size_t>(prefix_len);
+    std::memset(full + pos, 'X', pad_len);
+    pos += pad_len;
+    full[pos++] = '\n';
+    std::memcpy(full + pos, suffix, suffix_len);
+    pos += suffix_len;
+    TEST_ASSERT_EQUAL_UINT32(kBufCapacity, pos);
+
+    // Real additional content beyond byte 8192 -- confirms the stored "file"
+    // really is bigger than read()'s buffer, not coincidentally exactly its size.
+    const char *tail = "RAW_Data: 50 -50\n";
+    size_t tail_len = std::strlen(tail);
+    std::memcpy(full + pos, tail, tail_len);
+    pos += tail_len;
+
+    FakeStorage storage;
+    TEST_ASSERT_TRUE(storage.write_capture_file("/quarky/captures/rf433/big.sub",
+                                                 reinterpret_cast<const uint8_t *>(full), pos));
+
+    Rf433Scan::CapturedSignal result{};
+    TEST_ASSERT_TRUE(Rf433SubFormat::read(storage, "/quarky/captures/rf433/big.sub", &result));
+    TEST_ASSERT_EQUAL_UINT32(5, result.edge_count); // 4 values -> 5 edges, decode()'s own view is unaffected
+    TEST_ASSERT_TRUE(result.truncated);
 }
 
 // ===========================================================================
@@ -506,6 +623,76 @@ void test_ir_write_read_round_trip_via_storage() {
     TEST_ASSERT_EQUAL_UINT16_ARRAY(data, result[0].data, 5);
 }
 
+// Review finding #3 (.ir side): same real bug as Rf433SubFormat::read(), same
+// fix -- IrFileFormat::read() (ir_file_format.cpp) now ORs a
+// len==sizeof(buf) file-size check into *out_truncated. Built the same way
+// as the .sub version: the first 8192 bytes are a complete, valid,
+// single-signal .ir file on their own -- padding lives inside the ignored
+// tail of the duty_cycle value (extra digits copy_bounded()'s own tmp[32]
+// already truncates safely before parsing, so this can never trip any
+// per-signal truncation logic of decode()'s own) -- with real additional
+// content (a second signal) stored beyond byte 8192, so the "file" is
+// genuinely bigger than read()'s buffer.
+void test_ir_read_sets_truncated_flag_when_file_exceeds_buffer_capacity() {
+    constexpr size_t kBufCapacity = 8192; // matches read()'s static buf[8192]
+    char prefix_before_pad[128];
+    int prefix_len = std::snprintf(prefix_before_pad, sizeof(prefix_before_pad),
+                                    "Filetype: IR signals file\nVersion: 1\n#\nname: Pad\ntype: raw\nduty_cycle: 0.33");
+    TEST_ASSERT_TRUE(prefix_len > 0);
+    size_t pad_len = kBufCapacity - static_cast<size_t>(prefix_len) - 1 /* '\n' */;
+
+    static char full[kBufCapacity + 256];
+    size_t pos = 0;
+    std::memcpy(full + pos, prefix_before_pad, static_cast<size_t>(prefix_len));
+    pos += static_cast<size_t>(prefix_len);
+    std::memset(full + pos, '0', pad_len); // ignored trailing digits of duty_cycle's value
+    pos += pad_len;
+    full[pos++] = '\n';
+    TEST_ASSERT_EQUAL_UINT32(kBufCapacity, pos);
+
+    // Real additional content beyond byte 8192 -- a second, full signal --
+    // confirms the stored "file" really is bigger than read()'s buffer.
+    const char *tail = "#\nname: Extra\ntype: raw\nfrequency: 38000\nduty_cycle: 0.330000\ndata: 50 50\n";
+    size_t tail_len = std::strlen(tail);
+    std::memcpy(full + pos, tail, tail_len);
+    pos += tail_len;
+
+    FakeStorage storage;
+    TEST_ASSERT_TRUE(
+        storage.write_capture_file("/quarky/ir/big.ir", reinterpret_cast<const uint8_t *>(full), pos));
+
+    IrFileFormat::IrSignal result[2]{};
+    bool truncated = false;
+    size_t n = IrFileFormat::read(storage, "/quarky/ir/big.ir", result, 2, &truncated);
+    TEST_ASSERT_EQUAL_UINT32(1, n); // only the first (padded) signal is within the 8192-byte read
+    TEST_ASSERT_EQUAL_STRING("Pad", result[0].name);
+    TEST_ASSERT_TRUE(truncated);
+}
+
+// Review finding #6: kMaxSignalsPerFile was declared as an enforced internal
+// bound but never actually used anywhere -- now decode() stops scanning
+// further signals once it has finalized kMaxSignalsPerFile of them,
+// independent of max_signals. Built programmatically (real, valid, minimal
+// per-signal text, just repeated) rather than hand-typing 70 signal blocks.
+void test_ir_decode_enforces_kMaxSignalsPerFile() {
+    static char buf[16384];
+    int pos = std::snprintf(buf, sizeof(buf), "Filetype: IR signals file\nVersion: 1\n");
+    constexpr size_t kSignalsInFile = IrFileFormat::kMaxSignalsPerFile + 6;
+    for (size_t i = 0; i < kSignalsInFile; i++) {
+        pos += std::snprintf(buf + pos, sizeof(buf) - pos,
+                              "#\nname: S%u\ntype: raw\nfrequency: 38000\nduty_cycle: 0.330000\ndata: 100 100\n",
+                              static_cast<unsigned>(i));
+    }
+
+    IrFileFormat::IrSignal signals[IrFileFormat::kMaxSignalsPerFile + 10]{};
+    bool truncated = false;
+    size_t n = IrFileFormat::decode(buf, static_cast<size_t>(pos), signals,
+                                     IrFileFormat::kMaxSignalsPerFile + 10, &truncated);
+    TEST_ASSERT_EQUAL_UINT32(IrFileFormat::kMaxSignalsPerFile, n);
+    TEST_ASSERT_TRUE(truncated);
+    TEST_ASSERT_EQUAL_STRING("S0", signals[0].name); // first signals not dropped
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_encode_rejects_too_few_edges);
@@ -517,8 +704,11 @@ int main(int argc, char **argv) {
     RUN_TEST(test_decode_rejects_zero_valued_duration);
     RUN_TEST(test_decode_accepts_real_spec_example_fragment);
     RUN_TEST(test_decode_parses_multiple_raw_data_lines);
+    RUN_TEST(test_decode_accepts_real_custom_preset_header);
+    RUN_TEST(test_decode_rejects_out_of_int32_range_duration);
     RUN_TEST(test_encode_decode_real_fixture_is_a_fixed_point);
     RUN_TEST(test_write_read_real_fixture_via_storage);
+    RUN_TEST(test_read_sets_truncated_flag_when_file_exceeds_buffer_capacity);
     RUN_TEST(test_ir_decode_real_sample_file);
     RUN_TEST(test_ir_decode_rejects_wrong_filetype);
     RUN_TEST(test_ir_decode_rejects_wrong_version);
@@ -526,5 +716,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_ir_decode_truncates_oversized_data_field);
     RUN_TEST(test_ir_encode_decode_round_trip);
     RUN_TEST(test_ir_write_read_round_trip_via_storage);
+    RUN_TEST(test_ir_read_sets_truncated_flag_when_file_exceeds_buffer_capacity);
+    RUN_TEST(test_ir_decode_enforces_kMaxSignalsPerFile);
     return UNITY_END();
 }

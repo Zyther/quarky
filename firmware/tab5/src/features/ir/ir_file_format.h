@@ -71,10 +71,13 @@ constexpr size_t kMaxAddressBytes = 8;  // real cited example uses 4 bytes;
                                          // a spec limit, other real protocols
                                          // in the wild use other widths
 constexpr size_t kMaxRawSamples = 1024; // real spec's own stated max for `data`
-constexpr size_t kMaxSignalsPerFile = 64; // implementation bound for read()'s
-                                           // internal working state; callers
-                                           // still control output sizing via
-                                           // max_signals
+constexpr size_t kMaxSignalsPerFile = 64; // enforced internal-processing bound:
+                                           // decode() stops scanning further
+                                           // signals once this many have been
+                                           // parsed, independent of max_signals
+                                           // (which separately controls how many
+                                           // of those get copied into the
+                                           // caller's out[] array)
 
 enum class SignalType : uint8_t { kParsed, kRaw };
 
@@ -107,8 +110,10 @@ struct IrSignal {
 // IR signals file" / "Version: 1" -- Version 1 only is supported, matching
 // Rf433SubFormat's identical "reject unknown version rather than guess"
 // discipline). *out_truncated (if non-null) is set true if the file had
-// more signals than max_signals (extras dropped) or any individual raw
-// signal's `data` exceeded kMaxRawSamples.
+// more signals than max_signals (extras dropped), more signals than
+// kMaxSignalsPerFile (scanning stops there, an enforced internal bound --
+// see kMaxSignalsPerFile above), or any individual raw signal's `data`
+// exceeded kMaxRawSamples.
 size_t decode(const char *text, size_t len, IrSignal *out, size_t max_signals, bool *out_truncated);
 
 // Pure in-memory encode, no SD I/O -- host-testable. Encodes signals[0..count)
@@ -123,6 +128,14 @@ bool encode(const IrSignal *signals, size_t count, char *buf, size_t buf_size, s
 // arbitrary SD path" capability the plan's Task 21 text calls for --
 // generalized to any path, not tied to a bundled community-database
 // location a future Task 18 might also use.
+//
+// *out_truncated also picks up one more real case beyond decode()'s own:
+// if the real file on SD was larger than read()'s internal working buffer,
+// IStorage::read_file() caps *out_len at the buffer's capacity (its own
+// documented contract) -- read() detects that (out_len == buffer capacity)
+// and ORs it into *out_truncated too, so a caller can't mistake "read
+// everything, decode()-truncated for other reasons" from "the file itself
+// didn't fully fit in the read buffer" as "fully read."
 size_t read(IStorage &storage, const char *path, IrSignal *out, size_t max_signals, bool *out_truncated);
 bool write(IStorage &storage, const char *path, const IrSignal *signals, size_t count);
 

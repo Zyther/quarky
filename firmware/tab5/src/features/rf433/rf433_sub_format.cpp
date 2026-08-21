@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace Rf433SubFormat {
 
@@ -72,12 +73,16 @@ size_t merge_pulses(const Rf433Scan::CapturedSignal &sig, LevelPulse *out, size_
 // armed the interrupt, not something this project controls -- so if the
 // FIRST merged pulse is LOW, it is dropped rather than emitted with the
 // wrong sign. This mirrors build_durations()'s own "no leading duration for
-// edges[0]" reasoning one level further: a leading LOW segment records only
-// dead air before the real signal starts, with no known dwell time
-// preceding it (nothing in this CapturedSignal records how long the pin was
-// already LOW before capture began), so treating it as unrepresentable
-// costs no real information beyond what build_durations() already accepts
-// losing for the same reason.
+// edges[0]" reasoning one level further: EdgeSample.level is the level
+// AFTER a transition (rf433_common.h), so a LOW first merged pulse means
+// the first detected transition was FALLING -- an unrecorded rising edge
+// (and whatever HIGH dwell preceded it) happened before capture armed, with
+// no way to know how long that dwell was. That is not "no real information
+// to lose" (dead air) -- it is genuinely unrepresentable per the real
+// spec's own must-start-positive rule, so it is dropped rather than emitted
+// with a fabricated/wrong sign, the same real constraint build_durations()
+// already accepts losing for its own "no leading duration for edges[0]"
+// case.
 //
 // static, not stack-local, for the same reason rf433_protocol_decode.cpp's
 // decode() keeps its duration buffer static: ~4KB (kMaxDurations *
@@ -123,12 +128,50 @@ bool starts_with(const char *line, size_t line_len, const char *prefix, size_t p
     return line_len >= prefix_len && std::memcmp(line, prefix, prefix_len) == 0;
 }
 
+// Bounded strtol: decode()'s own contract (rf433_sub_format.h) says text[0..len)
+// "need not be NUL-terminated" -- calling std::strtol directly on the last
+// token in such a buffer (no trailing newline) would scan past the caller's
+// declared bound looking for a non-digit, reading whatever bytes happen to
+// sit after it (review-reported real bug: with Rf433SubFormat::read()'s
+// static working buffer, those bytes can be stale content left over from a
+// PREVIOUS, longer read). Copies at most kMaxTokenLen-1 bytes -- ample for
+// any real int32_t RAW_Data token, sign included -- into a local
+// NUL-terminated buffer before parsing, so strtol never sees memory beyond
+// what the caller actually bounded. Returns false for a non-numeric token,
+// OR if the digit run doesn't fit kMaxTokenLen-1 bytes and evidently
+// continues past what was copied (a token this module can't represent
+// rather than one it should silently mis-parse).
+constexpr size_t kMaxTokenLen = 16; // "-2147483648" (11 chars) + NUL + slack
+bool parse_long_bounded(const char *p, size_t max_len, long *out, size_t *consumed) {
+    char tmp[kMaxTokenLen];
+    size_t n = (max_len < kMaxTokenLen - 1) ? max_len : kMaxTokenLen - 1;
+    std::memcpy(tmp, p, n);
+    tmp[n] = '\0';
+    char *endp = nullptr;
+    long v = std::strtol(tmp, &endp, 10);
+    if (endp == tmp) return false; // non-numeric token
+    size_t used = static_cast<size_t>(endp - tmp);
+    if (used == n && n < max_len) {
+        char next = p[n];
+        if (next >= '0' && next <= '9') return false; // token longer than this module supports
+    }
+    *out = v;
+    *consumed = used;
+    return true;
+}
+
 } // namespace
 
 bool encode(const Rf433Scan::CapturedSignal &sig, char *buf, size_t buf_size, size_t *out_len) {
     if (buf == nullptr || buf_size == 0) return false;
 
-    int32_t durations[kMaxDurations];
+    // static, not stack-local -- same reasoning as build_signed_durations()'s
+    // own `merged` buffer just above: ~2KB (kMaxDurations * sizeof(int32_t))
+    // is fine off the stack, not fine added to a caller's frame once this
+    // runs on the LVGL/Arduino task's stack (Task 22). Not reentrant, same
+    // real, disclosed, single-caller-today constraint as every other static
+    // buffer in this file.
+    static int32_t durations[kMaxDurations];
     size_t n = build_signed_durations(sig, durations, kMaxDurations);
     if (n == 0) return false;
 
@@ -159,21 +202,48 @@ bool encode(const Rf433Scan::CapturedSignal &sig, char *buf, size_t buf_size, si
     return true;
 }
 
-bool decode(const char *text, size_t len, Rf433Scan::CapturedSignal *out) {
+bool decode(const char *text, size_t len, Rf433Scan::CapturedSignal *out, bool *out_non_alternating) {
+    if (out_non_alternating != nullptr) *out_non_alternating = false;
     if (text == nullptr || out == nullptr) return false;
 
     size_t pos = 0;
     const char *line = nullptr;
     size_t line_len = 0;
 
-    // Header: Filetype, Version, Frequency, Preset, Protocol -- real spec's
-    // own field order. Frequency/Preset are consumed (line present) but not
-    // value-validated -- see this file's header comment.
+    // Filetype/Version are always the first two lines, real spec's own
+    // fixed field order.
     if (!next_line(text, len, &pos, &line, &line_len) || !line_equals(line, line_len, kFiletypeLine)) return false;
     if (!next_line(text, len, &pos, &line, &line_len) || !line_equals(line, line_len, kVersionLine)) return false;
-    if (!next_line(text, len, &pos, &line, &line_len) || !starts_with(line, line_len, "Frequency:", 10)) return false;
-    if (!next_line(text, len, &pos, &line, &line_len) || !starts_with(line, line_len, "Preset:", 7)) return false;
-    if (!next_line(text, len, &pos, &line, &line_len) || !line_equals(line, line_len, kProtocolLine)) return false;
+
+    // Remaining header lines (Frequency, Preset, and -- only for the real
+    // spec's "RAW file, custom preset" file shape -- Custom_preset_module/
+    // Custom_preset_data) are scanned for by key rather than assumed to sit
+    // at fixed positions, so both real file shapes parse: the standard-preset
+    // shape is just Frequency/Preset/Protocol; the custom-preset shape
+    // inserts Custom_preset_module:/Custom_preset_data: lines between Preset:
+    // and Protocol: (real spec's own documented example -- see this file's
+    // header comment). None of these values are validated -- see this file's
+    // top comment for why. A bounded scan (kMaxHeaderLines) guards against
+    // spinning through an entire malformed file with no Protocol: line at all.
+    constexpr int kMaxHeaderLines = 6; // Frequency, Preset, Custom_preset_module,
+                                        // Custom_preset_data, Protocol, +1 slack
+    bool saw_frequency = false;
+    bool saw_preset = false;
+    bool found_protocol = false;
+    for (int header_lines = 0; header_lines < kMaxHeaderLines; header_lines++) {
+        if (!next_line(text, len, &pos, &line, &line_len)) break;
+        if (line_equals(line, line_len, kProtocolLine)) {
+            found_protocol = true;
+            break;
+        }
+        if (starts_with(line, line_len, "Protocol:", 9)) return false; // non-RAW protocol -- out of scope
+        if (starts_with(line, line_len, "Frequency:", 10)) { saw_frequency = true; continue; }
+        if (starts_with(line, line_len, "Preset:", 7)) { saw_preset = true; continue; }
+        if (starts_with(line, line_len, "Custom_preset_module:", 21)) continue;
+        if (starts_with(line, line_len, "Custom_preset_data:", 19)) continue;
+        return false; // unrecognized header line -- malformed
+    }
+    if (!found_protocol || !saw_frequency || !saw_preset) return false;
 
     // One or more RAW_Data: lines, concatenated -- real spec's own
     // continuation convention for captures over 512 values.
@@ -181,6 +251,9 @@ bool decode(const char *text, size_t len, Rf433Scan::CapturedSignal *out) {
     size_t n = 0;
     bool truncated = false;
     bool saw_raw_data = false;
+    bool non_alternating = false;
+    bool have_prev_sign = false;
+    bool prev_positive = false;
 
     while (next_line(text, len, &pos, &line, &line_len)) {
         if (line_len == 0) continue; // tolerate trailing blank lines
@@ -192,20 +265,36 @@ bool decode(const char *text, size_t len, Rf433Scan::CapturedSignal *out) {
             while (i < line_len && (line[i] == ' ' || line[i] == '\t')) i++;
             if (i >= line_len) break;
 
-            char *endp = nullptr;
-            long v = std::strtol(line + i, &endp, 10);
-            if (endp == line + i) return false; // non-numeric token -- malformed
-            if (v == 0) return false;            // real spec: "values must be non-zero"
+            long v = 0;
+            size_t consumed = 0;
+            if (!parse_long_bounded(line + i, line_len - i, &v, &consumed)) return false; // non-numeric/unsupported token
+            int32_t narrowed = static_cast<int32_t>(v);
+            // Real spec: "values must be non-zero." Checked on the NARROWED
+            // value (and the pre-narrow range rejected outright below) so a
+            // value like 4294967296 -- non-zero as a 64-bit `long` on this
+            // host, but which wraps to 0 when narrowed to int32_t -- can't
+            // sneak past the zero-check and silently become a zero-length
+            // duration.
+            if (v < std::numeric_limits<int32_t>::min() || v > std::numeric_limits<int32_t>::max()) {
+                return false; // out of this module's representable range
+            }
+            if (narrowed == 0) return false;
+
+            bool positive = narrowed > 0;
+            if (have_prev_sign && positive == prev_positive) non_alternating = true;
+            have_prev_sign = true;
+            prev_positive = positive;
 
             if (n < kMaxDurations) {
-                durations[n++] = static_cast<int32_t>(v);
+                durations[n++] = narrowed;
             } else {
                 truncated = true;
             }
-            i = static_cast<size_t>(endp - line);
+            i += consumed;
         }
     }
     if (!saw_raw_data || n == 0) return false;
+    if (out_non_alternating != nullptr) *out_non_alternating = non_alternating;
 
     // Reconstruct EdgeSample[] from n signed durations -> n+1 edges (a
     // duration is the gap BETWEEN two edges, same relationship
@@ -233,7 +322,14 @@ bool decode(const char *text, size_t len, Rf433Scan::CapturedSignal *out) {
         truncated = true;
     }
 
-    Rf433Scan::CapturedSignal result{};
+    // static, not stack-local -- ~4KB (sizeof(CapturedSignal)), same
+    // reasoning as every other buffer in this file (see build_signed_durations()'s
+    // own comment): fine off the stack, not fine added to a caller's frame
+    // once this runs on the LVGL/Arduino task's stack (Task 22). Entries at
+    // indices >= edge_count may hold stale data from a previous call, same
+    // as `durations` above -- never read, since callers only ever access
+    // edges[0..edge_count).
+    static Rf433Scan::CapturedSignal result{};
     uint32_t t = 0;
     for (size_t k = 0; k < edge_count; k++) {
         if (k == 0) {
@@ -269,7 +365,14 @@ bool read(IStorage &storage, const char *path, Rf433Scan::CapturedSignal *out) {
     static char buf[8192];
     size_t len = 0;
     if (!storage.read_file(path, reinterpret_cast<uint8_t *>(buf), sizeof(buf), &len)) return false;
-    return decode(buf, len, out);
+    if (!decode(buf, len, out)) return false;
+    // IStorage::read_file()'s own documented contract (hal/istorage.h):
+    // *out_len is capped at max_len if the real file was longer. len ==
+    // sizeof(buf) is therefore this call's only signal that the file may
+    // have been truncated -- flagged via the existing CapturedSignal::truncated
+    // field rather than adding a new one (this project's established idiom).
+    if (len == sizeof(buf)) out->truncated = true;
+    return true;
 }
 
 } // namespace Rf433SubFormat
