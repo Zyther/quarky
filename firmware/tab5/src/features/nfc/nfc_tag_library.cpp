@@ -67,18 +67,33 @@ bool load(IStorage &storage, const char *name, NfcCommon::TagInfo *out) {
     char path[96];
     std::snprintf(path, sizeof(path), "%s/%s", kLibraryDir, name);
 
-    NfcCommon::TagInfo tmp{};
+    // Read-buffer is deliberately ONE byte larger than TagInfo. IStorage::
+    // read_file()'s own documented contract (istorage.h) caps *out_len at
+    // max_len when the real file is LONGER than the buffer -- so reading
+    // into a buffer exactly sizeof(TagInfo) would make an oversized/
+    // corrupt file indistinguishable from an exact match (both report
+    // out_len == sizeof(TagInfo)). The +1 byte turns that ambiguity into a
+    // detectable case: an oversized file reports out_len ==
+    // sizeof(TagInfo)+1, which now correctly fails the exact-match check
+    // below instead of silently accepting a truncated/wrong record. Same
+    // reasoning this project already applies via the `truncated` idiom in
+    // rf433_sub_format.cpp/ir_file_format.cpp (Task 21) and via
+    // wifi_evil_portal.cpp's `len < kMaxTemplateBytes` check.
+    uint8_t raw[sizeof(NfcCommon::TagInfo) + 1];
     size_t out_len = 0;
-    if (!storage.read_file(path, reinterpret_cast<uint8_t *>(&tmp), sizeof(tmp), &out_len)) {
+    if (!storage.read_file(path, raw, sizeof(raw), &out_len)) {
         return false;
     }
-    // A size mismatch means this file isn't one of this module's own
-    // fixed-layout records (e.g. a short read, or something else entirely
-    // landed under the same directory/extension) -- don't hand back a
-    // partially-populated or garbage TagInfo.
-    if (out_len != sizeof(tmp)) {
+    if (out_len != sizeof(NfcCommon::TagInfo)) {
         return false;
     }
+    NfcCommon::TagInfo tmp{};
+    std::memcpy(&tmp, raw, sizeof(tmp));
+    // Defense in depth: force a NUL within type_name regardless of what was
+    // actually on disk, so a caller's %s formatting (nfc_tag_library_ui.cpp)
+    // can never read past this struct even if some other bug ever manages
+    // to write a non-terminated record.
+    tmp.type_name[sizeof(tmp.type_name) - 1] = '\0';
     *out = tmp;
     return true;
 }

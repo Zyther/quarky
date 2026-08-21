@@ -2,6 +2,7 @@
 #include "features/nfc/nfc_common.h"
 #include "features/nfc/nfc_tag_library.h"
 #include "hal/istorage.h"
+#include <cstdio>
 #include <cstring>
 
 // ===========================================================================
@@ -210,6 +211,34 @@ void test_list_returns_multiple_distinct_saved_tags() {
     TEST_ASSERT_TRUE(found_b);
 }
 
+void test_load_rejects_oversized_corrupt_record() {
+    FakeStorage storage;
+    const uint8_t uid[] = {0x01, 0x02, 0x03, 0x04};
+    NfcCommon::TagInfo tag;
+    build_tag(&tag, uid, sizeof(uid), "MIFARE Classic 1K");
+    TEST_ASSERT_TRUE(NfcTagLibrary::save(storage, tag));
+
+    char names[8][64];
+    int count = NfcTagLibrary::list(storage, names, 8);
+    TEST_ASSERT_EQUAL_INT(1, count);
+
+    // Overwrite the same file with MORE bytes than a real TagInfo record --
+    // simulates SD corruption or a stray oversized file landing under this
+    // module's own directory+extension. IStorage::read_file()'s documented
+    // contract caps *out_len at the read buffer's size when the real file is
+    // longer, so without the +1-byte read buffer in load(), this oversized
+    // file would be indistinguishable from an exact match. load() must
+    // reject it outright rather than hand back a truncated/wrong record.
+    char path[128];
+    std::snprintf(path, sizeof(path), "/quarky/captures/nfc/%s", names[0]);
+    uint8_t oversized[sizeof(NfcCommon::TagInfo) + 16];
+    std::memset(oversized, 0xAB, sizeof(oversized));
+    TEST_ASSERT_TRUE(storage.write_capture_file(path, oversized, sizeof(oversized)));
+
+    NfcCommon::TagInfo loaded{};
+    TEST_ASSERT_FALSE(NfcTagLibrary::load(storage, names[0], &loaded));
+}
+
 void test_list_respects_max_names_cap() {
     FakeStorage storage;
     for (int i = 0; i < 5; i++) {
@@ -230,6 +259,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_save_rejects_zero_length_uid);
     RUN_TEST(test_resaving_same_uid_overwrites_rather_than_duplicates);
     RUN_TEST(test_list_returns_multiple_distinct_saved_tags);
+    RUN_TEST(test_load_rejects_oversized_corrupt_record);
     RUN_TEST(test_list_respects_max_names_cap);
     return UNITY_END();
 }
