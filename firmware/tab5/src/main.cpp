@@ -23,6 +23,8 @@
 #include "features/wifi/wifi_connect.h"
 #include "features/wifi/wifi_evil_portal.h"
 #include "features/nfc/nfc_read.h" // Phase 3 Task 4: NFC/RFID2 tag read UI
+#include "features/nfc/nfc_tag_library.h" // Phase 3 Task 10: SD-backed NFC/
+                                          // RFID2 tag library (save/list/load)
 #include "features/rf433/rf433_scan.h" // Phase 3 Task 5: RF433 scan/capture UI
 #include "features/rf433/rf433_replay.h" // Phase 3 Task 6: replay a captured
                                           // signal on TAB5_RF433T_PIN. No
@@ -378,6 +380,11 @@ void setup() {
     // These modules are reachable via shell.cpp's Category::NFC tiles.
     NfcRead::register_module_nfc_unit();
     NfcRead::register_module_rfid2_unit();
+
+    // Task 10 (Phase 3): SD-backed NFC/RFID2 tag library (save/list/load,
+    // "Tag-o-matic" in the Bruce donor per the Phase 3 design spec's Section
+    // 1 table). Category::NFC tile alongside the two above.
+    NfcTagLibrary::register_module();
 
     // Task 5 (Phase 3): RF433 scan/capture UI (Category::RF433).
     Rf433Scan::register_module();
