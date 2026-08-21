@@ -51,7 +51,12 @@ public:
 
 private:
     char path_[128] = {};
-    uint8_t buf_[16384] = {};
+    // Sized to comfortably exceed Rf433SubFormat::kMaxEncodedTextBytes plus
+    // margin -- test_read_sets_truncated_flag_when_file_exceeds_buffer_capacity
+    // deliberately stores a file just past that real capacity to prove
+    // read() detects truncation; this fake's own buffer must be able to
+    // hold that (larger) file, distinct from the real capacity being tested.
+    uint8_t buf_[Rf433SubFormat::kMaxEncodedTextBytes + 4096] = {};
     size_t len_ = 0;
 };
 
@@ -423,7 +428,14 @@ void test_write_read_real_fixture_via_storage() {
 // read()'s buffer. The only thing that can set truncated=true in this case
 // is read()'s own len==sizeof(buf) file-size check.
 void test_read_sets_truncated_flag_when_file_exceeds_buffer_capacity() {
-    constexpr size_t kBufCapacity = 8192; // matches read()'s static buf[8192]
+    // Matches read()'s real buffer capacity (Rf433SubFormat::kMaxEncodedTextBytes,
+    // raised 2026-08-21 alongside kMaxEdgesPerSignal -- see that constant's
+    // own comment) -- was hardcoded to the old 8192 literal, which silently
+    // stopped testing truncation at all once the real buffer grew past it
+    // (the file this test builds no longer exceeded the real capacity, so
+    // nothing was truncated -- caught by this test's own edge_count/truncated
+    // assertions failing for real, not a false pass).
+    constexpr size_t kBufCapacity = Rf433SubFormat::kMaxEncodedTextBytes;
     const char *suffix = "Protocol: RAW\nRAW_Data: 100 -100 100 -100\n";
     char prefix_before_pad[128];
     int prefix_len = std::snprintf(prefix_before_pad, sizeof(prefix_before_pad),

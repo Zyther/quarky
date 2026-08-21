@@ -57,10 +57,13 @@
 // always HIGH) and must strictly alternate sign ("interleaved" -- two
 // same-signed values in a row is invalid per the real spec). Values must be
 // non-zero. Up to 512 values per RAW_Data: line; multiple RAW_Data: lines
-// are used for longer captures (real spec's own guidance). This project's
-// own capacity ceiling (kMaxDurations, below) is always <= 512, so write()
-// never needs to split across lines -- read() still parses multiple
-// RAW_Data: lines, for real interop with external files that do.
+// are used for longer captures (real spec's own guidance). UPDATED
+// 2026-08-21: this project's own capacity ceiling (kMaxDurations, below) was
+// raised past 512 (see Rf433Scan::kMaxEdgesPerSignal's own comment for the
+// real-world capture that motivated it -- a genuine Tesla charge-port
+// remote's real .sub file, 2395 duration values) -- write() now genuinely
+// splits across multiple RAW_Data: lines too, matching the real spec's own
+// convention read() already had to parse.
 //
 // CONVERSION REASONING (EdgeSample[] <-> signed RAW_Data), both directions
 // documented in rf433_sub_format.cpp next to the code that implements them:
@@ -90,6 +93,39 @@ extern const char kPresetName[];
 // to rf433_protocol_decode.cpp's kMaxDurations (a duration is the gap
 // BETWEEN two edges). Always <= the real spec's 512-per-line cap.
 constexpr size_t kMaxDurations = Rf433Scan::kMaxEdgesPerSignal - 1;
+
+// Real worst-case text size for encode()/read()'s buffers: kMaxDurations
+// values at up to 12 chars each ("-2147483648") + 1 leading space = 13
+// bytes/value, plus a small fixed header (~150 bytes) and one extra
+// "RAW_Data:\n" line prefix per 512 values once encode() splits (real spec's
+// own per-line cap, see this header's own top comment). Rounded up
+// generously past that worst case -- real captures use far fewer digits on
+// average (the genuine Tesla remote capture that motivated raising
+// kMaxDurations is 10991 bytes as a real .sub file, well under this).
+// Scales with kMaxEdgesPerSignal (see that constant's own comment for the
+// 4096->8192 real-PSRAM-headroom reasoning) -- kept proportional so this
+// buffer never becomes the new bottleneck after a future edge-cap increase.
+constexpr size_t kMaxEncodedTextBytes = 131072;
+
+// ── Combine ("daisy-chain several signals into one .sub") sizing ──────────
+//
+// Added 2026-08-21: the project owner asked whether a COMBINED file (built
+// from multiple captured signals via rf433_scan.cpp's "Select"/"Combine ->
+// .sub" feature) should be allowed to exceed the per-signal edge cap
+// (kMaxEdgesPerSignal) -- individual captures truncate at that real limit,
+// but concatenating several of them is a genuinely different operation with
+// no reason to inherit the SAME bound. kMaxCombinedEdges is the real worst
+// case for that operation: kMaxChainSignals full-length signals back to
+// back. At 8 signals * 8192 edges = 65536 edges, this costs ~512KB in
+// PSRAM (32MB total on this hardware, confirmed via ESP.getPsramSize() --
+// trivial) -- not an arbitrary separate guess, the actual sum of the parts.
+constexpr size_t kMaxCombinedEdges = static_cast<size_t>(Rf433Scan::kMaxChainSignals) *
+                                     Rf433Scan::kMaxEdgesPerSignal;
+constexpr size_t kMaxCombinedDurations = kMaxCombinedEdges - 1;
+// Scaled the same way kMaxEncodedTextBytes is for the single-signal case
+// (13 bytes/value worst case + header + per-512-values line-prefix
+// overhead), just for the larger combined edge count.
+constexpr size_t kMaxCombinedEncodedTextBytes = 1048576;
 
 // Pure in-memory conversion, no SD I/O -- host-testable (see
 // test/test_rf433_sub_format.cpp). Encodes sig into real Flipper ".sub" RAW
@@ -139,5 +175,22 @@ bool write(IStorage &storage, const char *path, const Rf433Scan::CapturedSignal 
 // other lossy read: out->truncated is set true, reusing this project's
 // existing CapturedSignal::truncated idiom rather than adding a new flag.
 bool read(IStorage &storage, const char *path, Rf433Scan::CapturedSignal *out);
+
+// ── Raw-array entry points, for combined/chained signals ─────────────────
+//
+// Same real encoding logic as encode()/write() above (both now delegate to
+// these), but operating directly on an edges[]/edge_count pair instead of
+// requiring a CapturedSignal -- CapturedSignal's edges[] array is fixed at
+// kMaxEdgesPerSignal, which is the right bound for one live capture but not
+// for a combined file built from several of them (see kMaxCombinedEdges'
+// own comment). edge_count may be up to kMaxCombinedEdges; behavior is
+// otherwise identical to encode()/write() (neither of those took or used a
+// "truncated" flag either -- that's this project's own CapturedSignal
+// bookkeeping, not part of the real .sub text format itself, so there is
+// nothing for these raw entry points to accept or emit for it).
+bool encode_raw(const Rf433Common::EdgeSample *edges, size_t edge_count,
+                 char *buf, size_t buf_size, size_t *out_len);
+bool write_raw(IStorage &storage, const char *path, const Rf433Common::EdgeSample *edges,
+               size_t edge_count);
 
 } // namespace Rf433SubFormat

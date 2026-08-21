@@ -34,17 +34,17 @@ struct LevelPulse {
 // instead. RAW_Data needs the level directly, as its sign. Duplicated
 // rather than shared: different return shape, and build_durations() is a
 // static helper in an anonymous namespace, not exposed for reuse.
-size_t merge_pulses(const Rf433Scan::CapturedSignal &sig, LevelPulse *out, size_t max_out) {
-    if (sig.edge_count < 2) return 0;
+size_t merge_pulses(const Rf433Common::EdgeSample *edges, size_t edge_count, LevelPulse *out, size_t max_out) {
+    if (edge_count < 2) return 0;
 
     size_t out_count = 0;
     uint32_t merged_duration = 0;
     bool merged_level = false;
     bool have_pulse = false;
 
-    for (size_t i = 1; i < sig.edge_count; i++) {
-        uint32_t gap = static_cast<uint32_t>(sig.edges[i].timestamp_us - sig.edges[i - 1].timestamp_us);
-        bool held_level = sig.edges[i - 1].level;
+    for (size_t i = 1; i < edge_count; i++) {
+        uint32_t gap = static_cast<uint32_t>(edges[i].timestamp_us - edges[i - 1].timestamp_us);
+        bool held_level = edges[i - 1].level;
 
         if (!have_pulse) {
             merged_duration = gap;
@@ -89,9 +89,25 @@ size_t merge_pulses(const Rf433Scan::CapturedSignal &sig, LevelPulse *out, size_
 // sizeof(LevelPulse)) is fine off the stack but means this function is NOT
 // reentrant -- a real constraint, not a live bug, given this project calls
 // it from a single task's poll/save path today.
-size_t build_signed_durations(const Rf433Scan::CapturedSignal &sig, int32_t *out, size_t max_out) {
-    static LevelPulse merged[kMaxDurations];
-    size_t merged_count = merge_pulses(sig, merged, kMaxDurations);
+size_t build_signed_durations(const Rf433Common::EdgeSample *edges, size_t edge_count,
+                              int32_t *out, size_t max_out) {
+    // Heap-allocated (plain `new`, lazily on first call -- function-local
+    // static initialization is guaranteed deferred to first use, well after
+    // PSRAM is registered as a heap, unlike a global/namespace-scope static
+    // would be) rather than a plain static array. Sized to
+    // kMaxCombinedDurations (not the smaller kMaxDurations) since this
+    // function now serves BOTH the single-signal encode() path and the
+    // combined-signal encode_raw() path (added 2026-08-21 for the daisy-
+    // chain "Combine -> .sub" feature) -- one correctly-sized buffer for
+    // the larger of the two callers' needs, not two separate ones. At
+    // kMaxCombinedDurations this is ~512KB -- this project's own real,
+    // verified sdkconfig (CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096) routes
+    // any single heap allocation over 4KB to PSRAM automatically, so plain
+    // `new` here (no ESP-IDF-specific heap_caps_malloc needed) is both
+    // portable to the native host test target (plain heap there, no PSRAM
+    // concept, still fine) and PSRAM-backed on the real target.
+    static LevelPulse *merged = new LevelPulse[kMaxCombinedDurations];
+    size_t merged_count = merge_pulses(edges, edge_count, merged, kMaxCombinedDurations);
     if (merged_count == 0) return 0;
 
     size_t start = merged[0].level ? 0 : 1;
@@ -162,26 +178,34 @@ bool parse_long_bounded(const char *p, size_t max_len, long *out, size_t *consum
 
 } // namespace
 
-bool encode(const Rf433Scan::CapturedSignal &sig, char *buf, size_t buf_size, size_t *out_len) {
+bool encode_raw(const Rf433Common::EdgeSample *edges, size_t edge_count,
+                 char *buf, size_t buf_size, size_t *out_len) {
     if (buf == nullptr || buf_size == 0) return false;
 
     // static, not stack-local -- same reasoning as build_signed_durations()'s
-    // own `merged` buffer just above: ~2KB (kMaxDurations * sizeof(int32_t))
-    // is fine off the stack, not fine added to a caller's frame once this
-    // runs on the LVGL/Arduino task's stack (Task 22). Not reentrant, same
+    // own `merged` buffer. Sized to kMaxCombinedDurations (not kMaxDurations)
+    // for the same reason that one is -- this is the SAME real code path
+    // encode() (the single-signal wrapper below) uses, so it must be able to
+    // hold whichever caller's edge_count is larger. Not reentrant, same
     // real, disclosed, single-caller-today constraint as every other static
     // buffer in this file.
-    static int32_t durations[kMaxDurations];
-    size_t n = build_signed_durations(sig, durations, kMaxDurations);
+    static int32_t *durations = new int32_t[kMaxCombinedDurations]; // see build_signed_durations()'s
+                                                                    // own comment on why plain
+                                                                    // `new` here is portable +
+                                                                    // PSRAM-safe
+    size_t n = build_signed_durations(edges, edge_count, durations, kMaxCombinedDurations);
     if (n == 0) return false;
 
-    // Real spec's own guidance: up to 512 values per RAW_Data: line.
-    // kMaxDurations (511) is always <= that, so exactly one RAW_Data: line
-    // is always sufficient for this project's own captures -- multi-line
-    // splitting is real spec behavior this WRITE side never needs to
-    // exercise (decode(), below, still parses multiple RAW_Data: lines, for
-    // reading real external files that do use them).
-    static_assert(kMaxDurations <= 512, "encode() assumes one RAW_Data line suffices");
+    // Real spec's own guidance: up to 512 values per RAW_Data: line. Before
+    // kMaxDurations was raised past 512 (2026-08-21, see kMaxEdgesPerSignal's
+    // own comment), a single RAW_Data: line always sufficed and this
+    // function never needed to split output -- a static_assert enforced
+    // that invariant and caught it firing the moment the cap grew, exactly
+    // as it should. Now genuinely splits across multiple RAW_Data: lines
+    // every kMaxValuesPerLine values, matching the real spec's own
+    // multi-line convention that decode() (below) already had to parse for
+    // reading real external files.
+    constexpr size_t kMaxValuesPerLine = 512;
 
     int written = std::snprintf(buf, buf_size, "%s\n%s\nFrequency: %u\nPreset: %s\n%s\n%s",
                                  kFiletypeLine, kVersionLine, static_cast<unsigned>(kFrequencyHz),
@@ -190,6 +214,11 @@ bool encode(const Rf433Scan::CapturedSignal &sig, char *buf, size_t buf_size, si
     size_t pos = static_cast<size_t>(written);
 
     for (size_t i = 0; i < n; i++) {
+        if (i > 0 && (i % kMaxValuesPerLine) == 0) {
+            written = std::snprintf(buf + pos, buf_size - pos, "\n%s", kRawDataPrefix);
+            if (written < 0 || pos + static_cast<size_t>(written) >= buf_size) return false;
+            pos += static_cast<size_t>(written);
+        }
         written = std::snprintf(buf + pos, buf_size - pos, " %ld", static_cast<long>(durations[i]));
         if (written < 0 || pos + static_cast<size_t>(written) >= buf_size) return false;
         pos += static_cast<size_t>(written);
@@ -200,6 +229,10 @@ bool encode(const Rf433Scan::CapturedSignal &sig, char *buf, size_t buf_size, si
 
     if (out_len != nullptr) *out_len = pos;
     return true;
+}
+
+bool encode(const Rf433Scan::CapturedSignal &sig, char *buf, size_t buf_size, size_t *out_len) {
+    return encode_raw(sig.edges, sig.edge_count, buf, buf_size, out_len);
 }
 
 bool decode(const char *text, size_t len, Rf433Scan::CapturedSignal *out, bool *out_non_alternating) {
@@ -247,7 +280,8 @@ bool decode(const char *text, size_t len, Rf433Scan::CapturedSignal *out, bool *
 
     // One or more RAW_Data: lines, concatenated -- real spec's own
     // continuation convention for captures over 512 values.
-    static int32_t durations[kMaxDurations];
+    static int32_t *durations = new int32_t[kMaxDurations]; // see build_signed_durations()'s
+                                                             // own comment
     size_t n = 0;
     bool truncated = false;
     bool saw_raw_data = false;
@@ -329,49 +363,83 @@ bool decode(const char *text, size_t len, Rf433Scan::CapturedSignal *out, bool *
     // indices >= edge_count may hold stale data from a previous call, same
     // as `durations` above -- never read, since callers only ever access
     // edges[0..edge_count).
-    static Rf433Scan::CapturedSignal result{};
+    // Heap-allocated (plain `new`, lazy on first call) rather than a plain
+    // static -- see build_signed_durations()'s own comment for why this is
+    // both native-test-portable and PSRAM-safe on target. Zero-initialized
+    // only on the FIRST allocation (`new (...)()` value-initializes once);
+    // entries at indices >= edge_count may hold stale data from a previous
+    // call thereafter, same disclosed behavior as `durations` above -- never
+    // read, since callers only ever access edges[0..edge_count).
+    static Rf433Scan::CapturedSignal *result = new Rf433Scan::CapturedSignal();
     uint32_t t = 0;
     for (size_t k = 0; k < edge_count; k++) {
         if (k == 0) {
-            result.edges[0] = Rf433Common::EdgeSample{0u, durations[0] > 0};
+            result->edges[0] = Rf433Common::EdgeSample{0u, durations[0] > 0};
         } else if (k < n) {
             t += static_cast<uint32_t>(std::abs(durations[k - 1]));
-            result.edges[k] = Rf433Common::EdgeSample{t, durations[k] > 0};
+            result->edges[k] = Rf433Common::EdgeSample{t, durations[k] > 0};
         } else { // k == n
             t += static_cast<uint32_t>(std::abs(durations[n - 1]));
-            result.edges[k] = Rf433Common::EdgeSample{t, !(durations[n - 1] > 0)};
+            result->edges[k] = Rf433Common::EdgeSample{t, !(durations[n - 1] > 0)};
         }
     }
-    result.edge_count = edge_count;
-    result.captured_at_ms = 0;
-    result.capture_id = 0;
-    result.truncated = truncated;
+    result->edge_count = edge_count;
+    result->captured_at_ms = 0;
+    result->capture_id = 0;
+    result->truncated = truncated;
 
-    *out = result;
+    *out = *result;
     return true;
 }
 
 bool write(IStorage &storage, const char *path, const Rf433Scan::CapturedSignal &sig) {
-    // Static: kMaxDurations (511) signed values at up to 12 chars each
-    // (" -2147483648") plus a small fixed header is ~6.5KB -- fine off the
-    // stack, not fine to keep growing this function's own frame with.
-    static char buf[8192];
+    // Heap-allocated, lazy on first call, sized generously for a full
+    // kMaxDurations-value capture (up to 12 chars/value e.g. "-2147483648"
+    // plus a small fixed header and multiple "RAW_Data:" line prefixes once
+    // encode() splits across lines) -- see build_signed_durations()'s own
+    // comment for why plain `new` here is both native-test-portable and
+    // PSRAM-safe on target, unlike a plain `static char buf[...]` at this
+    // size would be.
+    static char *buf = new char[kMaxEncodedTextBytes];
     size_t len = 0;
-    if (!encode(sig, buf, sizeof(buf), &len)) return false;
+    // NOTE: buf is a pointer now (was a plain array) -- sizeof(buf) would
+    // silently be sizeof(char*) (8), not the real buffer size. Always pass
+    // kMaxEncodedTextBytes explicitly here, not sizeof(buf).
+    if (!encode(sig, buf, kMaxEncodedTextBytes, &len)) return false;
+    return storage.write_capture_file(path, reinterpret_cast<const uint8_t *>(buf), len);
+}
+
+bool write_raw(IStorage &storage, const char *path, const Rf433Common::EdgeSample *edges,
+               size_t edge_count) {
+    // Heap-allocated, lazy on first call, sized for the real combined-signal
+    // worst case (kMaxCombinedEncodedTextBytes, see its own comment) -- a
+    // SEPARATE, larger buffer from write()'s own kMaxEncodedTextBytes-sized
+    // one, since this is the path a "Combine -> .sub" call goes through and
+    // needs to hold up to kMaxCombinedEdges worth of encoded text, not just
+    // one signal's worth.
+    static char *buf = new char[kMaxCombinedEncodedTextBytes];
+    size_t len = 0;
+    if (!encode_raw(edges, edge_count, buf, kMaxCombinedEncodedTextBytes, &len)) return false;
     return storage.write_capture_file(path, reinterpret_cast<const uint8_t *>(buf), len);
 }
 
 bool read(IStorage &storage, const char *path, Rf433Scan::CapturedSignal *out) {
-    static char buf[8192];
+    // Heap-allocated, lazy on first call -- see build_signed_durations()'s
+    // own comment for why plain `new` here is both native-test-portable and
+    // PSRAM-safe on target.
+    static char *buf = new char[kMaxEncodedTextBytes];
     size_t len = 0;
-    if (!storage.read_file(path, reinterpret_cast<uint8_t *>(buf), sizeof(buf), &len)) return false;
+    // Same sizeof(buf)-would-be-wrong note as write() above -- buf is a
+    // pointer, use kMaxEncodedTextBytes explicitly.
+    if (!storage.read_file(path, reinterpret_cast<uint8_t *>(buf), kMaxEncodedTextBytes, &len)) return false;
     if (!decode(buf, len, out)) return false;
     // IStorage::read_file()'s own documented contract (hal/istorage.h):
     // *out_len is capped at max_len if the real file was longer. len ==
-    // sizeof(buf) is therefore this call's only signal that the file may
-    // have been truncated -- flagged via the existing CapturedSignal::truncated
-    // field rather than adding a new one (this project's established idiom).
-    if (len == sizeof(buf)) out->truncated = true;
+    // kMaxEncodedTextBytes is therefore this call's only signal that the
+    // file may have been truncated -- flagged via the existing
+    // CapturedSignal::truncated field rather than adding a new one (this
+    // project's established idiom).
+    if (len == kMaxEncodedTextBytes) out->truncated = true;
     return true;
 }
 

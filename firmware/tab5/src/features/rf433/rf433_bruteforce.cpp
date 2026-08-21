@@ -6,6 +6,7 @@
 #include <feature_registry.h>
 #include <lvgl.h>
 #include <Arduino.h>
+#include <esp_heap_caps.h> // heap_caps_malloc()/MALLOC_CAP_SPIRAM -- see s_candidate's own comment
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -252,16 +253,17 @@ uint32_t s_total_codes = 0;
 
 enum class EndReason { kCompleted, kUserStopped, kTransmitFailed };
 
-// One candidate signal, rebuilt fresh each tick. ~28 edges * 8 bytes
-// (EdgeSample) plus bookkeeping is on the order of the same ~4KB static
-// buffer main.cpp's rf433_dump_capture() already keeps on internal DRAM
-// (`static Rf433Common::EdgeSample s_dump[512]`) -- three orders of
-// magnitude below the 64KB kMaxCapturedSignals*sizeof(CapturedSignal)
-// allocation that made rf433_scan.cpp's session buffer a real PSRAM-
-// allocation requirement (see that file's s_signals comment). No
-// heap_caps_malloc needed here for the same reason that buffer didn't need
-// one either.
-Rf433Scan::CapturedSignal s_candidate;
+// One candidate signal, rebuilt fresh each tick. Only ~28 edges are ever
+// actually populated (see build_candidate()'s own comment on why this can
+// never approach kMaxEdgesPerSignal), but sizeof(CapturedSignal) is fixed by
+// that compile-time constant regardless of runtime usage -- UPDATED
+// 2026-08-21: now that kMaxEdgesPerSignal is 4096 (was 512, see its own
+// comment), a plain global here would be ~32KB of internal DRAM, back in
+// the exhaustion class rf433_scan.cpp's s_signals comment already
+// documents. Heap-allocated in PSRAM (register_module(), same pattern) even
+// though only a tiny fraction of it is ever used, since the ALLOCATION size
+// is what matters for internal-DRAM pressure, not the usage pattern.
+Rf433Scan::CapturedSignal *s_candidate = nullptr;
 
 // UI widgets. Null when the screen isn't open (same convention as
 // rf433_scan.cpp's s_status_label et al.) -- every UI-touching function
@@ -443,6 +445,18 @@ void start() { ScreenStack::push(build_screen()); }
 } // namespace
 
 void register_module() {
+    // See s_candidate's own declaration comment. Same refuse-rather-than-
+    // silently-fall-back-to-internal-DRAM pattern as rf433_scan.cpp's
+    // s_signals/s_accum_edges allocations.
+    s_candidate = static_cast<Rf433Scan::CapturedSignal *>(
+        heap_caps_malloc(sizeof(Rf433Scan::CapturedSignal), MALLOC_CAP_SPIRAM));
+    if (!s_candidate) {
+        Serial.printf("quarky-tab5: [rf433-bruteforce] heap_caps_malloc(%u bytes, "
+                      "MALLOC_CAP_SPIRAM) FAILED -- PSRAM appears unusable. "
+                      "RF433 Bruteforce will not be registered.\n",
+                      (unsigned)sizeof(Rf433Scan::CapturedSignal));
+        return;
+    }
     g_registry.register_module({"rf433_bruteforce", "RF433 Bruteforce",
                                  Category::RF433, Affinity::TAB5_NATIVE,
                                  start, nullptr});
@@ -458,8 +472,8 @@ void poll() {
         return;
     }
 
-    build_candidate(s_protocol_idx, s_current_code, s_candidate);
-    Rf433Replay::transmit(s_candidate);
+    build_candidate(s_protocol_idx, s_current_code, *s_candidate);
+    Rf433Replay::transmit(*s_candidate);
 
     if (!Rf433Replay::is_busy()) {
         // transmit() refused outright -- see Rf433Replay::transmit()'s doc

@@ -94,7 +94,8 @@ static uint32_t s_selected_capture_id = 0; // 0 = sentinel "nothing selected" --
 // one .sub file. A SEPARATE selection mode from the single-selection above
 // (s_selected_capture_id): row taps toggle membership in this small ordered
 // set instead of replacing a single selection, while Select mode is on.
-constexpr int kMaxChainSignals = 8;
+// kMaxChainSignals itself now lives in rf433_scan.h (moved 2026-08-21) so
+// rf433_sub_format.h can size its own combine-specific buffers off it.
 static bool s_select_mode = false;
 static uint32_t s_chain_ids[kMaxChainSignals] = {0};
 static int s_chain_count = 0;
@@ -133,14 +134,21 @@ static lv_obj_t *s_load_sd_btn = nullptr;
 static lv_obj_t *s_loaded_status_label = nullptr;
 static lv_obj_t *s_loaded_replay_btn = nullptr;
 static lv_obj_t *s_loaded_replay_status_label = nullptr;
-// Not PSRAM-backed like s_signals[] -- this is a single CapturedSignal
-// (~4.1KB: 512 edges * 8 bytes + bookkeeping), not an array of
-// kMaxCapturedSignals(16) of them, so it doesn't reproduce the internal-DRAM
-// exhaustion s_signals' own allocation comment documents. `static` (not a
-// build_screen()-local) so the loaded signal survives Back/reopen, matching
-// s_signals'/s_signal_count's own session-persistence, and so it is never a
-// dangling stack reference by the time a Replay tap reads it.
-static CapturedSignal s_loaded_signal;
+// UPDATED 2026-08-21, real-hardware finding: this comment used to argue a
+// single CapturedSignal (~4.1KB at the old 512-edge kMaxEdgesPerSignal)
+// didn't need PSRAM the way s_signals[] (an ARRAY of kMaxCapturedSignals of
+// them) did. That stopped being true the moment kMaxEdgesPerSignal was
+// raised to 4096 (see its own comment) -- a single CapturedSignal is now
+// ~32KB, and a plain static global here would be exactly the same
+// internal-DRAM-exhaustion class s_signals' own allocation comment
+// documents (confirmed by inspecting the compiled object: this symbol was
+// 0x8010 = 32784 bytes of .bss before this fix). Heap-allocated in PSRAM
+// (register_module(), same pattern) instead. Still a POINTER, not a
+// build_screen()-local, for the same reason as before: survives Back/
+// reopen, matching s_signals'/s_signal_count's own session-persistence, and
+// is never a dangling stack reference by the time a Replay tap reads it --
+// heap allocation makes that even more true, not less.
+static CapturedSignal *s_loaded_signal = nullptr;
 static bool s_has_loaded_signal = false;
 static char s_loaded_path[160];
 
@@ -148,7 +156,12 @@ static bool s_active = false;
 static uint32_t s_last_edge_time_us = 0;
 static size_t s_accum_edge_count = 0;
 static bool s_accum_truncated = false;
-static Rf433Common::EdgeSample s_accum_edges[kMaxEdgesPerSignal];
+// Heap-allocated in PSRAM (register_module(), same reasoning/pattern as
+// s_signals' own allocation comment) rather than a plain static array --
+// at the current kMaxEdgesPerSignal (4096) a plain static here would be
+// 32KB of internal DRAM, squarely back in the exhaustion class that
+// allocation exists to prevent.
+static Rf433Common::EdgeSample *s_accum_edges = nullptr;
 static uint32_t s_next_capture_id = 1;
 
 // Gap threshold (in microseconds) to delimit end of an RF burst.
@@ -280,7 +293,7 @@ static void toggle_chain_membership(uint32_t capture_id) {
 }
 
 // Concatenates the chained signals' real edge timing (in tap order) into one
-// synthetic CapturedSignal, separated by kBurstGapThresholdUs (the same real
+// synthetic edge array, separated by kBurstGapThresholdUs (the same real
 // 25ms burst-boundary constant this project already uses to decide "this is
 // a new press, not a continuation" -- rf433_scan.cpp's own capture logic,
 // reused here rather than inventing a new gap value). Each segment's OWN
@@ -290,8 +303,18 @@ static void toggle_chain_membership(uint32_t capture_id) {
 // this edge" (rf433_common.h), so simply offsetting the next segment's
 // timestamps forward already represents the prior level being held for the
 // gap's duration, which is exactly correct silence semantics.
-static bool build_chain_signal(CapturedSignal *out) {
-    *out = CapturedSignal{};
+//
+// Writes into a RAW edges[]/out_edge_count pair rather than a CapturedSignal
+// (real-hardware follow-up, 2026-08-21): CapturedSignal's edges[] array is
+// fixed at kMaxEdgesPerSignal, the right bound for one live capture but not
+// for a combined file built from several of them -- the project owner asked
+// specifically whether a combined file should be able to exceed the
+// per-signal cap, and it now can, up to max_out_edges (see
+// Rf433SubFormat::kMaxCombinedEdges' own comment for the real sizing).
+static bool build_chain_signal(Rf433Common::EdgeSample *out_edges, size_t max_out_edges,
+                               size_t *out_edge_count, bool *out_truncated) {
+    *out_edge_count = 0;
+    *out_truncated = false;
     uint32_t running_offset = 0;
     bool any = false;
     for (int c = 0; c < s_chain_count; c++) {
@@ -305,22 +328,21 @@ static bool build_chain_signal(CapturedSignal *out) {
         uint32_t seg_base = seg->edges[0].timestamp_us;
         size_t i = 0;
         for (; i < seg->edge_count; i++) {
-            if (out->edge_count >= kMaxEdgesPerSignal) {
-                out->truncated = true;
+            if (*out_edge_count >= max_out_edges) {
+                *out_truncated = true;
                 break;
             }
-            out->edges[out->edge_count].timestamp_us =
+            out_edges[*out_edge_count].timestamp_us =
                 running_offset + (seg->edges[i].timestamp_us - seg_base);
-            out->edges[out->edge_count].level = seg->edges[i].level;
-            out->edge_count++;
+            out_edges[*out_edge_count].level = seg->edges[i].level;
+            (*out_edge_count)++;
         }
-        if (out->edge_count >= kMaxEdgesPerSignal) break;
+        if (*out_edge_count >= max_out_edges) break;
         uint32_t seg_duration = seg->edges[seg->edge_count - 1].timestamp_us - seg_base;
         running_offset += seg_duration + kBurstGapThresholdUs;
-        if (seg->truncated) out->truncated = true; // a source segment was itself truncated
+        if (seg->truncated) *out_truncated = true; // a source segment was itself truncated
     }
-    out->captured_at_ms = millis();
-    return any && out->edge_count > 0;
+    return any && *out_edge_count > 0;
 }
 
 static void add_signal_to_list(const CapturedSignal &sig) {
@@ -547,8 +569,8 @@ static void update_loaded_status_label() {
     }
     char buf[200];
     std::snprintf(buf, sizeof(buf), "Loaded: %s (%u edges)%s", s_loaded_path,
-                  (unsigned)s_loaded_signal.edge_count,
-                  s_loaded_signal.truncated ? " [truncated]" : "");
+                  (unsigned)s_loaded_signal->edge_count,
+                  s_loaded_signal->truncated ? " [truncated]" : "");
     lv_label_set_text(s_loaded_status_label, buf);
 }
 
@@ -566,7 +588,7 @@ static void on_sub_file_selected(const char *path, void * /*user_data*/) {
     // that's surfaced via update_loaded_status_label()'s "[truncated]" suffix,
     // the same idiom rf433_scan.cpp's own add_signal_to_list() already uses
     // for live-capture truncation.
-    bool ok = Rf433SubFormat::read(storage, s_loaded_path, &s_loaded_signal);
+    bool ok = Rf433SubFormat::read(storage, s_loaded_path, s_loaded_signal);
     s_has_loaded_signal = ok;
     if (!ok) {
         Serial.printf("quarky-tab5: [rf433-scan] Failed to load .sub file '%s' -- not a "
@@ -574,8 +596,8 @@ static void on_sub_file_selected(const char *path, void * /*user_data*/) {
                       s_loaded_path);
     } else {
         Serial.printf("quarky-tab5: [rf433-scan] Loaded '%s': %u edges%s\n", s_loaded_path,
-                      (unsigned)s_loaded_signal.edge_count,
-                      s_loaded_signal.truncated ? " (TRUNCATED)" : "");
+                      (unsigned)s_loaded_signal->edge_count,
+                      s_loaded_signal->truncated ? " (TRUNCATED)" : "");
     }
     update_loaded_status_label();
     update_replay_status_ui(); // re-evaluates s_loaded_replay_btn's disabled state
@@ -796,8 +818,25 @@ static lv_obj_t *build_screen() {
             }
             return;
         }
-        CapturedSignal combined{};
-        bool ok = build_chain_signal(&combined);
+        // Heap-allocated (plain `new`, lazy on first call), NOT a stack
+        // local -- real-hardware crash found and fixed 2026-08-21: at the
+        // OLD kMaxEdgesPerSignal (512), a stack-local CapturedSignal here
+        // was borderline (~4KB); after raising it, the SAME kind of
+        // stack-local would be a real overflow risk inside an LVGL
+        // click-handler callback running on the main/LVGL task (confirmed
+        // to crash with SW_CPU_RESET the moment this button was actually
+        // tapped, before this buffer became heap-allocated). Sized to
+        // Rf433SubFormat::kMaxCombinedEdges (not kMaxEdgesPerSignal) --
+        // real follow-up, same day: a combined file is now allowed to
+        // exceed any single signal's own cap (see that constant's own
+        // comment), so this scratch buffer must be sized for the combine
+        // case specifically, not reused from a single-signal-sized one.
+        static Rf433Common::EdgeSample *combined_edges =
+            new Rf433Common::EdgeSample[Rf433SubFormat::kMaxCombinedEdges];
+        size_t combined_edge_count = 0;
+        bool combined_truncated = false;
+        bool ok = build_chain_signal(combined_edges, Rf433SubFormat::kMaxCombinedEdges,
+                                     &combined_edge_count, &combined_truncated);
         char buf[128];
         if (!ok) {
             std::snprintf(buf, sizeof(buf), "All %d chained signals were evicted -- nothing to combine.",
@@ -806,14 +845,14 @@ static lv_obj_t *build_screen() {
             char path[96];
             std::snprintf(path, sizeof(path), "%s/chain_%u.sub", kSubFileDir,
                           (unsigned)s_chain_ids[0]);
-            bool wrote = Rf433SubFormat::write(storage, path, combined);
+            bool wrote = Rf433SubFormat::write_raw(storage, path, combined_edges, combined_edge_count);
             if (wrote) {
                 std::snprintf(buf, sizeof(buf), "Saved %d-signal chain to %s (%u edges)%s",
-                              s_chain_count, path, (unsigned)combined.edge_count,
-                              combined.truncated ? " [truncated]" : "");
+                              s_chain_count, path, (unsigned)combined_edge_count,
+                              combined_truncated ? " [truncated]" : "");
                 Serial.printf("quarky-tab5: [rf433-scan] combined %d signals -> %s (%u edges)%s\n",
-                              s_chain_count, path, (unsigned)combined.edge_count,
-                              combined.truncated ? " TRUNCATED" : "");
+                              s_chain_count, path, (unsigned)combined_edge_count,
+                              combined_truncated ? " TRUNCATED" : "");
                 // Reset the chain on success, same "done, start fresh" idiom
                 // Clear uses for the live-capture list.
                 s_chain_count = 0;
@@ -857,7 +896,7 @@ static lv_obj_t *build_screen() {
         // button -- see rf433_replay.h's doc comment: exactly one
         // safety-reviewed transmit path (GPIO53 arbiter + RX/TX exclusion),
         // never a second one for SD-loaded signals.
-        Rf433Replay::transmit(s_loaded_signal);
+        Rf433Replay::transmit(*s_loaded_signal);
     }, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_state(s_loaded_replay_btn, LV_STATE_DISABLED); // update_replay_status_ui()
                                                                // (below) re-derives this
@@ -983,6 +1022,34 @@ void register_module() {
                       "risking the internal-DRAM exhaustion this allocation "
                       "exists to prevent).\n",
                       (unsigned)(sizeof(CapturedSignal) * kMaxCapturedSignals));
+        return;
+    }
+    // Same reasoning/pattern as s_signals just above -- see s_accum_edges'
+    // own declaration comment.
+    s_accum_edges = static_cast<Rf433Common::EdgeSample *>(
+        heap_caps_malloc(sizeof(Rf433Common::EdgeSample) * kMaxEdgesPerSignal, MALLOC_CAP_SPIRAM));
+    if (!s_accum_edges) {
+        Serial.printf("quarky-tab5: [rf433-scan] heap_caps_malloc(%u bytes, "
+                      "MALLOC_CAP_SPIRAM) FAILED for s_accum_edges -- PSRAM "
+                      "appears unusable. RF433 Scan will not be registered.\n",
+                      (unsigned)(sizeof(Rf433Common::EdgeSample) * kMaxEdgesPerSignal));
+        heap_caps_free(s_signals);
+        s_signals = nullptr;
+        return;
+    }
+    // Same reasoning/pattern as s_signals/s_accum_edges above -- see
+    // s_loaded_signal's own declaration comment.
+    s_loaded_signal = static_cast<CapturedSignal *>(
+        heap_caps_malloc(sizeof(CapturedSignal), MALLOC_CAP_SPIRAM));
+    if (!s_loaded_signal) {
+        Serial.printf("quarky-tab5: [rf433-scan] heap_caps_malloc(%u bytes, "
+                      "MALLOC_CAP_SPIRAM) FAILED for s_loaded_signal -- PSRAM "
+                      "appears unusable. RF433 Scan will not be registered.\n",
+                      (unsigned)sizeof(CapturedSignal));
+        heap_caps_free(s_signals);
+        s_signals = nullptr;
+        heap_caps_free(s_accum_edges);
+        s_accum_edges = nullptr;
         return;
     }
     g_registry.register_module({"rf433_scan", "RF433 Scan/Capture",

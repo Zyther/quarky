@@ -695,13 +695,18 @@ size_t build_durations(const Rf433Scan::CapturedSignal &sig, unsigned int *out, 
 bool decode(const Rf433Scan::CapturedSignal &sig, DecodedCode *out) {
     if (out == nullptr) return false;
 
-    // static, not stack-local: kMaxDurations (511) * sizeof(unsigned int) is
-    // ~2KB, which is fine to keep off the stack, but it does mean this
-    // buffer lives in .bss and decode() is NOT reentrant/thread-safe -- two
-    // concurrent callers would clobber each other's duration array. This
-    // project calls decode() from a single task's poll loop today, so it is
-    // not a live bug, just a constraint worth a caller reading this to know.
-    static unsigned int dur[kMaxDurations];
+    // Heap-allocated (plain `new`, lazy on first call) rather than a plain
+    // static array -- UPDATED 2026-08-21: kMaxDurations now scales with
+    // Rf433Scan::kMaxEdgesPerSignal (4096, was 512), making a plain static
+    // here ~16KB of internal DRAM, the same exhaustion class
+    // rf433_scan.cpp's s_signals comment documents. Plain `new` is portable
+    // to the native host test target (plain heap there) and this project's
+    // real, verified sdkconfig (CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096)
+    // routes it to PSRAM automatically on the real target. Still not
+    // reentrant/thread-safe (a single function-static buffer either way) --
+    // this project calls decode() from a single task's poll loop today, so
+    // that remains a constraint worth knowing, not a live bug.
+    static unsigned int *dur = new unsigned int[kMaxDurations];
     size_t count = build_durations(sig, dur, kMaxDurations);
     // SubGhzDecoders::decode()'s own guard, count < 8: SubGhzDecoders.cpp:1866.
     if (count < 8) return false;
