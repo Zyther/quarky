@@ -41,6 +41,24 @@ constexpr uint32_t kRmtTickHz = 1000000;
 // real-hardware confirmation -- a genuine remote button held down, checking
 // whether one press yields one clean frame or gets cut mid-frame / merges
 // repeats.
+//
+// SECOND thing to confirm in that same real-hardware pass (raised by an
+// independent review round, 2026-08-21): this module arms ONE
+// rmtReadAsync() call per Start-Capture tap and never re-arms while
+// State::kWaiting, relying on the assumption that a still-idle input
+// (nothing pressed yet) does NOT itself trigger a premature "done" via this
+// threshold -- i.e. that the idle-gap timer only starts counting once the
+// FIRST real edge arrives, not from the moment rmtInit()/rmtReadAsync() was
+// called. Espressif's own public ESP-IDF RMT docs state this plainly
+// ("the actual reception starts at the first level change of the received
+// signal"), which is why this module is built the way it is -- but the
+// exact register-level behavior lives in `rmt_ll_rx_enable()`, which
+// wasn't available to verify directly in this project's toolchain (only
+// prebuilt .a libs, no HAL source). If real-hardware testing shows a
+// capture completing near-instantly with 0 pulses regardless of whether a
+// button was pressed, THIS is the assumption to revisit first -- the fix
+// would be re-arming rmtReadAsync() in poll() whenever a completion
+// contains no real mark data, rather than surfacing that as State::kFailed.
 constexpr uint16_t kIdleThresholdTicks = 8000; // 8ms
 
 // Neither of these is measurable from an already-demodulated RX signal (see
@@ -242,7 +260,13 @@ bool start_capture() {
         return false;
     }
 
-    rmtSetRxMaxThreshold(TAB5_IR_RX_GPIO, kIdleThresholdTicks);
+    if (!rmtSetRxMaxThreshold(TAB5_IR_RX_GPIO, kIdleThresholdTicks)) {
+        Serial.println("quarky-tab5: [ir-learn] rmtSetRxMaxThreshold() FAILED");
+        teardown_rx();
+        std::snprintf(s_error, sizeof(s_error), "rmtSetRxMaxThreshold() failed");
+        s_state = State::kFailed;
+        return false;
+    }
     // Deliberately NOT calling rmtSetRxMinThreshold(): rmtInit() calloc's a
     // fresh bus object (esp32-hal-rmt.c), which zero-initializes
     // signal_range_min_ns -- the noise filter is already disabled (0 ==
@@ -271,7 +295,13 @@ bool start_capture() {
     // default is already "no demodulation" -- this call is made anyway so
     // that fact is explicit in this file rather than an unstated assumption
     // about a framework default that could change later.
-    rmtSetCarrier(TAB5_IR_RX_GPIO, false, false, 0, 0);
+    if (!rmtSetCarrier(TAB5_IR_RX_GPIO, false, false, 0, 0)) {
+        Serial.println("quarky-tab5: [ir-learn] rmtSetCarrier() FAILED");
+        teardown_rx();
+        std::snprintf(s_error, sizeof(s_error), "rmtSetCarrier() failed");
+        s_state = State::kFailed;
+        return false;
+    }
 
     s_rx_symbol_count = kMaxRxSymbols; // capacity in; rmtReadAsync() updates
                                        // this to the actual count once the
