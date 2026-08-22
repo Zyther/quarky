@@ -660,16 +660,61 @@ Write the real unit identity (M5Stack "Unit IR", SKU U002), the IRM-3638T citati
 
 **Context:** Unlike the original Cardputer-ADV plan (transmit-only, receive unconfirmed), this dedicated unit is receive+transmit by design per the spec (added 2026-08-18) — this row is no longer conditional on confirming receive hardware exists, only on Task 15 having confirmed the real receive protocol. Port Bruce's `IRremoteESP8266`-fork-based decode logic or Poseidon's `ir_learn.cpp`/`ir_learn_decode.cpp`, adapted the same way Task 16 adapted transmit.
 
-- [ ] **Step 1: Implement the receive-capture path against Task 15's real API**
-- [ ] **Step 2: Port protocol decode logic (NEC, RC5, etc. — whatever the ported donor code covers)**
-- [ ] **Step 3: Build the screen (capture + decoded-result display)**
+**CORRECTED 2026-08-21 (real hardware confirmed; scope narrowed to match this
+task's own Produces line), same pattern as Task 15/16's own in-place
+corrections:**
+
+1. The Context paragraph above was written when Task 15's real receive
+   chip/protocol was still unknown ("whatever real receive API Task 15's
+   chip provides"). That is now fully resolved: the real hardware (M5Stack
+   "Unit IR" SKU U002) is NOT I2C — it's a plain 4-wire GPIO transceiver, RX
+   on `TAB5_IR_RX_GPIO` (GPIO54). The RX chip is IRM-3638T (Everlight
+   Electronics), a 38kHz-carrier-**demodulating** receiver module — its
+   output pin is already a clean, demodulated digital mark/space signal
+   (confirmed on real hardware in Task 15's bring-up spike: idles HIGH,
+   pulls LOW during real IR bursts). See `firmware/tab5/src/hal/ir_unit.h`
+   for the full citation trail.
+2. This task's own **Produces** line above already specifies a RAW
+   pulse-width capture (`pulse_widths_us[kMaxPulses]`, no address/command
+   fields) — inconsistent with this Context paragraph's "port protocol
+   decode logic (NEC, RC5, etc.)" and Step 2 below. That inconsistency is
+   resolved in favor of the Produces line: **this task is RAW capture
+   only.** NEC/RC5/Sony bit-level protocol decode is explicitly OUT OF
+   SCOPE for this pass — it needs real-hardware timing-threshold tuning
+   well beyond what's warranted right now, and the existing
+   `IrFileFormat`/`.ir` raw-signal infrastructure (Task 21, already
+   committed) already fully supports a raw capture without it. Step 2 below
+   is therefore marked done as "descoped", not implemented.
+
+Implementation: `firmware/tab5/src/features/ir/ir_learn.h`/`.cpp`. Captures
+via Arduino-ESP32's `esp32-hal-rmt.h` RX-mode API (`rmtInit(..., RMT_RX_MODE,
+...)`, `rmtReadAsync()`/`rmtReceiveCompleted()` — non-blocking, per the
+Task 15 watchdog-reset lesson every other multi-second IR/RF433 operation in
+this codebase already follows), converts the resulting `rmt_data_t` symbols
+into `LearnedCode` (mirror image of `ir_common.cpp`'s TX-side packing, with
+an explicit active-low level inversion documented in `ir_learn.cpp`'s
+`convert_symbols_to_code()`), and is trivially convertible to
+`IrFileFormat::IrSignal` via the new `IrLearn::to_ir_signal()` so a capture
+can be saved with the existing `IrFileFormat::write()` (SD path:
+`/quarky/captures/ir/learn_<ms>.ir`, matching this project's existing
+per-feature `/quarky/captures/<domain>/` convention). RMT RX carrier
+demodulation is explicitly disabled (`rmtSetCarrier(TAB5_IR_RX_GPIO, false,
+false, 0, 0)`) since the IRM-3638T already demodulates in hardware — enabling
+RMT's own demodulation on top of that would corrupt every capture. The
+idle-gap threshold that ends a capture (`kIdleThresholdTicks`, 8ms) is a
+reasoned **starting value pending real-hardware confirmation** — see its own
+comment in `ir_learn.cpp` — not yet verified against a real remote.
+
+- [x] **Step 1: Implement the receive-capture path against Task 15's real API** — `IrLearn::start_capture()`/`poll()`, non-blocking `rmtReadAsync()`/`rmtReceiveCompleted()`.
+- [x] **Step 2: Port protocol decode logic (NEC, RC5, etc.)** — DESCOPED 2026-08-21, see correction note above. Not implemented; raw capture only.
+- [x] **Step 3: Build the screen (capture + decoded-result display)** — Start Capture/Cancel toggle, live status, Save to SD (.ir).
 - [ ] **Step 4: PAUSE FOR HARDWARE, then verify against a real remote**
 
-**PAUSE FOR HARDWARE:** confirm IR unit connected, project owner has a real IR remote ready to point at it. Wait for confirmation.
+**PAUSE FOR HARDWARE:** confirm IR unit connected, project owner has a real IR remote ready to point at it. Wait for confirmation. **Not yet run — this step is deliberately left unchecked; real-hardware verification (including the 8ms idle-threshold value above) is being held back for the project owner to run separately, matching this project's standing practice of pausing before hardware checkpoints.**
 
 - [ ] **Step 5: Commit**
 
-**Model:** Opus — protocol-timing-sensitive against a still-freshly-characterized chip from Task 15, matching this project's tiering for timing-sensitive work on newly-bridged hardware.
+**Model:** Opus — protocol-timing-sensitive against a still-freshly-characterized chip from Task 15, matching this project's tiering for timing-sensitive work on newly-bridged hardware. (Implemented 2026-08-21 per the correction above: with protocol decode descoped, the remaining work is RMT RX API usage against an already-characterized, non-timing-decoded signal — lower-risk than the original Opus-tier framing assumed, but the model tier itself is left as originally planned rather than second-guessed here.)
 
 ---
 

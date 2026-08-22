@@ -50,6 +50,12 @@
 #include "features/ir/ir_tvbgone.h" // Phase 3 Task 16: TV-B-Gone (Category::IR),
                                     // transmits via features/ir/ir_common.h's
                                     // RMT-based IrCommon::transmit_raw()
+#include "features/ir/ir_learn.h" // Phase 3 Task 17: IR raw capture (Category::IR)
+                                  // -- receives via RMT RX on TAB5_IR_RX_GPIO
+                                  // (GPIO54, IRM-3638T), no named-protocol
+                                  // decode (scope corrected 2026-08-21, see
+                                  // ir_learn.h's header and the plan doc's
+                                  // Task 17 section)
 #include "features/ble/ble_scan.h"
 #include "features/ble/ble_spam.h"
 #include "features/ble/ble_finder.h"
@@ -429,6 +435,11 @@ void setup() {
     // Task 16 (Phase 3): TV-B-Gone (Category::IR) -- first IR-category tile.
     IrTvbGone::register_module();
 
+    // Task 17 (Phase 3): IR raw capture (Category::IR) -- receives on the IR
+    // unit's RX side (TAB5_IR_RX_GPIO / GPIO54, IRM-3638T). Raw pulse-width
+    // capture only, no NEC/RC5/Sony decode -- see ir_learn.h's header.
+    IrLearn::register_module();
+
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
     Serial.println("quarky-tab5: lvgl ready");
@@ -663,6 +674,10 @@ void loop() {
     IrTvbGone::poll(); // Phase 3 Task 16: no-ops unless a TV-B-Gone sweep is
                        // active; one code per tick, gated by its own real
                        // inter-code millis() timer -- see ir_tvbgone.h
+    IrLearn::poll(); // Phase 3 Task 17: no-ops unless a capture is armed;
+                     // checks rmtReceiveCompleted() (non-blocking) and only
+                     // does any work once the RMT RX channel's idle
+                     // threshold has actually fired -- see ir_learn.h
     WifiSpectrumFeature::poll(); // no-ops unless the WiFi Spectrum screen is open
     WifiConnectFeature::poll();  // no-ops unless a connect is in flight; drains the
                                   // background connect_task()'s result -- real-hardware
