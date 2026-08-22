@@ -720,20 +720,143 @@ comment in `ir_learn.cpp` — not yet verified against a real remote.
 
 ## Task 18: Universal remote / multi-profile clone (Flipper-IRDB)
 
+**CORRECTED/EXPANDED 2026-08-22**, after the project owner loaded a real,
+full copy of the community Flipper-IRDB onto the Tab5's SD card at
+`/quarky/ir/flipperdb/` and the controller inspected it directly on real
+hardware (via temporary, bounded serial-debug triggers — a whole-tree
+recursive walk, then a single-file read — both added, used, and removed;
+see the SDD ledger for the full trail, including a real task-watchdog
+crash the first, unbounded walk caused). Three real findings change this
+task's scope from what was originally assumed:
+
+1. **The real directory structure is deep and inconsistent, not flat.**
+   Examples actually observed: `flipperdb/Window_cleaners/HOBOT/*.ir` (2
+   levels under the IRDB root) and
+   `flipperdb/_Converted_/IR_Plus/R/REVOX/*.ir` (4 levels under the root).
+   The existing generic file browser (Task 22, `ui/file_browser.h`) is
+   explicitly flat/single-directory only (`IStorage::list_files()` skips
+   subdirectories entirely, by design) and cannot navigate this. **Project
+   owner's explicit choice** (asked directly, given the tradeoff against a
+   simpler flat searchable index): build a REAL folder-by-folder
+   navigator — list a directory's subfolders AND matching files, tap a
+   folder to descend, a Back/up control to ascend — mirroring the actual
+   on-disk layout rather than flattening it. This requires a new
+   `IStorage` primitive to list subdirectory names (not just files) — see
+   Step 0 below.
+2. **The real SD card also contains thousands of macOS AppleDouble
+   sidecar files** (`._Something.ir`, ~4096 bytes each, one per real file
+   — an artifact of copying the IRDB onto the SD card via a Mac/Finder).
+   These match a naive `*.ir` extension filter (the filename genuinely
+   ends in `.ir`) but are not real signal files. Both the new directory
+   listing and the existing file listing MUST explicitly reject any
+   filename starting with `._` (or, more generally, `.`) in addition to
+   the extension filter, or this feature will show/attempt-to-parse
+   thousands of garbage entries.
+3. **Real sample files are predominantly `type: parsed`, not `type:
+   raw`.** Two real files were read in full
+   (`Window_cleaners/HOBOT/Hobot_2S.ir`, `HOBOT.ir`) and BOTH were 100%
+   `type: parsed` entries using the `NEC` and `NECext` protocol names —
+   zero raw signals in either file. NEC-family protocols are the
+   overwhelming majority real-world consumer-IR protocol, so this
+   corpus-wide pattern should be assumed to hold broadly, not treated as
+   a fluke of these two samples. **This means Task 18 cannot be useful
+   against most of the real database without implementing real NEC/NECext
+   protocol ENCODING** (address+command bytes → mark/space timing) — raw-
+   signal-only playback (what `IrCommon::transmit_raw()` already provides
+   verbatim) would leave nearly the whole corpus unusable. This is new,
+   real, load-bearing scope this task's original text did not anticipate.
+
+   Real NEC timing, cited from Flipper's own real firmware source
+   (`lib/infrared/encoder_decoder/nec/infrared_protocol_nec_i.h`, dev
+   branch, fetched 2026-08-22 — the same real primary-source discipline
+   this project has followed all session, e.g. crapto1/MFRC522_I2C/
+   ST25R3916):
+   - Header: 9000µs mark, 4500µs space.
+   - Each bit: 560µs mark, then EITHER 560µs space (logical 0) OR 1690µs
+     space (logical 1).
+   - A final 560µs mark terminates the last bit's space.
+   - `NEC`: 8-bit address + 8-bit command, each followed by its own
+     bitwise-COMPLEMENT byte to fill the real 32-bit frame (the complement
+     bytes are DERIVED, not separately meaningful data) — consistent with
+     the real `HOBOT.ir` sample's `address: 00 00 00 00` / `command: 0D 00
+     00 00` (only the first byte of each 4-byte field is real; the rest is
+     zero-padding, not frame content).
+   - `NECext`: the full 16-bit address and 16-bit command fields are
+     transmitted as literally stored (no complement derivation) —
+     consistent with the real `Hobot_2S.ir` sample's `address: C5 1F 00
+     00` / `command: 0D F2 00 00` (two real bytes each; note 0xF2 is
+     bitwise-NOT of 0x0D purely because THIS specific remote's own command
+     byte happens to be self-complementary here, not because NECext
+     itself derives it — do not assume that holds for other NECext files).
+   - Other real protocol names the .ir format documents (`NEC42`,
+     `NEC42ext`, `Samsung32`, `RC5`, `RC5X`, `RC6`, `SIRC`/`SIRC15`/
+     `SIRC20`, `Kaseikyo`, `RCA`, `Pioneer`) exist in the real corpus too
+     (not yet sampled directly) — NEC/NECext are this task's real,
+     evidence-based minimum scope; an unrecognized protocol name must be
+     refused with a clear on-screen message (this project's established
+     "refuse rather than lie" convention), never silently mis-encoded or
+     asserted/crashed on.
+
 **Files:**
-- Create: `firmware/tab5/src/features/ir/ir_clone.h`
-- Create: `firmware/tab5/src/features/ir/ir_clone.cpp`
-- Modify: `firmware/tab5/src/main.cpp`
+- Create: `firmware/tab5/src/features/ir/ir_nec_encode.h`/`.cpp` — pure,
+  host-testable NEC/NECext address+command → mark/space duration array
+  encoder (no Arduino/hardware dependency, matching Task 7's/Task 21's
+  established host-testable-module pattern). Real sample data from the
+  two files read this session make good real host-native test fixtures.
+- Create: `firmware/tab5/src/features/ir/ir_clone.h`/`.cpp` — the
+  browse/select/send screen and per-command-button UI (see Step 2).
+- Modify: `firmware/tab5/src/hal/istorage.h`/`storage_sd.h`/`.cpp` — add
+  a `list_dirs(dir, names_out, max_names)` primitive (immediate
+  subdirectory names only, no recursion — same shape as `list_files()`),
+  with the same `._`-prefix rejection this task's Step 1 needs for files.
+- Modify: `firmware/tab5/src/main.cpp`.
 
 **Interfaces:**
-- Consumes: `IrLearn::LearnedCode` (Task 17), `IrCommon::transmit_raw` (Task 16).
-- Produces: `namespace IrClone { void register_module(); }`.
+- Consumes: `IrFileFormat::IrSignal`/`decode()`/`read()` (Task 21,
+  already committed — parses both `kRaw` and `kParsed` signal shapes),
+  `IrCommon::transmit_raw()` (Task 16), the new `IStorage::list_dirs()`.
+- Produces: `namespace IrNecEncode { bool encode(const IrFileFormat::IrSignal &sig, uint16_t *durations_out, size_t max_durations, size_t *out_count, uint32_t *out_carrier_hz); }`
+  (pure, host-testable; returns false for an unrecognized `protocol`
+  name — see the refusal convention above) and
+  `namespace IrClone { void register_module(); }`.
+- NOT consuming `IrLearn::LearnedCode` (Task 17) — that was this task's
+  original assumed interface, but Task 17's real capture and this task's
+  real "send a known community-database profile" both converge on the
+  same real currency, `IrFileFormat::IrSignal`, so there is no need for
+  this task to depend on Task 17's capture-specific struct at all.
 
-**Context:** Port UniGeek's Flipper-IRDB-compatible database/parsing logic per the spec ("most valuable single piece to port here — gives access to a large existing community remote database"). This is largely transport-independent (parsing a known file format into pulse-width sequences) so most of this task's logic is host-testable without hardware, using Task 7's precedent for host-native table-driven tests against real sample `.ir`/Flipper-format files.
+**Context (original, still true):** Port UniGeek's Flipper-IRDB-compatible
+parsing logic per the spec ("most valuable single piece to port here —
+gives access to a large existing community remote database"). The parser
+itself already exists (Task 21's `IrFileFormat::decode()`/`read()`) — this
+task's real remaining parsing work is the NEC/NECext ENCODE direction
+(protocol+address+command → timing), which is new, not a port of existing
+decode logic.
 
-- [ ] **Step 1: Port the Flipper-IRDB format parser, with a host-native test against a real sample file**
-- [ ] **Step 2: Build the profile-browse-and-send screen**
-- [ ] **Step 3: PAUSE FOR HARDWARE, then verify at least one profile against a real device**
+- [ ] **Step 0: Add `IStorage::list_dirs()`** (and its `StorageSD`
+  implementation) — immediate-subdirectory names only, `._`-prefix
+  entries rejected the same way Step 1's file listing must be.
+- [ ] **Step 1: Implement `ir_nec_encode.{h,cpp}` (NEC + NECext), with
+  host-native tests against the two real sample files read this session**
+  (`Hobot_2S.ir`'s `NECext` entries, `HOBOT.ir`'s `NEC` entries) — real
+  fixture data, not synthetic, matching Task 7/21's own precedent for
+  host-testable modules.
+- [ ] **Step 2: Build the browse-and-send screen** — real folder-by-folder
+  navigator (per the project owner's explicit choice) rooted at
+  `/quarky/ir` (or wherever the real IRDB root is confirmed to be — verify
+  against real hardware, don't hardcode blindly from this session's one
+  observed path), descending into subfolders, listing `.ir` files (each
+  potentially containing MULTIPLE named signals per file — the real
+  samples had ~11-12 named buttons each), and — directly satisfying the
+  project owner's own earlier explicit requirement from this session
+  ("each command in an IR file is represented by a button when the IR
+  file is loaded") — rendering one button per parsed signal once a file
+  is opened, each wired to encode (if `kParsed`) or pass through (if
+  `kRaw`) into `IrCommon::transmit_raw()`.
+- [ ] **Step 3: PAUSE FOR HARDWARE, then verify at least one real profile
+  against a real device** — ideally one of the two real files already
+  read this session (a real HOBOT window-cleaner robot, if available, or
+  any other NEC/NECext-protocol device the project owner has on hand).
 - [ ] **Step 4: Commit**
 
 **Model:** Sonnet.
