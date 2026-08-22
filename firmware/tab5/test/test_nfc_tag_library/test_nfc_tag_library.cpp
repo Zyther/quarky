@@ -84,6 +84,8 @@ public:
         return count;
     }
 
+    int list_dirs(const char *, char[][64], int) override { return 0; } // unused by these tests
+
 private:
     struct Entry {
         bool used = false;

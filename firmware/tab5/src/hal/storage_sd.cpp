@@ -237,7 +237,44 @@ int StorageSD::list_files(const char *dir, const char *ext_filter, char names_ou
         if (!entry.isDirectory()) {
             const char *name = entry.name(); // basename, not full path (FS.h)
             size_t name_len = strlen(name);
-            if (name_len > ext_len && strcmp(name + name_len - ext_len, ext_filter) == 0) {
+            // Task 18 finding (2026-08-22): the real on-SD-card
+            // Flipper-IRDB copy also contains thousands of macOS
+            // AppleDouble sidecar files (`._Something.ir`, one per real
+            // file -- an artifact of copying the database onto the SD
+            // card via a Mac/Finder). These match a naive extension
+            // filter just as well as the real file, so reject any name
+            // starting with '.' (covers AppleDouble and ordinary
+            // dotfiles/hidden entries alike) before the extension check.
+            if (name[0] != '.' && name_len > ext_len &&
+                strcmp(name + name_len - ext_len, ext_filter) == 0) {
+                strncpy(names_out[count], name, 63);
+                names_out[count][63] = '\0';
+                count++;
+            }
+        }
+        entry = d.openNextFile();
+    }
+    return count;
+}
+
+int StorageSD::list_dirs(const char *dir, char names_out[][64], int max_names) {
+    File d = SD_MMC.open(dir);
+    if (!d || !d.isDirectory()) return 0;
+
+    // Same unbounded-scan guard as list_files() above, same reasoning
+    // (Task 18 review precedent: this project already fixed exactly this
+    // class of bug once for list_files()).
+    constexpr int kMaxEntriesScanned = 256;
+    int count = 0;
+    int visited = 0;
+    File entry = d.openNextFile();
+    while (entry && count < max_names && visited < kMaxEntriesScanned) {
+        visited++;
+        if (entry.isDirectory()) {
+            const char *name = entry.name(); // basename, not full path (FS.h)
+            // Same dotfile rejection as list_files() -- a directory whose
+            // name starts with '.' is never a real IRDB category folder.
+            if (name[0] != '.') {
                 strncpy(names_out[count], name, 63);
                 names_out[count][63] = '\0';
                 count++;

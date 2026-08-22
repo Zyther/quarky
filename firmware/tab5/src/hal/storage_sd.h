@@ -16,4 +16,5 @@ public:
     bool append_capture_file(const char *path, const uint8_t *data, size_t len) override;
     bool read_file(const char *path, uint8_t *out, size_t max_len, size_t *out_len) override;
     int list_files(const char *dir, const char *ext_filter, char names_out[][64], int max_names) override;
+    int list_dirs(const char *dir, char names_out[][64], int max_names) override;
 };

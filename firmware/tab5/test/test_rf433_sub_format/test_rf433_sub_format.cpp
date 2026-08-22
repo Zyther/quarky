@@ -48,6 +48,7 @@ public:
         return true;
     }
     int list_files(const char *, const char *, char[][64], int) override { return 0; }
+    int list_dirs(const char *, char[][64], int) override { return 0; } // unused by these tests
 
 private:
     char path_[128] = {};

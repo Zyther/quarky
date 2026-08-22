@@ -833,15 +833,35 @@ task's real remaining parsing work is the NEC/NECext ENCODE direction
 (protocol+address+command → timing), which is new, not a port of existing
 decode logic.
 
-- [ ] **Step 0: Add `IStorage::list_dirs()`** (and its `StorageSD`
+- [x] **Step 0: Add `IStorage::list_dirs()`** (and its `StorageSD`
   implementation) — immediate-subdirectory names only, `._`-prefix
-  entries rejected the same way Step 1's file listing must be.
-- [ ] **Step 1: Implement `ir_nec_encode.{h,cpp}` (NEC + NECext), with
+  entries rejected the same way Step 1's file listing must be. Done:
+  `hal/istorage.h`'s new pure-virtual `list_dirs()`, implemented in
+  `hal/storage_sd.cpp` (mirrors `list_files()`'s own
+  `kMaxEntriesScanned`-bounded scan). `list_files()` itself previously had
+  NO dotfile filter at all — added one there too (real finding: the naive
+  `.ir`-extension check alone matches AppleDouble sidecar files just as
+  well as real signal files). Both existing `IStorage`-derived test doubles
+  (`test_rf433_sub_format.cpp`, `test_nfc_tag_library.cpp`) updated with a
+  trivial `list_dirs()` override so `pio test -e native` still links.
+- [x] **Step 1: Implement `ir_nec_encode.{h,cpp}` (NEC + NECext), with
   host-native tests against the two real sample files read this session**
   (`Hobot_2S.ir`'s `NECext` entries, `HOBOT.ir`'s `NEC` entries) — real
   fixture data, not synthetic, matching Task 7/21's own precedent for
-  host-testable modules.
-- [ ] **Step 2: Build the browse-and-send screen** — real folder-by-folder
+  host-testable modules. Done: `features/ir/ir_nec_encode.{h,cpp}`, real
+  timing/bit-order/complement details independently re-verified against
+  Flipper Devices' own real firmware source (`infrared_protocol_nec_i.h`,
+  `infrared_encoder_nec.c`, `infrared_common_encoder.c`, `dev` branch,
+  fetched 2026-08-22) rather than trusting only this section's own
+  paraphrase — confirmed: LSB-first bit order within each byte, byte order
+  = transmission order, NEC assembles `[address, ~address, command,
+  ~command]` (complement derived), NECext assembles `[address[0],
+  address[1], command[0], command[1]]` verbatim (no complement). 6 new
+  tests in `test/test_ir_nec_encode/test_ir_nec_encode.cpp`, including one
+  that decodes a verbatim embedded copy of `Hobot_2S.ir`'s real text via
+  `IrFileFormat::decode()` before encoding, proving the full real pipeline.
+  All pass under `pio test -e native` (45/45 total, no regressions).
+- [x] **Step 2: Build the browse-and-send screen** — real folder-by-folder
   navigator (per the project owner's explicit choice) rooted at
   `/quarky/ir` (or wherever the real IRDB root is confirmed to be — verify
   against real hardware, don't hardcode blindly from this session's one
@@ -852,11 +872,31 @@ decode logic.
   ("each command in an IR file is represented by a button when the IR
   file is loaded") — rendering one button per parsed signal once a file
   is opened, each wired to encode (if `kParsed`) or pass through (if
-  `kRaw`) into `IrCommon::transmit_raw()`.
+  `kRaw`) into `IrCommon::transmit_raw()`. Done: `features/ir/ir_clone.{h,cpp}`,
+  rooted at `/quarky/ir` (one level above the confirmed real
+  `flipperdb/` prefix, so a future sibling category folder is browsable
+  too). Each directory level is its own `ScreenStack`-pushed screen
+  instance; the standard Back button (already wired to `ScreenStack::pop()`
+  by every screen via `screen_scaffold.h`) doubles as the "ascend one
+  level" control, so no separate Up affordance was built. Unrecognized
+  protocols surface "Protocol not supported: <name>" on the status label
+  rather than silently failing. Registered under `Category::IR`/
+  `Affinity::TAB5_NATIVE`; no `poll()` (one blocking `transmit_raw()` call
+  per button tap, same risk class as `ir_tvbgone.cpp`'s own per-code
+  transmit). `pio run -e tab5` builds clean. **Not yet real-hardware
+  verified against the actual SD card contents or a real IR receiver** —
+  see Step 3.
 - [ ] **Step 3: PAUSE FOR HARDWARE, then verify at least one real profile
   against a real device** — ideally one of the two real files already
   read this session (a real HOBOT window-cleaner robot, if available, or
   any other NEC/NECext-protocol device the project owner has on hand).
+  Also worth confirming during this pass: (a) `ScreenStack::kMaxDepth`
+  (8) is close to the worst real observed nesting depth (root + flipperdb
+  + up to 4 more real levels + a file's signal screen = 7-8) — if a
+  deeper real branch exists, `ScreenStack::push()` silently stops tracking
+  depth rather than crashing, which would make Back misbehave, not lock
+  up; (b) that `list_dirs()`/`list_files()`'s dotfile rejection actually
+  clears the real AppleDouble corpus on the real SD card end to end.
 - [ ] **Step 4: Commit**
 
 **Model:** Sonnet.

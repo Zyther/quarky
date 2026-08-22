@@ -39,4 +39,27 @@ public:
     // or mount() was never called. Added alongside read_file() for the same
     // reason (wifi_evil_portal.cpp's template picker).
     virtual int list_files(const char *dir, const char *ext_filter, char names_out[][64], int max_names) = 0;
+
+    // Lists immediate SUBDIRECTORY basenames (not full paths, not files) of
+    // dir, writing up to max_names entries (each up to 63 chars + NUL) into
+    // names_out. Non-recursive -- one directory level only. Returns the
+    // number of entries actually written -- 0 if dir doesn't exist, has no
+    // subdirectories, or mount() was never called. Added for Task 18
+    // (ir_clone.cpp)'s real folder-by-folder Flipper-IRDB navigator: the
+    // real on-SD-card database (`/quarky/ir/flipperdb/...`) is deep and
+    // inconsistent in depth (2 levels in one observed real branch, 4 in
+    // another), so a flat list_files()-only browser (Task 22's
+    // ui/file_browser.h, deliberately scoped out of recursing -- see its own
+    // header) cannot navigate it; this primitive plus repeated list_files()
+    // calls, one directory at a time, is what lets ir_clone.cpp do so
+    // without ever walking the whole tree in one call (a whole-tree walk is
+    // what caused a real task-watchdog reset this session -- see the Task 18
+    // plan section).
+    //
+    // Same dotfile-rejection contract as list_files() (see StorageSD's real
+    // implementation): any entry whose basename starts with '.' is skipped,
+    // not just AppleDouble sidecar files (`._Something`) -- the real SD copy
+    // of the Flipper-IRDB contains thousands of these, one per real file,
+    // from being copied onto the SD card via a Mac/Finder.
+    virtual int list_dirs(const char *dir, char names_out[][64], int max_names) = 0;
 };

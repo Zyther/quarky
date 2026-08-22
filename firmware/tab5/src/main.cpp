@@ -56,6 +56,11 @@
                                   // decode (scope corrected 2026-08-21, see
                                   // ir_learn.h's header and the plan doc's
                                   // Task 17 section)
+#include "features/ir/ir_clone.h" // Phase 3 Task 18: universal remote / multi-
+                                  // profile clone against the real, on-SD-card
+                                  // Flipper-IRDB copy (/quarky/ir/flipperdb/) --
+                                  // recursive folder navigator + NEC/NECext
+                                  // encode via ir_nec_encode.h (see ir_clone.h)
 #include "features/ble/ble_scan.h"
 #include "features/ble/ble_spam.h"
 #include "features/ble/ble_finder.h"
@@ -439,6 +444,11 @@ void setup() {
     // unit's RX side (TAB5_IR_RX_GPIO / GPIO54, IRM-3638T). Raw pulse-width
     // capture only, no NEC/RC5/Sony decode -- see ir_learn.h's header.
     IrLearn::register_module();
+
+    // Task 18 (Phase 3): IR Clone -- browse/select/send against the real
+    // on-SD-card Flipper-IRDB copy (/quarky/ir/flipperdb/...), encoding real
+    // NEC/NECext `type: parsed` signals via ir_nec_encode.h. See ir_clone.h.
+    IrClone::register_module();
 
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
