@@ -631,14 +631,17 @@ Write the real unit identity (M5Stack "Unit IR", SKU U002), the IRM-3638T citati
 
 **Context:** Simplest IR feature per the spec (static code-database transmit). Port Bruce's `src/modules/ir/` or Poseidon's `ir_tvbgone.cpp` code-database and transmit-loop logic, adapted to Task 15's real transmit API (donor code assumes a bit-banged GPIO LED, not an I2C transceiver — the adaptation layer is `ir_common.cpp`, isolating every other IR feature task from needing to know the physical unit's real protocol).
 
-- [ ] **Step 1: Implement `ir_common.cpp`'s transmit adaptation layer against Task 15's real API**
-- [ ] **Step 2: Port the TV-B-Gone code database and per-tick transmit loop**
-- [ ] **Step 3: Build the screen**
-- [ ] **Step 4: PAUSE FOR HARDWARE, then verify against a real TV**
+- [x] **Step 1: Implement `ir_common.cpp`'s transmit adaptation layer against Task 15's real API** -- done via the ESP32-P4's real RMT peripheral (`esp32-hal-rmt.h`), not bit-banging or an IRremoteESP8266-style library (see ir_common.h's own header comment for why). `IrCommon::init()`/`deinit()`/`transmit_raw()`.
 
-**PAUSE FOR HARDWARE:** confirm IR unit connected, project owner has a real TV in range and ready to observe. Wait for confirmation.
+- [x] **Step 2: Port the TV-B-Gone code database and per-tick transmit loop** -- vendored Bruce's real Gen3 NA/EU database (`world_ir_codes.h`, CC-BY-SA, 271 codes, cross-validated byte-identical against a second independent donor checkout, UniGeek's TVBGoneData.h, for its first 8522 lines). Decode algorithm (`read_bits()`/bit-packed `codes[]` unpacking) reimplemented in `ir_tvbgone.cpp`, cross-validated against both donors' own transmit loops. Non-blocking, poll()-driven -- one code per tick, gated by the real 205ms inter-code delay both donors use -- per the lesson from Task 15's own watchdog-reset finding.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 3: Build the screen** -- NA/EU region toggle (2 checkable buttons, matching `nfc_mifare_crack.cpp`'s established replacement for the buggy `lv_dropdown`), Start/Stop, progress bar + status label, matching `rf433_bruteforce.cpp`'s established screen conventions.
+
+- [x] **Step 4: PAUSE FOR HARDWARE, then verify against a real TV**
+
+**PAUSE FOR HARDWARE:** confirm IR unit connected, project owner has a real TV in range and ready to observe. Wait for confirmation. **DONE, with a real bug found and fixed along the way (2026-08-21):** first real-hardware attempt (real LG TV, ~10ft) produced no response at any range/aim, with zero errors logged (init/transmit all reported success). The project owner independently cross-checked with two OTHER real implementations on the same TV: Poseidon's own Cardputer-ADV TV-B-Gone port (bit-banged carrier, 6-brand subset) also failed; UniGeek's own port (the exact same 271-code NA/EU database this port vendors) SUCCEEDED at the same ~10ft range. That cross-check pointed squarely at this port's own transmit path, not the TV/range/database. Root-caused by reading the REAL ESP-IDF source (not just `esp32-hal-rmt.h`'s own misleading doc comment): `rmtSetCarrier()`'s `carrier_level` parameter passes straight through to `rmt_carrier_config_t::flags.polarity_active_low`, whose real doc comment (`rmt_types.h`) states the default (false) modulates the carrier onto the HIGH/mark level -- this port had been passing `true`, inverting that, so the carrier was gated onto "space" segments instead of "mark", producing a completely wrong signal regardless of code accuracy. Fixed (`ir_common.cpp`, `rmtSetCarrier(..., false, ...)`), reflashed, re-tested against the same real LG TV at the same range: **PASS**, confirmed by the project owner.
+
+- [x] **Step 5: Commit**
 
 **Model:** Sonnet.
 

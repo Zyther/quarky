@@ -47,6 +47,9 @@
                                               // via Rf433Replay::transmit()
                                               // (own launcher tile, unlike
                                               // Replay above)
+#include "features/ir/ir_tvbgone.h" // Phase 3 Task 16: TV-B-Gone (Category::IR),
+                                    // transmits via features/ir/ir_common.h's
+                                    // RMT-based IrCommon::transmit_raw()
 #include "features/ble/ble_scan.h"
 #include "features/ble/ble_spam.h"
 #include "features/ble/ble_finder.h"
@@ -423,6 +426,9 @@ void setup() {
     // Task 8 (Phase 3): RF433 fixed-code bruteforce UI (Category::RF433).
     Rf433Bruteforce::register_module();
 
+    // Task 16 (Phase 3): TV-B-Gone (Category::IR) -- first IR-category tile.
+    IrTvbGone::register_module();
+
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
     Serial.println("quarky-tab5: lvgl ready");
@@ -654,6 +660,9 @@ void loop() {
                              // is active; after Rf433Replay::poll() above so
                              // is_busy()/state() are fresh this tick before
                              // deciding whether to fire the next candidate
+    IrTvbGone::poll(); // Phase 3 Task 16: no-ops unless a TV-B-Gone sweep is
+                       // active; one code per tick, gated by its own real
+                       // inter-code millis() timer -- see ir_tvbgone.h
     WifiSpectrumFeature::poll(); // no-ops unless the WiFi Spectrum screen is open
     WifiConnectFeature::poll();  // no-ops unless a connect is in flight; drains the
                                   // background connect_task()'s result -- real-hardware
