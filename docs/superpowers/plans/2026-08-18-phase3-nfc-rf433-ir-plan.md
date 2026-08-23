@@ -948,9 +948,9 @@ decode logic.
 
 **Context:** Continuous-noise transmit per the spec. Simplest remaining IR task.
 
-- [ ] **Step 1: Implement continuous noise-pattern transmit, poll()-driven with a Stop button (never a blocking loop, per Global Constraints)**
-- [ ] **Step 2: PAUSE FOR HARDWARE, then verify real IR noise is observable (e.g. via a phone camera, which can usually see IR LEDs)**
-- [ ] **Step 3: Commit**
+- [x] **Step 1: Implement continuous noise-pattern transmit, poll()-driven with a Stop button (never a blocking loop, per Global Constraints)** -- Done: `features/ir/ir_jammer.{h,cpp}`, one bounded `esp_random()`-seeded burst (20 mark/space pairs, 150-900us each -- real range chosen to match the timing consumer-IR protocols themselves use, per this project's own cited NEC constants) per `poll()` tick via `IrCommon::transmit_raw()`.
+- [x] **Step 2: PAUSE FOR HARDWARE, then verify real IR noise is observable (e.g. via a phone camera, which can usually see IR LEDs)** -- **CONFIRMED on real hardware 2026-08-23**: project owner observed the IR LED visibly, erratically flickering through a phone camera during a jam session ("works, good stuff").
+- [x] **Step 3: Commit** -- `5218d6b`.
 
 **Model:** Haiku/cheapest tier.
 
