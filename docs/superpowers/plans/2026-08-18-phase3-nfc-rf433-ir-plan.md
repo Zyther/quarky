@@ -531,7 +531,36 @@ Expect real retry/timeout constant tuning during hardware bring-up per the spec'
 
 ## Task 12: SRIX tag tool
 
-**Files:**
+**DEFERRED 2026-08-23 -- real scope mismatch found, project owner's explicit
+decision, not abandoned silently.** This task's own "low-effort port" framing
+turned out to rest on the same wrong donor-chip assumption this project has
+corrected repeatedly (Tasks 2/3/4/11/15): Bruce's real SRIX module
+(`~/src/firmware/lib/PN532_SRIX/pn532_srix.{h,cpp}`,
+`src/modules/rfid/srix_tool.{h,cpp}`) is PN532-specific top to bottom --
+`#include <Adafruit_PN532.h>`, raw PN532 I2C command framing -- and this
+project has no PN532. Checked what a real, non-PN532 port would actually
+need before proceeding blind: the real ST25R3916 (NFC unit) DOES support
+ISO 14443-B at the silicon level (confirmed via the real RFAL reference
+driver's own bundled examples --
+`~/src/wilson-elechouse/ST25R3916/ST25R3916_ELECHOUSE/examples/*/`
+`*_scan_14443AB_15693.ino`, `*_iso14443b_ndef_write_test.ino`), but THIS
+project's own `st25r3916_driver.{h,cpp}` only implements the polled NFC-A
+reader path (Tasks 2/4) -- 14443-B support doesn't exist in it yet, and
+per Task 4's own established finding RFAL itself can't be used unmodified
+on this hardware (no IRQ pin), so a real 14443-B path would need the same
+"port RFAL's real sequence into polled-register code" treatment Task 2/4
+already did once for 14443-A. SRIX tags themselves also layer ST's own
+proprietary command set (INITIATE/SELECT/GET UID/READ BLOCK, real ST SRIX4K
+datasheet territory) on TOP of that PHY, not just generic 14443-B framing.
+Net: this is real, comparable-scope protocol research to Task 24's Listen
+Mode work, not a quick port -- and there is no real SRIX tag on hand to
+verify against regardless. Project owner's explicit direction: note this as
+a real, disclosed Phase 3 deficiency (not a fabricated pass, not silently
+dropped) and revisit after every other phase is complete, likely bundled
+with Task 24's own 14443-B/protocol-mode research since both need the same
+real foundational work.
+
+**Files (unchanged from the original plan, not yet created):**
 - Create: `firmware/tab5/src/features/nfc/nfc_srix.h`
 - Create: `firmware/tab5/src/features/nfc/nfc_srix.cpp`
 - Modify: `firmware/tab5/src/main.cpp`
@@ -539,14 +568,16 @@ Expect real retry/timeout constant tuning during hardware bring-up per the spec'
 **Interfaces:**
 - Produces: `namespace NfcSrix { void register_module(); }`.
 
-**Context:** ISO 14443-B, low-effort port per the spec ("less common but low-effort port"). Port Bruce's SRIX module directly.
+**Context:** ISO 14443-B, low-effort port per the spec ("less common but low-effort port"). Port Bruce's SRIX module directly. **See the DEFERRED note above -- this framing is now known to be wrong; do not dispatch an implementer against this text as-is.**
 
-- [ ] **Step 1: Port Bruce's SRIX read/dump logic**
-- [ ] **Step 2: Build the screen**
-- [ ] **Step 3: PAUSE FOR HARDWARE, then verify against a real SRIX tag if the project owner has one** (if not available, note this in the task report as untested-for-lack-of-hardware rather than silently skipping the checkpoint discipline — a real, disclosed gap, not a fabricated pass)
-- [ ] **Step 4: Commit**
+- [ ] **Step 1: Port Bruce's SRIX read/dump logic** -- NOT DONE. Real replacement scope: research + implement real 14443-B PHY support in `st25r3916_driver.cpp` (comparable to Task 24's own Listen Mode research) plus SRIX's own proprietary command layer, cited from ST's real SRIX4K datasheet, not ported from Bruce's PN532-specific code.
+- [ ] **Step 2: Build the screen** -- NOT DONE.
+- [ ] **Step 3: PAUSE FOR HARDWARE, then verify against a real SRIX tag if the project owner has one** -- NOT DONE. No SRIX tag currently on hand; this checkpoint remains real and required whenever this task is picked back up, not waived.
+- [ ] **Step 4: Commit** -- NOT DONE.
 
-**Model:** Haiku/cheapest tier.
+**Model:** Was Haiku/cheapest tier under the original (wrong) low-effort
+framing -- re-tier when this is picked back up; real scope now matches
+Task 24's own Opus-for-research-then-Sonnet-for-implementation split.
 
 ---
 
