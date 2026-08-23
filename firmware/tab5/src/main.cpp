@@ -61,6 +61,9 @@
                                   // Flipper-IRDB copy (/quarky/ir/flipperdb/) --
                                   // recursive folder navigator + NEC/NECext
                                   // encode via ir_nec_encode.h (see ir_clone.h)
+#include "features/ir/ir_jammer.h" // Phase 3 Task 19: continuous randomized-
+                                   // noise transmit via ir_common.h's
+                                   // IrCommon::transmit_raw(). See ir_jammer.h.
 #include "features/ble/ble_scan.h"
 #include "features/ble/ble_spam.h"
 #include "features/ble/ble_finder.h"
@@ -450,6 +453,10 @@ void setup() {
     // NEC/NECext `type: parsed` signals via ir_nec_encode.h. See ir_clone.h.
     IrClone::register_module();
 
+    // Task 19 (Phase 3): IR Jammer -- continuous randomized-noise transmit
+    // via IrCommon::transmit_raw(). See ir_jammer.h.
+    IrJammer::register_module();
+
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
     Serial.println("quarky-tab5: lvgl ready");
@@ -701,6 +708,9 @@ void loop() {
                      // checks rmtReceiveCompleted() (non-blocking) and only
                      // does any work once the RMT RX channel's idle
                      // threshold has actually fired -- see ir_learn.h
+    IrJammer::poll(); // Phase 3 Task 19: no-ops unless a jam session is
+                      // active; one bounded randomized-noise burst per
+                      // tick -- see ir_jammer.h
     WifiSpectrumFeature::poll(); // no-ops unless the WiFi Spectrum screen is open
     WifiConnectFeature::poll();  // no-ops unless a connect is in flight; drains the
                                   // background connect_task()'s result -- real-hardware
