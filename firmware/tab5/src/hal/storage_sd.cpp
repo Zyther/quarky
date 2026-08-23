@@ -2,6 +2,7 @@
 #include <SD_MMC.h> // Tab5's SD is SDIO-attached, not SPI
 #include <cstring> // strncpy (ensure_parent_dirs)
 #include <cstdio>  // snprintf (posix_path)
+#include <cstdlib> // qsort -- see scan_dir()'s own sort comment
 #include <dirent.h> // opendir/readdir/d_type -- see scan_dir()'s own comment
                     // for the real measured reason this replaced the
                     // Arduino FS openNextFile() loop these two functions
@@ -293,6 +294,23 @@ constexpr char kSdMountpoint[] = "/sdcard";
 // folder measured 236 raw entries for 117 real subdirectories).
 constexpr int kMaxEntriesScanned = 512;
 
+// qsort() comparator for names_out[]'s fixed-width entries -- plain
+// case-sensitive strcmp. Real question this answers (2026-08-23, project
+// owner): "is directory-list ordering a side effect of being memory
+// bound?" No -- readdir() (and Arduino's openNextFile() before it) simply
+// returns entries in raw on-disk/filesystem order, never sorted; nothing
+// about the O(N^2)-scan fix or the LVGL memory-pool fix touches ordering
+// at all. Case-sensitive is deliberate, not an oversight: the real
+// Flipper-IRDB corpus's own category names are consistently
+// Title_Case_With_Underscores (confirmed directly -- ACs, Audio_and_
+// Video_Receivers, TVs, Window_cleaners, etc.), so plain ASCII strcmp
+// already gives the alphabetical order a human expects for this real
+// data; a case-INSENSITIVE sort would be needed for a corpus that mixed
+// case inconsistently, which this one doesn't.
+int compare_names(const void *a, const void *b) {
+    return strcmp(static_cast<const char *>(a), static_cast<const char *>(b));
+}
+
 // Shared body of both public listers. `want_dirs` selects DT_DIR vs DT_REG;
 // `ext_filter` is applied to files only (nullptr = accept any).
 int scan_dir(const char *dir, bool want_dirs, const char *ext_filter, char names_out[][64], int max_names) {
@@ -325,6 +343,15 @@ int scan_dir(const char *dir, bool want_dirs, const char *ext_filter, char names
         count++;
     }
     closedir(d);
+    // Alphabetize before returning -- readdir() gives raw on-disk order,
+    // not sorted (see compare_names()'s own comment). Cheap regardless of
+    // the real per-directory entry counts this project has actually seen
+    // (up to 236 raw/117 real for the largest real folder measured,
+    // flipperdb/TVs) -- qsort() on <= kMaxEntriesScanned fixed-width
+    // 64-byte strings is negligible next to the real directory-scan I/O
+    // cost this same function's own header comment measures in
+    // milliseconds.
+    qsort(names_out, count, sizeof(names_out[0]), compare_names);
     return count;
 }
 

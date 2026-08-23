@@ -227,9 +227,26 @@ lv_obj_t *build_file_screen(const char *path) {
 
     // One button per parsed signal -- directly satisfies the project
     // owner's own explicit requirement ("each command in an IR file is
-    // represented by a button when the IR file is loaded").
+    // represented by a button when the IR file is loaded"). Laid out as a
+    // 4-column wrapping grid (project owner's own explicit request,
+    // 2026-08-23 -- the plain vertical stack this used before made a
+    // real file's ~11-12 signals, let alone the largest real files this
+    // corpus can produce, an unnecessarily long scroll). Same real
+    // btn_grid idiom already established in this codebase
+    // (rf433_scan.cpp's own button row: lv_obj_create() child +
+    // LV_FLEX_FLOW_ROW_WRAP + pad_all/pad_gap for the row/column padding),
+    // just at 4 columns (LV_PCT(23) per button, leaving room for 3
+    // inter-column gaps) instead of rf433_scan.cpp's 3.
+    lv_obj_t *btn_grid = lv_obj_create(content);
+    lv_obj_set_width(btn_grid, LV_PCT(100));
+    lv_obj_set_height(btn_grid, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btn_grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_all(btn_grid, 2, 0);
+    lv_obj_set_style_pad_gap(btn_grid, 4, 0);
+
     for (size_t i = 0; i < n; i++) {
-        lv_obj_t *btn = lv_button_create(content);
+        lv_obj_t *btn = lv_button_create(btn_grid);
+        lv_obj_set_width(btn, LV_PCT(23));
         lv_obj_t *lbl = lv_label_create(btn);
         lv_label_set_text(lbl, signals[i].name);
         lv_obj_add_event_cb(btn, on_signal_click, LV_EVENT_CLICKED, &signals[i]);
