@@ -77,8 +77,63 @@
 #define LV_STDARG_INCLUDE       <stdarg.h>
 
 #if LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN
-    /*Size of the memory available for `lv_malloc()` in bytes (>= 2kB)*/
-    #define LV_MEM_SIZE (64 * 1024U)          /*[bytes]*/
+    // -------------------------------------------------------------------
+    // lv_mem lives in PSRAM, and is 1 MB, not 64 kB.
+    //
+    // THIS PREVENTS TWO DISTINCT REAL CRASHES, it is not headroom tuning.
+    // Measured on the physical Tab5 2026-08-23 while bisecting the IR Clone
+    // (features/ir/ir_clone.cpp) folder-navigator crash, via lv_mem_monitor()
+    // printed either side of every screen push:
+    //
+    //   POST /quarky/ir/flipperdb   lv_mem free=288  used=100%  frag=17%
+    //   [lvgl] [Error] lv_draw_add_task: Asserted at expression:
+    //                  new_task != NULL (Out of memory) lv_draw.c:106
+    //
+    // A single directory screen costs ~2 kB of chrome plus ~700 BYTES PER
+    // LIST ROW (measured: 32 rows consumed 22560 B, 27 rows 19272 B, 11 rows
+    // 8756 B). At the module's own 32-entry listing cap that is ~25 kB --
+    // 39% of a 64 kB pool for ONE screen. The navigator is recursive and
+    // ScreenStack keeps every parent screen alive underneath the top one
+    // (screen_stack.cpp's pop() deletes only the top), so THREE stacked
+    // real directories of the real Flipper-IRDB exhaust the pool. That is
+    // not an exotic depth: `/quarky/ir/flipperdb` alone lists 32.
+    //
+    // Exhaustion is fatal in one of two ways, both observed, depending only
+    // on which lv_malloc() happens to be the one that fails first:
+    //
+    //  1. lv_draw.c:106's lv_draw_add_task() has LV_ASSERT_MALLOC, and
+    //     LV_ASSERT_HANDLER is `while(1);` -> loopTask spins at priority 1
+    //     and the task WDT aborts the board. Confirmed by decoding the
+    //     register dump: MEPC == RA == 0x4000d444 == lv_draw_add_task at
+    //     lv_draw.c:106, reached from lv_obj_redraw (lv_refr.c:129).
+    //
+    //  2. lv_draw_sw_fill.c:90's `mask_buf = lv_malloc(clipped_w)` has NO
+    //     NULL check and NO assert at all, so line 162's
+    //     `lv_memset(mask_buf, opa, clipped_w)` writes to address 0:
+    //     "Store access fault ... MCAUSE 0x7, MTVAL 0x00000000". That is
+    //     the originally-reported IR Clone crash, and it is an upstream
+    //     LVGL 9.5.0 bug we cannot fix without patching vendored source.
+    //     Only keeping the pool from running dry avoids it. (Rounded
+    //     corners are what puts a widget on this path -- `rout > 0` -- so
+    //     essentially every button in this UI reaches it.)
+    //
+    // Note this is a DIFFERENT pool from the one ui/lvgl_port.cpp's
+    // psram_draw_buf_malloc() fixed on 2026-08-12. That covers the
+    // lv_draw_buf handlers (layer + image buffers); verified against the
+    // real vendored source, lv_draw_layer_alloc_buf() (lv_draw.c:503) does
+    // go through lv_draw_buf_create() -> lv_draw_buf_create_ex(
+    // &default_handlers,...) -> the registered buf_malloc_cb, so layers
+    // were already covered. lv_malloc()/lv_mem -- every widget, style,
+    // label string and draw task -- was not, and never had been.
+    //
+    // PSRAM rather than a bigger static array because the array is .bss
+    // (LV_ATTRIBUTE_LARGE_RAM_ARRAY) and internal RAM is the scarce
+    // resource here (~420 kB total headroom, shared with every task stack
+    // and the radio stacks), while the board has ~32 MB of SPIRAM. These
+    // are CPU-only structures -- nothing DMAs out of lv_mem -- so the same
+    // "no cache maintenance needed" argument lvgl_port.cpp makes for draw
+    // buffers applies, and the far hotter draw buffer already lives there.
+    #define LV_MEM_SIZE (1024 * 1024U)        /*[bytes]*/
 
     /*Size of the memory expand for `lv_malloc()` in bytes*/
     #define LV_MEM_POOL_EXPAND_SIZE 0
@@ -87,8 +142,12 @@
     #define LV_MEM_ADR 0     /*0: unused*/
     /*Instead of an address give a memory allocator that will be called to get a memory pool for LVGL. E.g. my_malloc*/
     #if LV_MEM_ADR == 0
-        #undef LV_MEM_POOL_INCLUDE
-        #undef LV_MEM_POOL_ALLOC
+        // Consumed by lv_mem_core_builtin.c:79 as
+        // lv_tlsf_create_with_pool((void *)LV_MEM_POOL_ALLOC(LV_MEM_SIZE),
+        // LV_MEM_SIZE), once, from lv_init(). Arduino's startup has brought
+        // SPIRAM up long before setup() calls lvgl_port_init().
+        #define LV_MEM_POOL_INCLUDE <esp_heap_caps.h>
+        #define LV_MEM_POOL_ALLOC(size) heap_caps_malloc((size), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
     #endif
 #endif  /*LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN*/
 

@@ -66,6 +66,15 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 // beyond what the display driver already does for its own buffer). LVGL's
 // builtin pool is left to widgets/styles alone, which it comfortably fits:
 // the whole 21-row scan list measured 36% of it.
+//
+// FOLLOW-UP 2026-08-23: "which it comfortably fits" did not hold. The
+// builtin pool (lv_malloc/lv_mem, a SEPARATE pool from the draw-buf
+// handlers routed below) was exhausted for real by IR Clone's recursive
+// folder navigator at ~700 bytes per list row across stacked screens, and
+// exhausting it crashes two different ways -- one of them an unchecked NULL
+// write inside LVGL itself. That pool now lives in PSRAM at 1 MB; see
+// include/lv_conf.h's LV_MEM_SIZE/LV_MEM_POOL_ALLOC block for the real
+// measurements and both failure signatures.
 static void *psram_draw_buf_malloc(size_t size, lv_color_format_t) {
     // LVGL's own default over-allocates by LV_DRAW_BUF_ALIGN - 1 so that
     // align_pointer_cb can round the returned pointer up inside the block;

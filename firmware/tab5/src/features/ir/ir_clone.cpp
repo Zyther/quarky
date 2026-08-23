@@ -30,11 +30,31 @@ namespace {
 // hardcoding the flipperdb name itself anywhere in this module.
 constexpr char kRootDir[] = "/quarky/ir";
 
-// Bounded per-directory-level listing capacity -- same generous-for-real-
-// use bound as ui/file_browser.h's own kMaxEntries(32), for the identical
-// reason (a directory of SD-copied community files, not unbounded RAM).
-constexpr int kMaxDirEntries = 32;
-constexpr int kMaxFileEntries = 32;
+// Bounded per-directory-level listing capacity. Raised 32 -> 128
+// (2026-08-23, real finding): the real on-SD-card Flipper-IRDB's own
+// `flipperdb` root directory has MORE than 32 real category
+// subdirectories (confirmed directly -- the project owner observed real
+// folders past "Monitors" silently missing from the list) -- the old
+// 32-entry cap, inherited from ui/file_browser.h's own flat-listing bound
+// without re-deriving whether it was still appropriate for a real,
+// wide (not just deep) community database, was truncating the root
+// listing with no indication anything was cut off. 128 is a generous
+// real bound above any observed real category count, not a spec limit;
+// safe to raise this far now that the real memory constraint that would
+// have made a larger static buffer risky is gone (see
+// include/lv_conf.h's LV_MEM_SIZE fix, 2026-08-23 -- LVGL's own internal
+// widget/style pool is now 1MB in PSRAM, not the 64KB static pool that
+// made every real list row here costly).
+//
+// STILL NOT A TRUNCATION-SIGNALING FIX: if a real directory somehow has
+// more than 128 entries, list_dirs()/list_files() still silently cap at
+// this number with no on-screen indication, the same real gap this
+// comment is itself flagging, just pushed to a much less likely real
+// trigger. A full fix would need list_dirs()/list_files() to report
+// "there were more than max_names real entries" back to the caller (a
+// further IStorage interface change, out of scope for this fix).
+constexpr int kMaxDirEntries = 128;
+constexpr int kMaxFileEntries = 128;
 
 // Real observed sample files have ~11-12 named signals each (both Hobot
 // samples read in full this session); 32 is a generous bound well above

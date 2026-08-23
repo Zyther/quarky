@@ -1,6 +1,11 @@
 #include "storage_sd.h"
 #include <SD_MMC.h> // Tab5's SD is SDIO-attached, not SPI
 #include <cstring> // strncpy (ensure_parent_dirs)
+#include <cstdio>  // snprintf (posix_path)
+#include <dirent.h> // opendir/readdir/d_type -- see scan_dir()'s own comment
+                    // for the real measured reason this replaced the
+                    // Arduino FS openNextFile() loop these two functions
+                    // used to share
 #include <esp_heap_caps.h> // heap_caps_get_free_size(MALLOC_CAP_DMA) -- see
                           // list_files()/list_dirs()'s own out_read_failed
                           // comment for the real finding this checks for
@@ -234,72 +239,110 @@ bool StorageSD::read_file(const char *path, uint8_t *out, size_t max_len, size_t
     return true;
 }
 
+
+// ---------------------------------------------------------------------------
+// Directory scanning: POSIX opendir()/readdir(), NOT Arduino FS
+// openNextFile().
+//
+// THIS PREVENTS A REAL TASK-WATCHDOG REBOOT, it is not a micro-optimisation.
+// Measured on the physical Tab5 2026-08-23, timing list_dirs()/list_files()
+// directly while navigating the real on-SD Flipper-IRDB:
+//
+//   /quarky/ir/flipperdb      94 raw entries   list_dirs 620 ms + list_files 620 ms
+//   /quarky/ir/flipperdb/TVs 236 raw entries   list_dirs 4.30 s + list_files 4.30 s
+//
+// 8.70 s of blocking SD I/O inside ONE loop() iteration, against a 5 s
+// CONFIG_ESP_TASK_WDT_TIMEOUT_S -> "Task watchdog got triggered ... loopTask
+// (CPU 1) ... Aborting" and a reboot. (Confirmed it is a stall, not a spin:
+// the abort's register dump has CPU 1 in IDLE1 with MEPC in
+// esp_cpu_wait_for_intr -- loopTask was blocked in I/O, not looping.)
+//
+// Note the per-entry cost is not constant: 6.6 ms/entry at 94 entries but
+// 18.2 ms/entry at 236. That superlinearity is the actual bug, and it comes
+// from the Arduino layer. VFSFileImpl::openNextFile() (framework-arduino
+// esp32 libraries/FS/src/vfs_api.cpp:454) calls readdir() -- which already
+// carries the entry's type in dirent::d_type -- then DISCARDS it and
+// constructs a VFSFileImpl for the entry's full path, whose constructor
+// stat()s it. On FATFS a stat() by name has to walk the directory to find
+// the entry, so scanning a directory of N entries costs O(N^2) block reads.
+//
+// readdir() alone is O(N) total and needs no stat() at all: ESP-IDF's FATFS
+// VFS fills d_type itself from the directory entry it has already read
+// (esp_vfs_fat.c's vfs_fat_readdir_r: `d_type = (fno.fattrib & AM_DIR) ?
+// DT_DIR : DT_REG`), which is exactly -- and only -- the DIR-vs-FILE
+// distinction both callers below need.
+//
+// Semantics are otherwise deliberately unchanged from the openNextFile()
+// version: same dotfile rejection, same max_names cap, same
+// kMaxEntriesScanned visit bound, same basename-only output (readdir's
+// d_name is already a basename, as Arduino's entry.name() was here).
+namespace {
+
+// SD_MMC.begin()'s default mountpoint (SD_MMC.h:58). The Arduino FS object
+// hides it; POSIX calls do not, so paths must be re-rooted through it.
+constexpr char kSdMountpoint[] = "/sdcard";
+
+// Total directory entries visited per scan, regardless of how many match.
+// Same bound (and same 2026-08-15 real finding behind it) the openNextFile()
+// loops carried: a directory of many non-matching entries would otherwise
+// make this scan unbounded, and it is called synchronously from a click
+// handler inside a single loop() iteration. Kept at 512 for the same
+// AppleDouble-sidecar doubling reason documented at its previous 256->512
+// raise -- every real file in this corpus is accompanied by a `._` sidecar,
+// so a real directory costs two visited slots per real entry (the real TVs
+// folder measured 236 raw entries for 117 real subdirectories).
+constexpr int kMaxEntriesScanned = 512;
+
+// Shared body of both public listers. `want_dirs` selects DT_DIR vs DT_REG;
+// `ext_filter` is applied to files only (nullptr = accept any).
+int scan_dir(const char *dir, bool want_dirs, const char *ext_filter, char names_out[][64], int max_names) {
+    char full[256];
+    std::snprintf(full, sizeof(full), "%s%s", kSdMountpoint, dir);
+    DIR *d = opendir(full);
+    if (d == nullptr) return 0;
+
+    size_t ext_len = (ext_filter != nullptr) ? strlen(ext_filter) : 0;
+    int count = 0;
+    int visited = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != nullptr && count < max_names && visited < kMaxEntriesScanned) {
+        visited++;
+        if (want_dirs != (e->d_type == DT_DIR)) continue;
+        const char *name = e->d_name;
+        // The real on-SD Flipper-IRDB copy carries a macOS AppleDouble
+        // sidecar (`._Something.ir`) beside every real file, an artifact of
+        // having been written to the card by Finder. Those match a naive
+        // extension filter just as well as the real file, so reject any
+        // name starting with '.' (covers AppleDouble and ordinary hidden
+        // entries alike) before the extension check.
+        if (name[0] == '.') continue;
+        if (ext_filter != nullptr) {
+            size_t name_len = strlen(name);
+            if (name_len <= ext_len || strcmp(name + name_len - ext_len, ext_filter) != 0) continue;
+        }
+        strncpy(names_out[count], name, 63);
+        names_out[count][63] = '\0';
+        count++;
+    }
+    closedir(d);
+    return count;
+}
+
+} // namespace
+
 int StorageSD::list_files(const char *dir, const char *ext_filter, char names_out[][64], int max_names,
                           bool *out_read_failed) {
     // Real pre-flight check (see dma_memory_critically_low()'s own citation):
-    // when DMA memory is this low, SD_MMC.open() below and every subsequent
-    // openNextFile() call are essentially guaranteed to fail their own
-    // internal block reads -- checking once up front, before attempting any
-    // of them, gives a clean, deterministic "likely read failure" signal
-    // instead of a silent 0 indistinguishable from a genuinely empty
-    // directory.
+    // when DMA memory is this low, the directory scan below is essentially
+    // guaranteed to fail its own internal block reads -- checking once up
+    // front, before attempting any of them, gives a clean, deterministic
+    // "likely read failure" signal instead of a silent 0 indistinguishable
+    // from a genuinely empty directory.
     if (dma_memory_critically_low()) {
         if (out_read_failed) *out_read_failed = true;
         return 0;
     }
-    File d = SD_MMC.open(dir);
-    if (!d || !d.isDirectory()) return 0;
-
-    // Task review finding (2026-08-15, Minor): the loop used to stop only
-    // once max_names MATCHES were found, so a directory containing many
-    // non-matching entries (no reasonable real-world limit) made this scan
-    // unbounded -- called synchronously from build_screen(), itself run
-    // from the launcher tile's click handler inside a single loop()
-    // iteration, against this project's own ~50ms loop() budget
-    // constraint. kMaxEntriesScanned bounds total directory entries visited
-    // regardless of match count, independent of max_names.
-    //
-    // Raised 256 -> 512 (Task 18 review round, 2026-08-22, real finding):
-    // this same task's own dotfile-rejection fix (below) means every real
-    // file in the real, on-SD-card Flipper-IRDB now costs TWO visited slots
-    // (the real file plus its paired AppleDouble `._` sidecar), silently
-    // halving this scan's effective real-file capacity per directory with
-    // no truncation signal returned to the caller -- unlike
-    // IrFileFormat::read()'s own truncated flag, this function has no such
-    // output param, so a busy real leaf folder could show an incomplete
-    // list with no visible indication. Doubling restores the original
-    // 2026-08-15 finding's intended real per-directory capacity given this
-    // newly-discovered doubling factor, without the larger, more invasive
-    // change of adding a truncation out-param to an interface with 40+
-    // existing call sites across this codebase.
-    constexpr int kMaxEntriesScanned = 512;
-    size_t ext_len = strlen(ext_filter);
-    int count = 0;
-    int visited = 0;
-    File entry = d.openNextFile();
-    while (entry && count < max_names && visited < kMaxEntriesScanned) {
-        visited++;
-        if (!entry.isDirectory()) {
-            const char *name = entry.name(); // basename, not full path (FS.h)
-            size_t name_len = strlen(name);
-            // Task 18 finding (2026-08-22): the real on-SD-card
-            // Flipper-IRDB copy also contains thousands of macOS
-            // AppleDouble sidecar files (`._Something.ir`, one per real
-            // file -- an artifact of copying the database onto the SD
-            // card via a Mac/Finder). These match a naive extension
-            // filter just as well as the real file, so reject any name
-            // starting with '.' (covers AppleDouble and ordinary
-            // dotfiles/hidden entries alike) before the extension check.
-            if (name[0] != '.' && name_len > ext_len &&
-                strcmp(name + name_len - ext_len, ext_filter) == 0) {
-                strncpy(names_out[count], name, 63);
-                names_out[count][63] = '\0';
-                count++;
-            }
-        }
-        entry = d.openNextFile();
-    }
-    return count;
+    return scan_dir(dir, /*want_dirs=*/false, ext_filter, names_out, max_names);
 }
 
 int StorageSD::list_dirs(const char *dir, char names_out[][64], int max_names,
@@ -310,33 +353,5 @@ int StorageSD::list_dirs(const char *dir, char names_out[][64], int max_names,
         if (out_read_failed) *out_read_failed = true;
         return 0;
     }
-    File d = SD_MMC.open(dir);
-    if (!d || !d.isDirectory()) return 0;
-
-    // Same unbounded-scan guard as list_files() above, same reasoning
-    // (Task 18 review precedent: this project already fixed exactly this
-    // class of bug once for list_files()) -- and the same 256->512 raise
-    // for the same dotfile-doubling reason (see list_files()'s own
-    // comment); directory names aren't AppleDouble-sidecar-affected
-    // themselves, but this scan shares the same directory listing as
-    // list_files() at each level, so the same real corpus density applies.
-    constexpr int kMaxEntriesScanned = 512;
-    int count = 0;
-    int visited = 0;
-    File entry = d.openNextFile();
-    while (entry && count < max_names && visited < kMaxEntriesScanned) {
-        visited++;
-        if (entry.isDirectory()) {
-            const char *name = entry.name(); // basename, not full path (FS.h)
-            // Same dotfile rejection as list_files() -- a directory whose
-            // name starts with '.' is never a real IRDB category folder.
-            if (name[0] != '.') {
-                strncpy(names_out[count], name, 63);
-                names_out[count][63] = '\0';
-                count++;
-            }
-        }
-        entry = d.openNextFile();
-    }
-    return count;
+    return scan_dir(dir, /*want_dirs=*/true, /*ext_filter=*/nullptr, names_out, max_names);
 }
