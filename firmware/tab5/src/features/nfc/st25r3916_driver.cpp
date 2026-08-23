@@ -1759,10 +1759,18 @@ bool apdu_transceive(const uint8_t *tx, size_t tx_len,
     const bool is_i_block = ((pcb & kPcbTypeMask) == kPcbIBlockType) &&
                             ((pcb & kPcbB2Bit) != 0U) &&
                             ((pcb & kPcbB6Bit) == 0U);
-    if (!is_i_block) {
-        // An R-block or a malformed/unsupported S-block -- not handled (see
-        // this section's SOURCES note on scope). Reported as failure rather
-        // than guessed at.
+    // [REF] rfal_isoDep.cpp:709-712: the PICC's I-block response echoes the
+    // SAME block-number bit the PCD's request carried (the PCD-side toggle
+    // below applies only to the NEXT frame this driver sends) -- RFAL itself
+    // treats a mismatch here as a mandatory reject (Digital 1.1 15.2.6.4 /
+    // EMVCo 2.6 10.3.5.4), not an optional check. Missing this would let a
+    // stale or duplicate I-block (e.g. a retransmission after RF noise) be
+    // silently accepted as the answer to whatever was just sent.
+    const bool bn_matches = (pcb & 0x01U) == (s_pcb_block_number & 0x01U);
+    if (!is_i_block || !bn_matches) {
+        // An R-block, a malformed/unsupported S-block, or an I-block with
+        // the wrong block number -- not handled (see this section's SOURCES
+        // note on scope). Reported as failure rather than guessed at.
         return false;
     }
 

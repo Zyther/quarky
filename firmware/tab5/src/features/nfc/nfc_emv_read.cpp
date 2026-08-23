@@ -149,9 +149,21 @@ bool ber_tlv_len(const uint8_t *data, size_t len, size_t pos,
     return true;
 }
 
+// Real EMV/ISO 7816-4 TLV nesting in practice is shallow (a template tag
+// wrapping a handful of primitive tags, rarely more than one level deep).
+// This cap is a cheap defensive bound against a crafted response nesting
+// constructed tags dozens of levels deep to run this recursive walker's
+// stack usage up against the task's real stack budget -- not a limit any
+// real card response should ever approach.
+constexpr int kMaxTlvNestingDepth = 16;
+
 bool ber_tlv_find_in(const uint8_t *data, size_t len, size_t start, size_t end,
                      const uint8_t *tag, uint8_t tag_len,
-                     const uint8_t **val_out, size_t *val_len_out) {
+                     const uint8_t **val_out, size_t *val_len_out,
+                     int depth = 0) {
+    if (depth > kMaxTlvNestingDepth) {
+        return false;
+    }
     size_t pos = start;
     while (pos < end) {
         size_t tlen = 0;
@@ -164,7 +176,13 @@ bool ber_tlv_find_in(const uint8_t *data, size_t len, size_t start, size_t end,
             return false;
         }
         const size_t val_pos = pos + tlen + llen;
-        if (val_pos + vlen > end) {
+        // Split as "val_pos > end" then "vlen > end - val_pos" rather than
+        // "val_pos + vlen > end": a crafted 4-byte long-form length (up to
+        // 0xFFFFFFFF, see ber_tlv_len() above) can make val_pos + vlen wrap
+        // size_t's 32-bit range back under `end`, silently bypassing a
+        // single-addition bounds check. This form never adds two
+        // attacker-influenced values together.
+        if (val_pos > end || vlen > end - val_pos) {
             return false; // truncated/malformed -- refuse rather than overread
         }
 
@@ -177,7 +195,7 @@ bool ber_tlv_find_in(const uint8_t *data, size_t len, size_t start, size_t end,
         // constructed (nested) tag whose value is itself a TLV sequence.
         if ((data[pos] & 0x20U) != 0U) {
             if (ber_tlv_find_in(data, len, val_pos, val_pos + vlen, tag, tag_len,
-                                val_out, val_len_out)) {
+                                val_out, val_len_out, depth + 1)) {
                 return true;
             }
         }
