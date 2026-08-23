@@ -227,7 +227,21 @@ int StorageSD::list_files(const char *dir, const char *ext_filter, char names_ou
     // iteration, against this project's own ~50ms loop() budget
     // constraint. kMaxEntriesScanned bounds total directory entries visited
     // regardless of match count, independent of max_names.
-    constexpr int kMaxEntriesScanned = 256;
+    //
+    // Raised 256 -> 512 (Task 18 review round, 2026-08-22, real finding):
+    // this same task's own dotfile-rejection fix (below) means every real
+    // file in the real, on-SD-card Flipper-IRDB now costs TWO visited slots
+    // (the real file plus its paired AppleDouble `._` sidecar), silently
+    // halving this scan's effective real-file capacity per directory with
+    // no truncation signal returned to the caller -- unlike
+    // IrFileFormat::read()'s own truncated flag, this function has no such
+    // output param, so a busy real leaf folder could show an incomplete
+    // list with no visible indication. Doubling restores the original
+    // 2026-08-15 finding's intended real per-directory capacity given this
+    // newly-discovered doubling factor, without the larger, more invasive
+    // change of adding a truncation out-param to an interface with 40+
+    // existing call sites across this codebase.
+    constexpr int kMaxEntriesScanned = 512;
     size_t ext_len = strlen(ext_filter);
     int count = 0;
     int visited = 0;
@@ -263,8 +277,12 @@ int StorageSD::list_dirs(const char *dir, char names_out[][64], int max_names) {
 
     // Same unbounded-scan guard as list_files() above, same reasoning
     // (Task 18 review precedent: this project already fixed exactly this
-    // class of bug once for list_files()).
-    constexpr int kMaxEntriesScanned = 256;
+    // class of bug once for list_files()) -- and the same 256->512 raise
+    // for the same dotfile-doubling reason (see list_files()'s own
+    // comment); directory names aren't AppleDouble-sidecar-affected
+    // themselves, but this scan shares the same directory listing as
+    // list_files() at each level, so the same real corpus density applies.
+    constexpr int kMaxEntriesScanned = 512;
     int count = 0;
     int visited = 0;
     File entry = d.openNextFile();

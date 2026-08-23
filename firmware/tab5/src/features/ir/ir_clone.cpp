@@ -155,11 +155,20 @@ void on_signal_click(lv_event_t *e) {
 
 // Frees the heap-allocated signal array a file screen decoded into --
 // registered on that screen's own `content` object, so it's torn down
-// exactly once, when the whole screen is deleted (ScreenStack::pop()),
-// regardless of how many per-signal buttons hold raw pointers INTO this
-// same array (those pointers are simply never used again after the array
-// they point into is freed, since screen teardown and button teardown
-// happen together in the same lv_obj_delete() call).
+// exactly once, when the whole screen is deleted (ScreenStack::pop()).
+// CORRECTED (Task 18 review round, 2026-08-22): this is safe NOT because
+// parent and child teardown happen "together" -- verified against LVGL's
+// own real lv_obj_tree.c: a parent's LV_EVENT_DELETE actually fires
+// BEFORE its children are recursively deleted, the opposite of what this
+// comment used to claim. It's safe because ScreenStack::pop() is a single
+// synchronous, non-reentrant call on the main task: nothing between this
+// callback freeing `signals` and the per-signal buttons' own subsequent
+// deletion ever dereferences the now-dangling `&signals[i]` pointers those
+// buttons hold as click-handler user_data -- button deletion itself never
+// reads that user_data, only LV_EVENT_CLICKED does, and no click can fire
+// once teardown has started. This reasoning would NOT hold under any
+// future async/reentrant teardown path -- do not copy this pattern into
+// one without re-deriving this analysis.
 void free_signals_cb(lv_event_t *e) {
     delete[] static_cast<IrFileFormat::IrSignal *>(lv_event_get_user_data(e));
 }

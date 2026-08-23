@@ -1,12 +1,22 @@
 #include "screen_stack.h"
+#include <Arduino.h>
 
 lv_obj_t *ScreenStack::stack_[ScreenStack::kMaxDepth];
 int ScreenStack::depth_ = 0;
 
 void ScreenStack::push(lv_obj_t *screen) {
-    if (depth_ < kMaxDepth) {
-        stack_[depth_++] = screen;
+    if (depth_ >= kMaxDepth) {
+        // Real fix (see kMaxDepth's own comment for the bug this closes):
+        // refuse rather than display a screen we can't track. The caller
+        // already fully built `screen` before calling push() (every real
+        // caller in this codebase does), so it must be deleted here, not
+        // just dropped, or it leaks.
+        Serial.println("quarky-tab5: [screen-stack] push() REFUSED -- max "
+                       "depth reached, staying on current screen");
+        lv_obj_delete(screen);
+        return;
     }
+    stack_[depth_++] = screen;
     lv_screen_load(screen);
 }
 
