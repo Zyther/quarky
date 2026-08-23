@@ -583,17 +583,30 @@ void setup() {
             Serial.println("quarky-tab5: loaded existing PSK from NVS (boot-time)");
         }
 
-        bool c2_wifi_ok = c2link_wifi.init(provisioned_psk, "Quarky-Tab5-Test", "quarkytest123", 7777);
-        Serial.printf("quarky-tab5: c2link_wifi init %s\n", c2_wifi_ok ? "OK" : "FAILED");
+        // c2link_wifi.init() is DELIBERATELY NOT CALLED HERE any more (real
+        // hardware finding, 2026-08-23 -- see hal/c2link_wifi.h's own header
+        // comment and the SDD ledger's "Task 18: real-hardware crash
+        // investigation" section): bringing up WiFi C2 costs ~146KB of this
+        // board's real ~187KB total DMA-capable memory pool, which was
+        // silently starving SD reads (RF433 saves, NFC tag library, IR
+        // Clone's Flipper-IRDB browsing, etc.) on every boot whether or not
+        // anything ever used the WiFi transport. BLE C2 (below) alone now
+        // handles pairing/control by default; ui/pairing_screen.cpp's
+        // "Enable WiFi Link" button is the one place a user can still opt
+        // into WiFi C2 explicitly, paying its real memory cost only when
+        // actually wanted.
+        Serial.println("quarky-tab5: c2link_wifi init deferred -- BLE C2 is "
+                       "the default transport; enable WiFi C2 from the "
+                       "Pair Satellite screen if needed");
 
-        // Task 13: C2LinkBle -- the second C2 transport, used when the WiFi
-        // radio is busy with an active feature. Coexists with C2LinkWifi above
-        // (both transports are brought up here; feature code picks which one
-        // to actually use at runtime, per the foundation spec). Same
-        // provisioned PSK as the WiFi transport, per the fix above. A known,
-        // already-flagged, deferred concern from Task 11 is that
-        // WiFi.mode(WIFI_AP) (above) and BLE together touch the same C6
-        // co-processor radio at runtime.
+        // Task 13: C2LinkBle -- the second C2 transport, and (as of the
+        // 2026-08-23 lazy-WiFi-C2 change above) the DEFAULT one: brought up
+        // unconditionally here, while C2LinkWifi now only comes up if a user
+        // explicitly opts in from ui/pairing_screen.cpp. Same provisioned
+        // PSK as the WiFi transport would use if enabled, per the fix
+        // below. A known, already-flagged, deferred concern from Task 11 is
+        // that WiFi AP mode (if the user does enable it) and BLE together
+        // touch the same C6 co-processor radio at runtime.
         // Queue the HID keyboard service into the one shared GATT server
         // before c2link_ble.init() starts the NimBLE host task. It MUST
         // happen here, not from any runtime trigger -- NimBLE drains the

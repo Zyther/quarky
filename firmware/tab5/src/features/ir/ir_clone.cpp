@@ -237,13 +237,28 @@ lv_obj_t *build_dir_screen(const char *dir) {
     // ui/file_browser.h's static s_names.
     static char dir_names[kMaxDirEntries][64];
     static char file_names[kMaxFileEntries][64];
-    int dir_count = storage.list_dirs(dir, dir_names, kMaxDirEntries);
-    int file_count = storage.list_files(dir, ".ir", file_names, kMaxFileEntries);
+    bool dir_read_failed = false;
+    bool file_read_failed = false;
+    int dir_count = storage.list_dirs(dir, dir_names, kMaxDirEntries, &dir_read_failed);
+    int file_count = storage.list_files(dir, ".ir", file_names, kMaxFileEntries, &file_read_failed);
 
     lv_obj_t *list = lv_list_create(content);
     lv_obj_set_size(list, LV_PCT(100), LV_PCT(100));
 
-    if (dir_count == 0 && file_count == 0) {
+    // Real distinction, not previously possible (see IStorage::list_dirs()/
+    // list_files()'s own out_read_failed citation): a genuinely empty
+    // directory and a directory whose SD read failed (most likely a busy
+    // WiFi/BLE radio session starving the board's DMA-capable memory --
+    // see the SDD ledger's Task 18 real-hardware investigation) used to
+    // both silently show "Empty directory", making a real read failure
+    // look identical to "there's really nothing here."
+    if (dir_read_failed || file_read_failed) {
+        lv_list_add_text(list, "Could not read this directory -- SD card read "
+                               "failed (often caused by a busy WiFi/BLE radio "
+                               "session leaving too little DMA-capable memory "
+                               "free). Try again, or close other radio "
+                               "features first.");
+    } else if (dir_count == 0 && file_count == 0) {
         lv_list_add_text(list, "Empty directory.");
     }
 

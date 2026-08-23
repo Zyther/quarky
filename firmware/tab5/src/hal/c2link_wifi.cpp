@@ -137,3 +137,7 @@ bool C2LinkWifi::is_connected() {
 uint32_t c2link_wifi_last_recv_ms() {
     return s_last_recv_ms;
 }
+
+bool C2LinkWifi::is_initialized() {
+    return s_server != nullptr;
+}

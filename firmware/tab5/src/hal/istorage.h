@@ -38,7 +38,22 @@ public:
     // actually written -- 0 if dir doesn't exist, is empty, has no matches,
     // or mount() was never called. Added alongside read_file() for the same
     // reason (wifi_evil_portal.cpp's template picker).
-    virtual int list_files(const char *dir, const char *ext_filter, char names_out[][64], int max_names) = 0;
+    //
+    // out_read_failed (optional, default nullptr -- existing callers need no
+    // changes): set to true if a 0 result is suspected to be a REAL storage
+    // read failure rather than a genuinely empty/nonexistent directory.
+    // Added after a real hardware finding (Task 18, 2026-08-22/23 -- see
+    // the SDD ledger's "Task 18: real-hardware crash investigation"
+    // section): a busy WiFi/BLE radio session can consume nearly all of
+    // this board's DMA-capable internal memory, making every SD_MMC block
+    // read fail (`allocate_dma_buf: not enough mem`) -- and a failed read
+    // and a genuinely empty directory were previously indistinguishable at
+    // this API, silently showing "no files" for what was really "couldn't
+    // read". Best-effort (a pre-flight low-DMA-memory check, not a
+    // guarantee every possible real SD error is caught) -- left untouched
+    // (never set to false) on a call this implementation doesn't suspect.
+    virtual int list_files(const char *dir, const char *ext_filter, char names_out[][64], int max_names,
+                           bool *out_read_failed = nullptr) = 0;
 
     // Lists immediate SUBDIRECTORY basenames (not full paths, not files) of
     // dir, writing up to max_names entries (each up to 63 chars + NUL) into
@@ -61,5 +76,10 @@ public:
     // not just AppleDouble sidecar files (`._Something`) -- the real SD copy
     // of the Flipper-IRDB contains thousands of these, one per real file,
     // from being copied onto the SD card via a Mac/Finder.
-    virtual int list_dirs(const char *dir, char names_out[][64], int max_names) = 0;
+    //
+    // out_read_failed: same real-read-failure-vs-empty-directory signal as
+    // list_files()'s own parameter above -- see its comment for the full
+    // citation.
+    virtual int list_dirs(const char *dir, char names_out[][64], int max_names,
+                          bool *out_read_failed = nullptr) = 0;
 };

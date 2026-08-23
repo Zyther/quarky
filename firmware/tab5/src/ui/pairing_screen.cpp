@@ -2,11 +2,29 @@
 #include "screen_scaffold.h"
 #include "screen_stack.h"
 #include "../hal/psk_store.h"
+#include "../hal/c2link_wifi.h"
 #include <crypto.h>
 #include <qrcode.h>
 #include <Arduino.h>
 #include <esp_heap_caps.h>
 #include <cstdio>
+
+// Real global instance + free function, both defined in main.cpp (matching
+// this project's established `extern StorageSD storage;` idiom used by
+// every other IStorage-consuming feature module -- e.g. ir_clone.cpp,
+// ir_learn.cpp). Needed here as of the 2026-08-23 lazy-WiFi-C2 change (see
+// hal/c2link_wifi.h's own header comment): this screen is now the one real
+// place C2LinkWifi::init() is called from, instead of main.cpp's boot
+// sequence.
+extern C2LinkWifi c2link_wifi;
+extern void on_c2_receive(const c2proto::Frame &frame);
+
+// Same literal SSID/password/port main.cpp's boot sequence used to pass to
+// c2link_wifi.init() before the lazy-init change -- moved here since this
+// is now the only real caller.
+static const char *const kWifiApSsid = "Quarky-Tab5-Test";
+static const char *const kWifiApPassword = "quarkytest123";
+static constexpr uint16_t kWifiPort = 7777;
 
 static constexpr int32_t kCanvasSize = 300;
 
@@ -111,6 +129,58 @@ lv_obj_t *build_pairing_screen() {
     }
 
     render_qr_canvas(content, psk);
+
+    // WiFi C2 opt-in (2026-08-23, real hardware finding -- see this file's
+    // top-of-file comment and hal/c2link_wifi.h's own header for the full
+    // citation): WiFi C2 is no longer brought up unconditionally at boot
+    // because doing so cost ~146KB of this board's real ~187KB DMA-capable
+    // memory pool regardless of whether anything used it, starving SD reads
+    // for other Tab5-native features. BLE C2 is the default; this button is
+    // the one real way left to opt into WiFi C2's higher-throughput
+    // transport, paying its real memory cost only when actually wanted.
+    lv_obj_t *wifi_label = lv_label_create(content);
+    lv_label_set_long_mode(wifi_label, LV_LABEL_LONG_WRAP);
+    bool already_up = c2link_wifi.is_initialized();
+    lv_label_set_text(wifi_label, already_up
+                                       ? "WiFi C2: enabled"
+                                       : "WiFi C2: off by default (BLE C2 handles "
+                                         "pairing/control) -- costs real DMA "
+                                         "memory other SD-heavy features need. "
+                                         "Enable only if you need the WiFi "
+                                         "transport specifically.");
+
+    if (!already_up) {
+        lv_obj_t *wifi_btn = lv_button_create(content);
+        lv_obj_t *wifi_btn_label = lv_label_create(wifi_btn);
+        lv_label_set_text(wifi_btn_label, "Enable WiFi Link");
+        lv_obj_add_event_cb(wifi_btn, [](lv_event_t *e) {
+            lv_obj_t *btn = static_cast<lv_obj_t *>(lv_event_get_target(e));
+            lv_obj_t *label = static_cast<lv_obj_t *>(lv_event_get_user_data(e));
+            // Re-load rather than capture the outer psk[16] -- that stack
+            // array is long out of scope by the time a real button tap
+            // fires this callback. PskStore::load() is a cheap NVS read,
+            // and both call sites (this one, and the one that already ran
+            // moments ago to render the QR/hex above) always agree on the
+            // same persisted key -- see this file's own Task 20 comment.
+            uint8_t reload_psk[16];
+            if (!PskStore::load(reload_psk)) {
+                // Should not happen -- build_pairing_screen() already
+                // generated+persisted one above if none existed -- but
+                // refuse rather than init() with an undefined key if it
+                // somehow does.
+                lv_label_set_text(label, "WiFi C2: failed (no PSK found)");
+                return;
+            }
+            bool ok = c2link_wifi.init(reload_psk, kWifiApSsid, kWifiApPassword, kWifiPort);
+            if (ok) {
+                c2link_wifi.set_receive_handler(on_c2_receive);
+                lv_label_set_text(label, "WiFi C2: enabled");
+                lv_obj_add_state(btn, LV_STATE_DISABLED);
+            } else {
+                lv_label_set_text(label, "WiFi C2: failed to start (see serial log)");
+            }
+        }, LV_EVENT_CLICKED, wifi_label);
+    }
 
     return screen;
 }

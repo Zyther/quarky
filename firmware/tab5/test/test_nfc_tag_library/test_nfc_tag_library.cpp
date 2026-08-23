@@ -61,7 +61,8 @@ public:
         return true;
     }
 
-    int list_files(const char *dir, const char *ext_filter, char names_out[][64], int max_names) override {
+    int list_files(const char *dir, const char *ext_filter, char names_out[][64], int max_names,
+                   bool * = nullptr) override {
         int count = 0;
         size_t dir_len = std::strlen(dir);
         for (int i = 0; i < kMaxEntries && count < max_names; i++) {
@@ -84,7 +85,7 @@ public:
         return count;
     }
 
-    int list_dirs(const char *, char[][64], int) override { return 0; } // unused by these tests
+    int list_dirs(const char *, char[][64], int, bool * = nullptr) override { return 0; } // unused by these tests
 
 private:
     struct Entry {

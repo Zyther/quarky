@@ -1,6 +1,9 @@
 #include "storage_sd.h"
 #include <SD_MMC.h> // Tab5's SD is SDIO-attached, not SPI
 #include <cstring> // strncpy (ensure_parent_dirs)
+#include <esp_heap_caps.h> // heap_caps_get_free_size(MALLOC_CAP_DMA) -- see
+                          // list_files()/list_dirs()'s own out_read_failed
+                          // comment for the real finding this checks for
 // boards/tab5/pins_config.h documents the real Tab5 SD/C6 SDIO pins and the
 // SDIO-host-sharing research below in named constants (TAB5_SD_*,
 // TAB5_C6_SDIO_*). Not included/consumed directly here: SD_MMC's own
@@ -156,6 +159,22 @@ bool StorageSD::write_test_file() {
 // then /quarky/captures/wifi. SD_MMC.mkdir() on an already-existing directory
 // is a harmless no-op (confirmed against the ESP32 SD_MMC/FS library), so no
 // existence check is needed before each call.
+// Real finding, Task 18 hardware investigation (2026-08-22/23 -- see the SDD
+// ledger's "Task 18: real-hardware crash investigation" section): a busy
+// WiFi/BLE radio session (esp-hosted's own transport mempool, which
+// genuinely requires DMA-capable memory) can drive this board's real
+// DMA-capable internal-memory pool down to as little as 128 bytes, at which
+// point every SD_MMC block read fails
+// (`sdmmc_cmd: allocate_dma_buf: not enough mem, err=0x101`) -- observed
+// directly on real hardware. 8192 bytes is a conservative real threshold:
+// generously above what one SD block-read DMA transfer actually needs (SD
+// sectors are 512 bytes; even generous driver/descriptor overhead is nowhere
+// near 8KB), so this only fires under genuinely degraded conditions like the
+// one that motivated it, not under ordinary light memory pressure.
+static bool dma_memory_critically_low() {
+    return heap_caps_get_free_size(MALLOC_CAP_DMA) < 8192;
+}
+
 static void ensure_parent_dirs(const char *path) {
     char buf[128];
     strncpy(buf, path, sizeof(buf) - 1);
@@ -215,7 +234,19 @@ bool StorageSD::read_file(const char *path, uint8_t *out, size_t max_len, size_t
     return true;
 }
 
-int StorageSD::list_files(const char *dir, const char *ext_filter, char names_out[][64], int max_names) {
+int StorageSD::list_files(const char *dir, const char *ext_filter, char names_out[][64], int max_names,
+                          bool *out_read_failed) {
+    // Real pre-flight check (see dma_memory_critically_low()'s own citation):
+    // when DMA memory is this low, SD_MMC.open() below and every subsequent
+    // openNextFile() call are essentially guaranteed to fail their own
+    // internal block reads -- checking once up front, before attempting any
+    // of them, gives a clean, deterministic "likely read failure" signal
+    // instead of a silent 0 indistinguishable from a genuinely empty
+    // directory.
+    if (dma_memory_critically_low()) {
+        if (out_read_failed) *out_read_failed = true;
+        return 0;
+    }
     File d = SD_MMC.open(dir);
     if (!d || !d.isDirectory()) return 0;
 
@@ -271,7 +302,14 @@ int StorageSD::list_files(const char *dir, const char *ext_filter, char names_ou
     return count;
 }
 
-int StorageSD::list_dirs(const char *dir, char names_out[][64], int max_names) {
+int StorageSD::list_dirs(const char *dir, char names_out[][64], int max_names,
+                         bool *out_read_failed) {
+    // Same real pre-flight check as list_files() -- see that function's own
+    // comment and dma_memory_critically_low()'s citation.
+    if (dma_memory_critically_low()) {
+        if (out_read_failed) *out_read_failed = true;
+        return 0;
+    }
     File d = SD_MMC.open(dir);
     if (!d || !d.isDirectory()) return 0;
 
