@@ -886,18 +886,50 @@ decode logic.
   transmit). `pio run -e tab5` builds clean. **Not yet real-hardware
   verified against the actual SD card contents or a real IR receiver** —
   see Step 3.
-- [ ] **Step 3: PAUSE FOR HARDWARE, then verify at least one real profile
-  against a real device** — ideally one of the two real files already
-  read this session (a real HOBOT window-cleaner robot, if available, or
-  any other NEC/NECext-protocol device the project owner has on hand).
-  Also worth confirming during this pass: (a) `ScreenStack::kMaxDepth`
-  (8) is close to the worst real observed nesting depth (root + flipperdb
-  + up to 4 more real levels + a file's signal screen = 7-8) — if a
-  deeper real branch exists, `ScreenStack::push()` silently stops tracking
-  depth rather than crashing, which would make Back misbehave, not lock
-  up; (b) that `list_dirs()`/`list_files()`'s dotfile rejection actually
-  clears the real AppleDouble corpus on the real SD card end to end.
-- [ ] **Step 4: Commit**
+- [x] **Step 3: PAUSE FOR HARDWARE, then verify at least one real profile
+  against a real device** — **DONE, 2026-08-23, after two real crashes
+  found and fixed along the way.** Real-hardware testing of the deep
+  `flipperdb/_Converted_/IR_Plus/R/REVOX` branch and the separately
+  large `flipperdb/TVs` branch (117 real subdirectories) both crashed
+  the board — NOT `ScreenStack::kMaxDepth` (that was pre-emptively fixed
+  during Task 18's own review round, see that section above), but two
+  independent, previously-undiscovered real bugs:
+  1. LVGL's internal widget/style pool (`lv_malloc`/`lv_mem`,
+     `LV_MEM_SIZE`) was 64KB static internal RAM — IR Clone's recursive
+     navigator (~700 bytes/list-row, parent screens kept alive by
+     `ScreenStack`) exhausted it after a few stacked real directories,
+     crashing one of two ways depending on which allocation failed
+     first (an unchecked NULL-pointer write inside LVGL's own
+     `lv_draw_sw_fill.c`, or an `LV_ASSERT_MALLOC` spin the task
+     watchdog eventually aborted). Fixed: `LV_MEM_SIZE` raised to 1MB,
+     moved to PSRAM (`include/lv_conf.h`) — verified via a real stress
+     test (16 stacked 32-row screens, the worst case the code can
+     produce) at only 24% pool used, no render-latency regression.
+  2. A second, unrelated crash on the much larger `TVs` folder (117
+     real subdirectories) turned out to be an O(N^2) SD directory scan:
+     Arduino's `openNextFile()` discards the already-known directory
+     entry type and `stat()`s each entry by path instead, which
+     re-walks the whole directory on FATFS. Listing `TVs`'s real 236
+     raw entries took 8.70 real seconds in one `loop()` iteration
+     against a 5s watchdog timeout. Fixed: `StorageSD` now scans via
+     POSIX `opendir()`/`readdir()` directly, reading the entry type
+     ESP-IDF's own FATFS VFS already provides — verified 60x faster
+     (145ms), byte-identical real counts.
+  Both fixes independently verified by the controller (clean rebuilds,
+  `pio test -e native` 45/45 each round) and confirmed by the project
+  owner on real hardware against both previously-crashing real paths:
+  "both of these directories work well done!" `list_dirs()`/
+  `list_files()`'s dotfile rejection was confirmed working throughout
+  this same real corpus (thousands of real AppleDouble sidecars, zero
+  observed leaking into any listing). Two further real UI requests
+  from the project owner during this same hardware pass, both
+  implemented and confirmed working: a 4-column button grid for a
+  file's per-signal buttons (was a single vertical column), and
+  alphabetized directory/file listings (`readdir()` returns raw on-disk
+  order, never sorted — a real gap, not a side effect of either fix
+  above; fixed with a `qsort()`/`strcmp()` pass in `scan_dir()`).
+- [x] **Step 4: Commit** — `09158b6`, `246b12c`, `737077e` (plus the
+  earlier implementation/review-round commits `7ed8a60`, `73925f1`).
 
 **Model:** Sonnet.
 
