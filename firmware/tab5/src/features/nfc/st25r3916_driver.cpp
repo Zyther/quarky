@@ -3,6 +3,7 @@
 #include "../../../boards/tab5/pins_config.h"
 #include <Wire.h>
 #include <Arduino.h>
+#include <cstring>
 
 // ===========================================================================
 // SOURCES. Every register address, mode byte, command code and bit position
@@ -1327,7 +1328,7 @@ void nfca_poller_end() {
     field_off();
 }
 
-NfcaResult nfca_detect(Iso14443aTag *out) {
+NfcaResult nfca_detect(Iso14443aTag *out, bool keep_active) {
     if (out == nullptr) {
         return NfcaResult::kProtocolError;
     }
@@ -1450,11 +1451,20 @@ NfcaResult nfca_detect(Iso14443aTag *out) {
         // antenna could be read exactly once. The tag acknowledges by NOT
         // responding (ISO14443-3 6.4.3), so the transceive outcome is
         // deliberately discarded -- same as [EH] rfalNfcaPollerSleep().
-        uint8_t slp_rx[4] = {0};
-        uint8_t slp_len = 0;
-        (void)transceive(/*short_cmd=*/0U, kSlpReq, sizeof(kSlpReq), /*crc_tx=*/true,
-                         /*antcl=*/false, /*crc_rx=*/true,
-                         slp_rx, sizeof(slp_rx), &slp_len, millis() + 2U);
+        //
+        // SKIPPED when keep_active is true (added by Phase 3 Task 13): a
+        // HALTed tag does not answer RATS, only WUPA, so a caller that wants
+        // to chain an ISO14443-4 activation onto this exact tag needs it left
+        // ACTIVE. Every existing caller gets the default (false) and this
+        // block runs exactly as before -- see keep_active's own doc comment
+        // in the header for the full backward-compatibility argument.
+        if (!keep_active) {
+            uint8_t slp_rx[4] = {0};
+            uint8_t slp_len = 0;
+            (void)transceive(/*short_cmd=*/0U, kSlpReq, sizeof(kSlpReq), /*crc_tx=*/true,
+                             /*antcl=*/false, /*crc_rx=*/true,
+                             slp_rx, sizeof(slp_rx), &slp_len, millis() + 2U);
+        }
 
         return NfcaResult::kFound;
     }
@@ -1462,6 +1472,313 @@ NfcaResult nfca_detect(Iso14443aTag *out) {
     // Three cascade levels all reported "more to come" -- ISO14443-3 has no
     // fourth level, so the tag is not following the standard.
     return NfcaResult::kProtocolError;
+}
+
+// ===========================================================================
+// ISO14443-4 (T=CL) activation and single-APDU exchange (Phase 3 Task 13,
+// EMV/APDU reader)
+//
+// SOURCES FOR THIS SECTION ONLY. Everything below -- the RATS command byte,
+// the RATS PARAM's FSDI/DID packing, the ATS TL/T0/TB layout, the FWI->FWT
+// formula, and the I-block PCB encoding/block-number toggle -- traces to ST's
+// own RFAL ISO-DEP layer, read directly rather than recalled, matching this
+// project's established discipline for every other protocol section in this
+// file:
+//   ~/src/wilson-elechouse/ST25R3916/NFC-RFAL/src/rfal_isoDep.cpp / .h
+//   (the same vendored RFAL tree already cited above for rfal_nfca.cpp/
+//   rfal_rfst25r3916.cpp; this is its ISO-DEP/T=CL half, not previously read
+//   by this project before this task).
+//     - rfal_isoDep.cpp:139  RFAL_ISODEP_CMD_RATS = 0xE0     "Digital 1.1 13.6.1"
+//     - rfal_isoDep.cpp:181-183 RATS PARAM packing: FSDI in bits 7-4
+//       (RFAL_ISODEP_RATS_PARAM_FSDI_MASK/SHIFT), DID (CID) in bits 3-0
+//       (RFAL_ISODEP_RATS_PARAM_DID_MASK)
+//     - rfal_isoDep.cpp:929-931 rfalIsoDepRATS(): the literal composition
+//       `ratsReq.CMD = RFAL_ISODEP_CMD_RATS; ratsReq.PARAM = (FSDI<<4)|DID`
+//     - rfal_isoDep.h:69 RFAL_ISODEP_NO_DID = 0x00 -- "DID value indicating
+//       the ISO-DEP layer not to use DID [CID]". This driver, like every
+//       single-tag-only reader in this file, always requests DID=0/NO_DID:
+//       there is only ever one tag active (nfca_detect()'s own documented
+//       single-tag scope), so no CID field is ever needed to disambiguate,
+//       and rfal_isoDep.cpp:336/354 confirm RFAL itself only adds the PCB
+//       DID bit to outgoing frames when its own `did != RFAL_ISODEP_NO_DID`.
+//     - rfal_isoDep.cpp:141-146 ATS layout: RFAL_ISODEP_ATS_MIN_LEN=1 (a bare
+//       TL byte, meaning "no optional fields, all defaults"),
+//       RFAL_ISODEP_ATS_T0_FSCI_MASK=0x0F (card's own FSC, low nibble of T0)
+//     - rfal_isoDep.h:135-137 T0 optional-field presence bits: TA=0x10,
+//       TB=0x20, TC=0x40
+//     - rfal_isoDep.cpp:936-938 rfalIsoDepRATS()'s own ATS validity check:
+//       "Check for valid ATS length Digital 1.1 13.6.2.1 & 13.6.2.3" --
+//       `(rcvLen < RFAL_ISODEP_ATS_MIN_LEN) || (rcvLen > RFAL_ISODEP_ATS_MAX_LEN)
+//       || (ats->TL != rcvLen)` is an error. This driver applies the same
+//       TL-equals-received-length check as its ATS validity gate.
+//     - rfal_isoDep.cpp:1094-1096 FWI extraction from TB, when present:
+//       `FWI = (TB >> RFAL_ISODEP_ATS_TB_FWI_SHIFT) & RFAL_ISODEP_ATS_FWI_MASK`
+//       (shift=4, mask=0x0F); rfal_isoDep.h:74 RFAL_ISODEP_FWI_DEFAULT=4 when
+//       TB is absent.
+//     - rfal_isoDep.cpp:805-807 rfalIsoDepFWI2FWT(): "FWT = (256 x 16/fC) x
+//       2^FWI => 2^(FWI+12)" -- this driver computes the same power-of-two in
+//       fc-cycles and divides by fc=13.56 MHz for a millisecond timeout,
+//       exactly as commented at fwiToFwtMs()'s definition below.
+//     - rfal_isoDep.cpp:815-829 rfalIsoDepFSxI2FSx(): the FSDI->FSD (max
+//       frame size) table. FSDI=7 -> FSD=128 (case RFAL_ISODEP_FSXI_128 ->
+//       RFAL_ISODEP_FSX_128 in that switch). This driver declares FSDI=7 in
+//       RATS (kRatsParam below), not the NFC-Forum-max FSDI=8/FSD=256: this
+//       file's own transceive()'s rx_cap parameter is a uint8_t (max 255), so
+//       FSD=256 could never actually be honoured if a compliant card ever
+//       sent a full-size frame -- FSD=128 is the largest declared value that
+//       cannot itself cause a real overflow, and is generously larger than
+//       every real APDU response this project's EMV feature module sends or
+//       expects to receive (SELECT/GPO/READ RECORD responses; see
+//       nfc_emv_read.cpp).
+//     - rfal_isoDep.cpp:66-89 I-block PCB encoding: `ISODEP_PCB_IBLOCK=0x00`,
+//       `ISODEP_PCB_B2_BIT=0x02` (a MUST-be-1 bit on every I-block per
+//       ISO14443-4), `isoDep_PCBIBlock(bn) = IBLOCK | B2_BIT | (bn & 0x01)`
+//       -- i.e. 0x02 for block number 0, 0x03 for block number 1. Block
+//       number toggles every successful I-block round-trip
+//       (isoDep_ToggleBN(), rfal_isoDep.cpp:269) and starts at 0 after RATS
+//       (rfal_isoDep.cpp:459 gIsoDep.blockNumber = 0, in rfalIsoDepInitialize()).
+//     - rfal_isoDep.cpp:102-117 S-block PCB encoding: `ISODEP_PCB_SBLOCK=0xC0`,
+//       `ISODEP_PCB_WTX=0x30` (the S-block subtype bits), `ISODEP_PCBSBLOCK =
+//       SBLOCK | B2_BIT`, `ISODEP_PCB_SWTX = ISODEP_PCBSBLOCK | WTX` = 0xF2.
+//     - rfal_isoDep.cpp:415-421 the WTX ACK this driver's own handling below
+//       is modelled on: the S(WTX) reply echoes the SAME PCB (0xF2) and the
+//       SAME one-byte "power" INF field the card's own S(WTX) REQUEST carried
+//       -- `ctrlMsgBuf[...] = param` where `param` is exactly the byte the
+//       request supplied, not a value this driver computes or negotiates.
+//
+// SCOPE, stated honestly, same policy as nfca_detect()'s own header comment:
+//   * No I-block chaining, either direction. Every C-APDU this project's EMV
+//     module sends and every R-APDU it expects fits in one I-block given the
+//     FSD=128 this driver declares. A card or command that needed chaining
+//     would be reported as a plain protocol/unsupported-PCB error rather than
+//     silently mis-assembled.
+//   * No R-block (ACK/NAK) handling on transmit. This driver never resends an
+//     I-block after a NAK; a NAK-shaped or unrecognised PCB in the response is
+//     treated as failure. Real EMV read-only exchanges over a short-range,
+//     single-command-per-frame link essentially never need this on the PCD
+//     side in practice; disclosed rather than silently assumed to be unneeded.
+//   * S(WTX) (waiting-time extension) IS handled, bounded to kMaxWtxRounds
+//     rounds per APDU -- see apdu_transceive()'s own comment for why (a real
+//     card is reasonably likely to ask for one during GET PROCESSING OPTIONS,
+//     which can involve on-card cryptographic computation).
+//   * No S(DESELECT) is ever sent. A polite ISO14443-4 session end is an
+//     S-block DESELECT/response handshake (rfal_isoDep.cpp's ISODEP_PCB_SDSL);
+//     this driver instead always ends a session via nfca_poller_end()'s
+//     field_off(), which de-powers the tag outright -- a real, if less polite,
+//     way to end any contactless session, and the one nfc_read.cpp's own
+//     teardown() already uses for the plain UID-read path. A card left
+//     mid-session when the field cuts is not left in any worse state than
+//     simply being pulled out of range, which every contactless reader must
+//     already tolerate.
+// ===========================================================================
+
+namespace {
+
+constexpr uint8_t kCmdRats = 0xE0U; // [REF] rfal_isoDep.cpp:139
+// FSDI=7 (FSD=128, see the SOURCES note above for why not 8/256), DID=0
+// (RFAL_ISODEP_NO_DID -- no CID, single-tag reader).
+constexpr uint8_t kRatsFsdi  = 7U;
+constexpr uint8_t kRatsParam = static_cast<uint8_t>(kRatsFsdi << 4);
+
+constexpr uint8_t kAtsMinLen = 1U; // [REF] RFAL_ISODEP_ATS_MIN_LEN
+constexpr uint8_t kAtsMaxLen = 32U; // generous local cap; real ATS historical
+                                    // bytes are rarely long and this driver
+                                    // does not need to parse them anyway
+constexpr uint8_t kAtsT0TaPresent = 0x10U; // [REF] rfal_isoDep.h:135
+constexpr uint8_t kAtsT0TbPresent = 0x20U; // [REF] rfal_isoDep.h:136
+constexpr uint8_t kFwiDefault = 4U; // [REF] RFAL_ISODEP_FWI_DEFAULT
+
+constexpr uint8_t kPcbTypeMask   = 0xC0U;
+constexpr uint8_t kPcbIBlockType = 0x00U;
+constexpr uint8_t kPcbSBlockType = 0xC0U;
+constexpr uint8_t kPcbSTypeMask  = 0x30U;
+constexpr uint8_t kPcbWtxType    = 0x30U;
+constexpr uint8_t kPcbB2Bit      = 0x02U; // MUST be 1 on every I/S-block
+constexpr uint8_t kPcbB6Bit      = 0x20U; // MUST be 0 on a valid I-block
+
+// Per-exchange wall-clock cap. Computed from the card's own declared FWI
+// (via fwiToFwtMs() below) but hard-clamped here to keep a single
+// apdu_transceive() call -- and, more importantly, the handful of them a full
+// EMV read performs back to back -- comfortably inside the ~5 s ESP32 task
+// watchdog window this project has already been bitten by twice (see
+// hal/ir_unit.h's and hal/storage_sd.cpp's own header comments). FWI's legal
+// range extends to a ~4.95 s FWT (FWI=14); honouring that literally for
+// several exchanges in a row inside one synchronous read (see
+// nfc_emv_read.cpp) could alone exceed the watchdog budget even though every
+// individual wait was protocol-legal. Real EMV SELECT/GPO/READ RECORD
+// exchanges this driver sends need nowhere near this: typical real-card FWI
+// for these commands is small (low-to-mid single digits), and this cap only
+// ever bites a pathologically slow or malfunctioning card, which is exactly
+// when failing fast is preferable to risking a watchdog panic.
+constexpr uint32_t kMaxSingleExchangeMs = 500U;
+
+// A card requesting more time than it was just granted (another S(WTX) right
+// after this driver's ack) is retried up to this many times before this
+// driver gives up on the whole APDU. Bounds worst-case time for ONE
+// apdu_transceive() call to roughly (kMaxWtxRounds + 1) * kMaxSingleExchangeMs
+// even against a card that does nothing but ask for extensions.
+constexpr uint8_t kMaxWtxRounds = 2U;
+
+// [REF] rfal_isoDep.cpp:805-807: "FWT = (256 x 16/fC) x 2^FWI => 2^(FWI+12)",
+// fc = 13.56 MHz. Returns milliseconds, rounded up by one, then clamped to
+// kMaxSingleExchangeMs -- see that constant's own comment for why the clamp
+// exists and why it is safe for the read-only EMV command set this drives.
+uint32_t fwiToFwtMs(uint8_t fwi) {
+    // 14 = [REF]'s own ISODEP_FWI_MAX. An out-of-range value in a real ATS
+    // would itself be non-compliant; fall back to the default rather than
+    // shift by an unbounded amount.
+    const uint8_t clamped_fwi = (fwi > 14U) ? kFwiDefault : fwi;
+    const uint64_t fc_cycles = static_cast<uint64_t>(1U) << (clamped_fwi + 12U);
+    uint32_t ms = static_cast<uint32_t>((fc_cycles / 13560U) + 1U); // fc in kHz
+    if (ms > kMaxSingleExchangeMs) {
+        ms = kMaxSingleExchangeMs;
+    }
+    return ms;
+}
+
+uint8_t s_pcb_block_number = 0U;
+uint32_t s_apdu_timeout_ms = 0U;
+
+} // namespace
+
+bool iso14443_4_activate() {
+    if (!s_nfca_ready) {
+        return false;
+    }
+    s_pcb_block_number = 0U;
+    s_apdu_timeout_ms = fwiToFwtMs(kFwiDefault); // refined below once the
+                                                 // real ATS is read, if it
+                                                 // says otherwise
+
+    const uint8_t rats_req[2] = {kCmdRats, kRatsParam};
+    uint8_t ats[kAtsMaxLen] = {0};
+    uint8_t ats_len = 0;
+    // Activation gets its own generous-but-bounded deadline, separate from
+    // kMaxSingleExchangeMs: RATS is a one-time cost per tag, not repeated per
+    // APDU, so there is no "several of these in a row" risk to guard against
+    // the way there is for apdu_transceive()'s steady-state calls.
+    const uint32_t deadline = millis() + 100U;
+    const Xfer xr = transceive(/*short_cmd=*/0U, rats_req, sizeof(rats_req),
+                               /*crc_tx=*/true, /*antcl=*/false, /*crc_rx=*/true,
+                               ats, sizeof(ats), &ats_len, deadline);
+    if (xr != Xfer::kOk) {
+        Serial.printf("quarky-tab5: [st25r3916] RATS (0xE0) failed, xfer=%u\n",
+                      static_cast<unsigned>(xr));
+        return false;
+    }
+    // [REF] rfal_isoDep.cpp:936-938's own ATS validity gate: TL must equal
+    // the actual received length, and be at least the 1-byte minimum.
+    if (ats_len < kAtsMinLen || ats[0] != ats_len) {
+        Serial.printf("quarky-tab5: [st25r3916] ATS malformed: len=%u TL=0x%02X\n",
+                      (unsigned)ats_len, ats_len > 0 ? ats[0] : 0);
+        return false;
+    }
+
+    uint8_t fwi = kFwiDefault;
+    if (ats_len >= 2U) {
+        const uint8_t t0 = ats[1];
+        size_t idx = 2U;
+        if ((t0 & kAtsT0TaPresent) != 0U) {
+            idx++; // TA present, skip it -- not needed for this task
+        }
+        if ((t0 & kAtsT0TbPresent) != 0U) {
+            if (idx < ats_len) {
+                // [REF] rfal_isoDep.cpp:1096: FWI = (TB >> 4) & 0x0F
+                fwi = static_cast<uint8_t>((ats[idx] >> 4) & 0x0FU);
+            }
+            idx++;
+        }
+        // TC (idx, if T0's 0x40 bit is set) is not consulted -- this driver
+        // never requests DID/NAD, so TC's advanced-features bits are
+        // irrelevant here.
+    }
+    s_apdu_timeout_ms = fwiToFwtMs(fwi);
+
+    Serial.printf("quarky-tab5: [st25r3916] ISO14443-4 activated: ATS len=%u "
+                  "FWI=%u -> per-exchange timeout %u ms\n",
+                  (unsigned)ats_len, (unsigned)fwi, (unsigned)s_apdu_timeout_ms);
+    return true;
+}
+
+bool apdu_transceive(const uint8_t *tx, size_t tx_len,
+                     uint8_t *rx, size_t rx_cap, size_t *rx_len) {
+    if (rx_len != nullptr) {
+        *rx_len = 0;
+    }
+    if (!s_nfca_ready || tx == nullptr || tx_len == 0 || rx == nullptr) {
+        return false;
+    }
+    // One PCB byte precedes the APDU; transceive()'s own tx_len parameter is
+    // a uint8_t, so this driver's usable APDU size tops out at 254 bytes --
+    // far more than any command nfc_emv_read.cpp sends (all under 32 bytes).
+    if (tx_len > 254U || rx_cap > 255U) {
+        return false;
+    }
+
+    uint8_t frame[255];
+    frame[0] = static_cast<uint8_t>(kPcbB2Bit | (s_pcb_block_number & 0x01U));
+    memcpy(&frame[1], tx, tx_len);
+    const uint8_t frame_len = static_cast<uint8_t>(tx_len + 1U);
+
+    uint8_t resp[255];
+    uint8_t resp_len = 0;
+    Xfer xr = transceive(/*short_cmd=*/0U, frame, frame_len, /*crc_tx=*/true,
+                         /*antcl=*/false, /*crc_rx=*/true,
+                         resp, sizeof(resp), &resp_len,
+                         millis() + s_apdu_timeout_ms);
+
+    for (uint8_t wtx_round = 0; ; wtx_round++) {
+        if (xr != Xfer::kOk || resp_len == 0) {
+            return false;
+        }
+        const uint8_t pcb = resp[0];
+        const bool is_s_wtx = ((pcb & kPcbTypeMask) == kPcbSBlockType) &&
+                              ((pcb & kPcbSTypeMask) == kPcbWtxType);
+        if (!is_s_wtx) {
+            break;
+        }
+        // [REF] rfal_isoDep.cpp:415-421: the WTX ack echoes the SAME PCB and
+        // the SAME one-byte power-multiplier INF field the request carried.
+        if (resp_len < 2U || wtx_round >= kMaxWtxRounds) {
+            Serial.println("quarky-tab5: [st25r3916] S(WTX) request malformed "
+                           "or too many rounds -- giving up on this APDU");
+            return false;
+        }
+        const uint8_t ack[2] = {pcb, resp[1]};
+        xr = transceive(/*short_cmd=*/0U, ack, sizeof(ack), /*crc_tx=*/true,
+                        /*antcl=*/false, /*crc_rx=*/true,
+                        resp, sizeof(resp), &resp_len,
+                        millis() + s_apdu_timeout_ms);
+    }
+
+    const uint8_t pcb = resp[0];
+    // [REF] ISODEP_PCB_IB_VALID_MASK/VAL: bits (0x20|0x02) must read (0|0x02)
+    // on a real I-block -- the B2 must-be-1 bit set AND the B6 must-be-0 bit
+    // clear, on top of the type bits identifying an I-block in the first
+    // place.
+    const bool is_i_block = ((pcb & kPcbTypeMask) == kPcbIBlockType) &&
+                            ((pcb & kPcbB2Bit) != 0U) &&
+                            ((pcb & kPcbB6Bit) == 0U);
+    if (!is_i_block) {
+        // An R-block or a malformed/unsupported S-block -- not handled (see
+        // this section's SOURCES note on scope). Reported as failure rather
+        // than guessed at.
+        return false;
+    }
+
+    const size_t inf_len = static_cast<size_t>(resp_len) - 1U;
+    if (inf_len > rx_cap) {
+        return false;
+    }
+    memcpy(rx, &resp[1], inf_len);
+    if (rx_len != nullptr) {
+        *rx_len = inf_len;
+    }
+    // [REF] rfal_isoDep.cpp:269 isoDep_ToggleBN(): the block number toggles
+    // after every successful round-trip, ready for the next I-block this
+    // driver sends.
+    s_pcb_block_number ^= 1U;
+    return true;
 }
 
 } // namespace St25r3916

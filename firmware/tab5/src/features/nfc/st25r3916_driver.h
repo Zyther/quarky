@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 // Real ST25R3916 register-level driver for the Tab5's NFC unit (I2C 0x50 on
@@ -118,10 +119,64 @@ bool nfca_poller_begin();
 // so the true worst case can run a few ms past ~25 ms. That is still well
 // inside a poll() tick's ~50 ms budget with margin. Typical real cost is
 // 1-3 ms (no tag) or 6-12 ms (tag found), dominated by I2C, not by RF.
-NfcaResult nfca_detect(Iso14443aTag *out);
+//
+// `keep_active` (added by Phase 3 Task 13, EMV/APDU reader): when true, the
+// trailing SLP_REQ (HALT) that normally ends every successful pass is
+// skipped, leaving the tag ACTIVE so a caller can immediately chain an
+// ISO14443-4 RATS + APDU exchange onto it (iso14443_4_activate() below
+// requires exactly this -- RATS sent to a HALTed tag gets no answer, since
+// HALT is a real ISO14443-3 state and only WUPA, not RATS, wakes a tag from
+// it). Defaults to false, i.e. the ORIGINAL auto-HALT behavior, so every
+// existing caller (nfc_read.cpp is the only one that calls this function
+// today; nfc_tag_library.cpp/nfc_mifare_crack.cpp/nfc_amiibo.cpp all operate
+// on the separate WS1850S/RFID2 unit and never touch this function or this
+// file at all) is unaffected without being touched. A caller that passes
+// true is responsible for eventually calling nfca_poller_end() (which turns
+// the field off outright -- that always ends the tag's session, HALTed or
+// not) rather than relying on a HALT it never sent.
+NfcaResult nfca_detect(Iso14443aTag *out, bool keep_active = false);
 
 // Stops the poller: field_off() plus a Stop-all-activities so no timer or
 // receive state is left running. Safe to call when begin() was never called.
 void nfca_poller_end();
+
+// --- ISO14443-4 (T=CL) activation and single-APDU exchange -----------------
+// Added by Phase 3 Task 13 (EMV/APDU reader). Built entirely on the same
+// polled-IRQ transceive() primitive nfca_detect() already uses internally --
+// see st25r3916_driver.cpp's "ISO14443-4 / EMV APDU exchange" SOURCES section
+// for the real RATS/I-block citations (ST's own RFAL ISO-DEP layer,
+// ~/src/wilson-elechouse/ST25R3916/NFC-RFAL/src/rfal_isoDep.cpp/.h).
+//
+// Real call sequence (see features/nfc/nfc_emv_read.cpp for the actual user):
+//   nfca_poller_begin() -> nfca_detect(&tag, /*keep_active=*/true) -> a single
+//   iso14443_4_activate() -> any number of apdu_transceive() calls -> either
+//   nfca_poller_end() (tears the field down, ending the session) or a fresh
+//   nfca_detect() for another tag. Single-tag only, matching nfca_detect()'s
+//   own documented scope -- there is no multi-target CID/DID addressing here.
+
+// Sends RATS (Request for Answer To Select, 0xE0) and validates the ATS
+// response well enough to confirm the tag entered ISO14443-4 (T=CL) protocol
+// mode -- NOT a full TA/TB/TC parse (this task's brief explicitly does not
+// require one), beyond extracting FWI from TB (if present) to size the
+// per-APDU timeout apdu_transceive() uses. Requires nfca_poller_begin() to
+// have already run and a tag to already be ACTIVE (i.e. the most recent
+// nfca_detect() call used keep_active=true and returned kFound). Returns
+// false on any protocol/timeout/I2C failure, in which case no APDU exchange
+// should be attempted.
+bool iso14443_4_activate();
+
+// Sends one C-APDU wrapped in an ISO14443-4 I-block and returns the unwrapped
+// R-APDU in `rx`. Transparently answers S(WTX) waiting-time-extension
+// requests (bounded -- see the .cpp) since real EMV cards use these during
+// slower operations (GET PROCESSING OPTIONS in particular). Does NOT
+// implement I-block chaining in either direction: every APDU this driver
+// sends or receives is expected to fit in one frame, which the RATS exchange
+// arranges for by declaring a generous-but-buffer-safe FSD (see the .cpp) and
+// which holds for the read-only EMV command set this project's EMV feature
+// module sends. Requires iso14443_4_activate() to have already succeeded.
+// Returns false (and *rx_len = 0) on any protocol/timeout/I2C failure or on
+// an R-block/chaining response this function does not handle.
+bool apdu_transceive(const uint8_t *tx, size_t tx_len,
+                     uint8_t *rx, size_t rx_cap, size_t *rx_len);
 
 } // namespace St25r3916

@@ -34,6 +34,9 @@
 #include "features/nfc/nfc_amiibo.h" // Phase 3 Task 11: Ultralight/NTAG21x
                                      // (Amiibo/NTAG215) read/write on the
                                      // RFID2 unit
+#include "features/nfc/nfc_emv_read.h" // Phase 3 Task 13: EMV/APDU contactless
+                                       // payment-card read (PAN/expiry/vendor)
+                                       // on the NFC unit
 #include "features/rf433/rf433_scan.h" // Phase 3 Task 5: RF433 scan/capture UI
 #include "features/rf433/rf433_replay.h" // Phase 3 Task 6: replay a captured
                                           // signal on TAB5_RF433T_PIN. No
@@ -434,6 +437,11 @@ void setup() {
     // RFID2 unit. Category::NFC tile alongside the four above.
     NfcAmiibo::register_module();
 
+    // Task 13 (Phase 3): EMV/APDU contactless payment-card read (PAN/expiry/
+    // vendor, read-only) on the NFC unit. Category::NFC tile alongside the
+    // five above.
+    NfcEmvRead::register_module();
+
     // Task 5 (Phase 3): RF433 scan/capture UI (Category::RF433).
     Rf433Scan::register_module();
 
@@ -680,6 +688,11 @@ void loop() {
                        // directly (no worker task -- each tick is a single
                        // bounded MFRC522 transceive, same budget class as
                        // NfcRead::poll()'s detect calls).
+    NfcEmvRead::poll(); // Phase 3 Task 13: no-ops unless the EMV card-read
+                        // screen is open; drives its own detect/read
+                        // sequence directly (no worker task -- see
+                        // nfc_emv_read.cpp's EXECUTION MODEL comment for why
+                        // a single poll()-tick budget exception is safe here).
     Rf433Replay::poll(); // Phase 3 Task 6: no-ops unless a transmit task is in
                           // flight or has just finished; releases the GPIO53
                           // arbiter claim on completion (main-task-only, see
