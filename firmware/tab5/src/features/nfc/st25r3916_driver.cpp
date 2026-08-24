@@ -1607,6 +1607,230 @@ NfcaResult nfca_detect(Iso14443aTag *out, bool keep_active) {
 }
 
 // ===========================================================================
+// NFC Forum Type 2 Tag (MIFARE Ultralight / NTAG21x family) page read
+// (added 2026-08-24 by Phase 3 Task 24's content-emulation extension)
+//
+// WHY THIS EXISTS. Listen Mode emulation that answers only anticollision/
+// SELECT was proven useless against real readers on 2026-08-24 (see the
+// Listen Mode section's own note further down this file). To answer a
+// reader's READ commands with real data, the emulator first needs real data
+// -- and NfcCommon::TagInfo carried nothing but UID/SAK/ATQA. This is the
+// capture half: the same real T2T protocol features/nfc/nfc_amiibo.cpp has
+// been reading since 2026-08-21, but through the NFC unit (this chip) rather
+// than the separate RFID2/WS1850S unit that module drives, so that a tag
+// scanned and saved on the NFC-unit screen carries its own page content into
+// the tag library.
+//
+// SOURCES FOR THIS SECTION ONLY, same discipline as every other section here:
+//
+// [REF-T2T] ~/src/wilson-elechouse/ST25R3916/NFC-RFAL/src/rfal_t2t.cpp/.h --
+//      ST's own NFC Forum Type 2 Tag reader layer, part of the same vendored
+//      RFAL tree already cited above for rfal_nfca.cpp/rfal_isoDep.cpp, read
+//      directly for this task:
+//        - rfal_t2t.cpp:73-77 `rfalT2Tcmds`, annotated "NFC-A T2T command set
+//          T2T 1.0 5.1": RFAL_T2T_CMD_READ = 0x30, RFAL_T2T_CMD_WRITE = 0xA2,
+//          RFAL_T2T_CMD_SECTOR_SELECT = 0xC2. This is the citation for the
+//          0x30 command byte below -- NOT recall, and NOT MFRC522's
+//          identically-valued PICC_CMD_MF_READ (which is the same real byte
+//          for the same real reason, and is what nfc_amiibo.cpp's donor loop
+//          goes through).
+//        - rfal_t2t.cpp:80-84 `rfalT2TReadReq`, "T2T 1.0 5.2 and table 11":
+//          the whole command is exactly two bytes, `code` then `blNo`. CRC is
+//          appended by the hardware (rfalT2TPollerRead() passes
+//          RFAL_TXRX_FLAGS_DEFAULT, i.e. CRC on, at :127).
+//        - rfal_t2t.h:63-64 RFAL_T2T_BLOCK_LEN = 4 and RFAL_T2T_READ_DATA_LEN
+//          = 4 * RFAL_T2T_BLOCK_LEN = 16 -- one READ returns four 4-byte
+//          pages, which is why this loop advances 4 pages at a time.
+//        - rfal_t2t.cpp:53 RFAL_FDT_POLL_READ_MAX = rfalConvMsTo1fc(5), "as
+//          defined in TS T2T 1.0 table 18" -- the real 5 ms per-READ timeout,
+//          converted below into this chip's own 64/fc NRT steps exactly the
+//          way kRatsNrtSteps64fc already converts ISO-DEP's.
+//        - rfal_t2t.cpp:55-57 RFAL_T2T_ACK_NACK_LEN = 1 ("Len of NACK in
+//          bytes (4 bits)"), RFAL_T2T_ACK = 0x0A, RFAL_T2T_ACK_MASK = 0x0F,
+//          used at :130 as "T2T 1.0 5.2.1.7 The Reader/Writer SHALL treat a
+//          NACK in response to a READ Command as a Protocol Error". So a real
+//          NAK is a single 4-BIT frame whose value is not 0x0A -- it is not a
+//          whole byte, and it carries no CRC.
+//
+// [MI2] The vendored MFRC522_I2C library (lib/MFRC522_I2C/), already this
+//      project's cited source for the RFID2 unit's PICC layer:
+//        - MFRC522_I2C.h:308 `MF_ACK = 0xA` -- "The MIFARE Classic uses a 4
+//          bit ACK/NAK. Any other value than 0xA is NAK." (the same real
+//          encoding RFAL's ACK/ACK_MASK pair above describes, stated as a
+//          rule rather than a constant).
+//        - MFRC522_I2C.cpp:452,466-467 -- the real NAK DETECTION this
+//          project already ships: read RxLastBits, then
+//          `if (*backLen == 1 && _validBits == 4) return STATUS_MIFARE_NACK;`
+//        - MFRC522_I2C.cpp PICC_GetType(): `case 0x00: return
+//          PICC_TYPE_MIFARE_UL;` -- SAK 0x00 is the real Ultralight/NTAG21x
+//          family marker nfc_read.cpp now dispatches on.
+//
+// [AM] features/nfc/nfc_amiibo.cpp -- this project's OWN already-reviewed,
+//      already-real port of the donor read loop (Bruce's
+//      ~/src/firmware/src/modules/rfid/RFID2.cpp), reused verbatim in
+//      structure here rather than re-derived:
+//        - the loop bound: RFID2.cpp:428 `for (byte page = 0; page <= 252;
+//          page += 4)` -> nfc_amiibo.cpp's kDonorLastPageStart = 252.
+//        - the terminator: RFID2.cpp:431-432, a NACK from MIFARE_Read is the
+//          real, standard "read past end of memory" end-of-loop signal, not a
+//          failure.
+//        - the trim: RFID2.cpp:264-265 `dataPages = (readStatus == SUCCESS &&
+//          dataPages > 0) ? dataPages - 1 : dataPages;` -- a real T2T tag's
+//          READ near the end of memory returns the last valid page repeated
+//          to fill its 16-byte answer rather than NAKing immediately, so the
+//          final successfully-read group over-counts by exactly one page.
+//          nfc_amiibo.cpp ports that empirical correction; so does this, on
+//          the same two paths it does (tag-terminated and donor-bound-
+//          exhausted) and NOT on its own buffer-capacity path.
+//
+// ONE HONEST IMPRECISION, disclosed rather than papered over: this driver
+// cannot cleanly tell a real 4-bit NAK apart from a genuine framing/CRC error
+// at the end of memory. transceive() is the single shared exchange primitive
+// (deliberately -- it is the real-hardware-verified one), and it rejects both
+// a partial last byte and a hardware CRC flag as Xfer::kProtocol before ever
+// reading the FIFO; a 4-bit NAK carries no CRC and is exactly such a frame.
+// Widening transceive() to surface RxLastBits would mean modifying the code
+// path every verified reader feature (anticollision, SELECT, RATS, every EMV
+// APDU) runs through, for a distinction that changes nothing about the
+// result: the loop below treats ANY non-clean answer after at least one
+// successful page group as end-of-memory, which is precisely what the donor
+// loop's own `status != STATUS_OK` branch does with the NACK case as its
+// expected flavour. The raw Xfer code is logged so a real anomaly is still
+// visible.
+// ===========================================================================
+
+namespace {
+
+// [REF-T2T] rfal_t2t.cpp:74, "T2T 1.0 5.1".
+constexpr uint8_t kT2tCmdRead = 0x30U;
+// [REF-T2T] rfal_t2t.h:63 RFAL_T2T_BLOCK_LEN.
+constexpr uint8_t kT2tPageLen = 4U;
+static_assert(kT2tPageLen == kListenPageLen,
+              "the capture side and the Listen Mode responder must agree on "
+              "the T2T page size -- both are RFAL_T2T_BLOCK_LEN");
+// [REF-T2T] rfal_t2t.h:63-64.
+constexpr uint8_t kT2tPagesPerRead = 4U;
+constexpr uint8_t kT2tReadDataLen  = 16U; // 4 * RFAL_T2T_BLOCK_LEN
+// [AM]/RFID2.cpp:428 -- the donor's own last page-group start.
+constexpr int kT2tDonorLastPageStart = 252;
+// [REF-T2T] rfal_t2t.cpp:53 RFAL_FDT_POLL_READ_MAX = rfalConvMsTo1fc(5).
+// rfal_rf.h:96 RFAL_1MS_IN_1FC = 13560, so 5 ms = 67800 (1/fc); the NRT
+// counts 64/fc steps ([DS] Table 51 nrt_step = 0), 67800 / 64 = 1059.
+constexpr uint16_t kT2tReadNrtSteps64fc = 1059U;
+// Room for the largest real answer (16 data bytes + the 2 CRC bytes this chip
+// leaves in the FIFO) with margin.
+constexpr uint8_t kT2tRxBufLen = 24U;
+
+} // namespace
+
+void nfca_halt() {
+    if (!s_nfca_ready) {
+        return;
+    }
+    // Byte-for-byte the same SLP_REQ exchange nfca_detect()'s own step 3
+    // performs, including deliberately discarding the outcome -- see that
+    // call site for the ISO14443-3 6.4.3 / [EH] rfalNfcaPollerSleep()
+    // citation on why silence IS the acknowledgement.
+    uint8_t slp_rx[4] = {0};
+    uint8_t slp_len = 0;
+    (void)transceive(/*short_cmd=*/0U, kSlpReq, sizeof(kSlpReq), /*crc_tx=*/true,
+                     /*antcl=*/false, /*crc_rx=*/true,
+                     slp_rx, sizeof(slp_rx), &slp_len, millis() + 2U);
+}
+
+bool t2t_read_pages(uint8_t *out, size_t cap_bytes, uint8_t *pages_out) {
+    if (pages_out != nullptr) {
+        *pages_out = 0;
+    }
+    if (out == nullptr || cap_bytes < kT2tPageLen || !s_nfca_ready) {
+        nfca_halt();
+        return false;
+    }
+
+    size_t cap_pages = cap_bytes / kT2tPageLen;
+    if (cap_pages > 255U) {
+        cap_pages = 255U; // *pages_out is a uint8_t
+    }
+
+    size_t pages = 0;
+    bool trim = false; // donor's -1 correction applies (see [AM] above)
+
+    for (int start = 0; start <= kT2tDonorLastPageStart;
+         start += kT2tPagesPerRead) {
+        if (pages >= cap_pages) {
+            // Buffer full. Deliberately NOT trimmed -- this is this driver's
+            // own capacity limit, not the tag's end of memory, so the last
+            // group read is genuinely valid data. Mirrors nfc_amiibo.cpp's
+            // own kMaxPages safety-cap branch, which likewise skips the trim.
+            break;
+        }
+
+        // A fresh per-exchange deadline for every READ, for exactly the
+        // reason nfca_detect()'s own `deadline` variable documents at length:
+        // kDetectBudgetMs bounds ONE exchange, and reusing a single computed
+        // budget across a long sequence of them silently turns it into a
+        // shrinking shared one. A 231-page tag runs 58 of these.
+        const uint32_t deadline = millis() + kDetectBudgetMs;
+
+        // [REF-T2T] rfal_t2t.cpp:80-84 + :123-124: the whole command is
+        // {code, blNo}, sent with CRC (RFAL_TXRX_FLAGS_DEFAULT at :127).
+        // Plain ISO14443-3 data exchange -- NOT wrapped in an ISO14443-4
+        // I-block, so this deliberately uses the same low-level transceive()
+        // nfca_detect() itself uses and not apdu_transceive().
+        const uint8_t req[2] = {kT2tCmdRead, static_cast<uint8_t>(start)};
+        uint8_t rx[kT2tRxBufLen] = {0};
+        uint8_t rx_len = 0;
+        const Xfer x = transceive(/*short_cmd=*/0U, req, sizeof(req), /*crc_tx=*/true,
+                                  /*antcl=*/false, /*crc_rx=*/true,
+                                  rx, sizeof(rx), &rx_len, deadline,
+                                  kT2tReadNrtSteps64fc);
+
+        if (x != Xfer::kOk || rx_len != kT2tReadDataLen) {
+            // End of memory (the real NAK case, see this section's "ONE
+            // HONEST IMPRECISION" note), or a genuine failure. Either way the
+            // tag has no more to give.
+            Serial.printf("quarky-tab5: [st25r3916] t2t_read_pages: stopped at "
+                          "page %d (xfer=%u 0=kOk,1=kNoResponse,2=kCollision,"
+                          "3=kProtocol,4=kIo; len=%u) after %u pages\n",
+                          start, (unsigned)x, (unsigned)rx_len, (unsigned)pages);
+            trim = (pages > 0);
+            break;
+        }
+
+        const size_t room = cap_pages - pages;
+        const size_t take = (room < kT2tPagesPerRead) ? room : kT2tPagesPerRead;
+        std::memcpy(out + (pages * kT2tPageLen), rx, take * kT2tPageLen);
+        pages += take;
+
+        if (start >= kT2tDonorLastPageStart) {
+            // [AM]/RFID2.cpp:428's own loop bound reached without the tag ever
+            // saying stop -- nfc_amiibo.cpp treats that as end-of-memory too,
+            // trim included.
+            trim = (pages > 0);
+            break;
+        }
+    }
+
+    // [AM]/RFID2.cpp:264-265's real post-read correction.
+    if (trim && pages > 0) {
+        pages--;
+    }
+
+    if (pages_out != nullptr) {
+        *pages_out = static_cast<uint8_t>(pages);
+    }
+
+    // Restore the exact post-condition a plain nfca_detect() leaves behind --
+    // see nfca_halt()'s own header comment for why skipping this would make
+    // the very next scan report "no tag".
+    nfca_halt();
+
+    Serial.printf("quarky-tab5: [st25r3916] t2t_read_pages: captured %u pages "
+                  "(%u bytes)\n", (unsigned)pages, (unsigned)(pages * kT2tPageLen));
+    return pages > 0;
+}
+
+// ===========================================================================
 // ISO14443-4 (T=CL) activation and single-APDU exchange (Phase 3 Task 13,
 // EMV/APDU reader)
 //
@@ -2767,6 +2991,113 @@ bool apdu_transceive(const uint8_t *tx, size_t tx_len,
 // tail the way rfalListenStart():2501 does, and drive the same transition from
 // listen_poll() on every field-presence edge the way
 // rfalRunListenModeWorker():2747-2757 does.
+//
+// ===========================================================================
+// SECOND REAL-HARDWARE FINDING, SAME DAY (2026-08-24), AND THE CONTENT-
+// EMULATION EXTENSION IT DROVE.
+//
+// With the fix above in place, both real readers -- an iPhone running NFC
+// Tools and a Chameleon Ultra -- genuinely completed the whole anticollision/
+// SELECT sequence against the emulated tag: PASSIVE_TARGET_STATUS's pta_state
+// field walked 1(idle) -> 2/3(ready_l1/l2) -> 5(active), repeatedly and
+// reproducibly, against BOTH a saved EMV card (SAK 0x20) and a saved real
+// NTAG (SAK 0x00, UID 04:73:45:E4:3A:02:89, ATQA 0x0044). The protocol worked.
+//
+// And NEITHER reader ever showed a stable "tag found" to its user: both kept
+// re-polling, which is exactly the 1 -> 2 -> 3 -> 5 -> 0 -> 1 ... cycling
+// visible in the DIAG log. Testing the SAK 0x00 tag (not ISO14443-4 capable,
+// so RATS cannot be the explanation) produced the identical cycling, which
+// isolates the real cause: this driver answered NOTHING after SELECT. Every
+// real reader, whatever the tag's SAK, reads something back before it declares
+// success to its own user; getting silence, it concludes the tag has gone and
+// re-polls. That was the baseline's own disclosed scope boundary ("No response
+// to anything past SELECT ... the plan's own out-of-scope stretch goal"), and
+// it makes emulation useless as shipped.
+//
+// THE EXTENSION: answer the real NFC Forum Type 2 Tag READ command from a
+// captured page image (captured by t2t_read_pages() above, stored in
+// NfcCommon::TagInfo, passed in through ListenConfig::pages).
+//
+// ADDITIONAL SOURCES FOR THIS EXTENSION ONLY:
+//   ~/src/wilson-elechouse/ST25R3916/ST25R3916_ELECHOUSE/src/rfal_rfst25r3916.cpp
+//     - rfalRunListenModeWorker()'s RFAL_LM_STATE_ACTIVE_A / _ACTIVE_Ax case
+//       (:2850-2891) -- THE mechanism for receiving data in the active state,
+//       and the model for listenServiceFrame() below. On RXE (:2853/2856): OR
+//       in the PAR/CRC/ERR2/ERR1 status (:2857-2860), read
+//       st25r3916GetNumFIFOBytes() (:2861), and if any of CRC/ERR1/PAR is set
+//       OR the length is <= RFAL_CRC_LEN, discard: zero the length, CLEAR_FIFO
+//       + UNMASK_RECEIVE_DATA, and drop back to IDLE (or, from ACTIVE_Ax, to
+//       SLEEP_A) (:2863-2881). Otherwise subtract RFAL_CRC_LEN (:2884 -- the
+//       same 2-byte CRC-in-FIFO subtraction this file's own kCrcLen already
+//       centralises for the reader path), read the FIFO (:2885), and hand the
+//       raw bytes to the application via dataFlag/rxLen (:2886-2887). RFAL
+//       does NOT interpret the command or build the response -- that is the
+//       application's job in its own layering, and is what is implemented
+//       here for the first time in this project (every other feature in this
+//       codebase is a READER interpreting a TAG's answer; this is the
+//       reverse).
+//       On EOF instead of RXE (:2854-2855) it returns to POWER_OFF, which is
+//       what listen_poll()'s existing field-loss handling already does.
+//     - rfalListenSetState()'s RFAL_LM_STATE_ACTIVE_A / _ACTIVE_Ax case
+//       (:2705-2712) -- the state ENTRY that must happen once the PTA reaches
+//       active: `st25r3916SetRegisterBits(REG_PASSIVE_TARGET, d_106_ac_a)`,
+//       i.e. DISABLE the chip's autonomous 106 kb/s anticollision now that
+//       selection is over, so every subsequent frame is delivered to firmware
+//       as ordinary RXE data instead of being consumed by the PTA hardware;
+//       then clear the stale PAR/CRC/ERR2/ERR1 status and enable RXE. Ported
+//       as listenEnterActive() below (the interrupt-enable half is a no-op
+//       here for the same reason listenEnterPowerOff() already documents:
+//       this driver never writes the four IRQ MASK registers at all, leaving
+//       them at Set Default's all-enabled state).
+//     - rfalPrepareTransceive() (:1145-1160) -- the ONE load-bearing
+//       difference between the Listen Mode transmit path and the reader
+//       path's own transceive(): "In Passive Listen Mode do not use STOP as
+//       it stops FDT timer" -- CMD_CLEAR_FIFO replaces the CMD_STOP +
+//       CMD_RESET_RXGAIN pair. This was checked against the vendored source
+//       specifically rather than assumed identical, and it is not: reusing
+//       transceive() verbatim for a PICC response would stop the very timer
+//       that paces the answer. Everything after that IS the same: the
+//       no_tx_par/no_rx_par/nfc_f0 programme (:1190-1209) and the AGC enable
+//       (:1211-1216).
+//     - rfalTransceiveTx()'s RFAL_TXRX_STATE_TX_TRANSMIT case (:1341-1350,
+//       :1370-1375) -- st25r3916SetNumTxBits(bit count), st25r3916WriteFifo(),
+//       then CMD_TRANSMIT_WITH_CRC / CMD_TRANSMIT_WITHOUT_CRC. Identical to
+//       the reader path, including the BIT (not byte) count register pair,
+//       which is what lets a 4-bit NAK be transmitted at all. :1359-1366 adds
+//       one Listen-Mode-only guard -- refuse to transmit if the external
+//       field has gone -- which is explicitly skipped while the Lm state is
+//       ACTIVE_A/ACTIVE_Ax, i.e. in exactly the state this driver transmits
+//       from, so there is nothing to port.
+//     - rfalListenSleepStart()'s RFAL_LM_STATE_SLEEP_A branch (:2516-2529) --
+//       the real HALT handling, ported as listenEnterSleep(): clear
+//       PASSIVE_TARGET.d_106_ac_a (re-arming the PTA's autonomous
+//       anticollision so a later WUPA can wake us), CMD_GOTO_SLEEP (:2518,
+//       [REF] st25r3916.h:97 "Passive target logic to Sleep/Halt state"),
+//       re-write MODE's targ/om/nfc_ar bits (:2519-2521), clear
+//       ISO14443A_NFC.nfc_f0 (:2528) and CMD_UNMASK_RECEIVE_DATA (:2529).
+//   ~/src/wilson-elechouse/ST25R3916/NFC-RFAL/src/rfal_t2t.cpp/.h
+//     - the T2T command set, READ response length, and the 4-bit ACK/NAK
+//       encoding. Fully cited in the "NFC Forum Type 2 Tag page read" SOURCES
+//       block earlier in this file; the responder below answers exactly the
+//       commands that block describes reading.
+//
+// DISCLOSED GAP -- GET_VERSION IS NOT IMPLEMENTED, DELIBERATELY. Real
+// NTAG21x and Ultralight EV1 tags support a GET_VERSION command that returns
+// an 8-byte product identification, and real readers do send it. There is no
+// citable source for either its command byte or its response layout anywhere
+// in this project's vendored sources -- not in RFAL's own T2T layer
+// (rfal_t2t.cpp:73-77 lists exactly three commands: READ, WRITE, SECTOR
+// SELECT), not in the MFRC522_I2C library, not in the Bruce/Poseidon/UniGeek
+// donors (grepped, 2026-08-24). Inventing the byte and fabricating a
+// plausible-looking 8-byte answer is precisely what this file's SOURCES
+// discipline exists to prevent, so it is NOT done: an unrecognised command
+// gets a NAK, which is also genuinely what a real plain MIFARE Ultralight
+// (MF0ICU1, SAK 0x00 -- the exact family and the exact SAK this emulates)
+// does with GET_VERSION. A reader that gets a NAK there falls back to plain
+// READs, which is the path that actually carries the tag's content. If a real
+// reader is later observed to need it, the honest fix is to capture the real
+// tag's own GET_VERSION response during t2t_read_pages() and replay it, not
+// to synthesise one.
 // ===========================================================================
 
 namespace {
@@ -2777,6 +3108,7 @@ constexpr uint8_t kRegPassiveTargetStatus = 0x21U; // R  Passive target state st
 
 // --- Direct commands -----------------------------------------------------
 constexpr uint8_t kCmdGotoSense          = 0xCDU; // PTA logic -> Sense/Idle
+constexpr uint8_t kCmdGotoSleep          = 0xCEU; // PTA logic -> Sleep/Halt
 constexpr uint8_t kCmdUnmaskReceiveData  = 0xD1U;
 constexpr uint8_t kCmdClearFifo          = 0xDBU;
 
@@ -2913,6 +3245,66 @@ ListenState s_listen_state = ListenState::kNotArmed;
 // NOT expose this: to the UI both are "armed, waiting".
 bool s_listen_field_on = false;
 
+// --- Content-emulation state (2026-08-24 extension) ------------------------
+// The emulated tag's real captured page image, copied out of ListenConfig by
+// listen_start() so the caller's buffer needs no lifetime past that call.
+// 231 pages x 4 bytes = 924 bytes of BSS, sized and justified in
+// nfc_common.h's own kMaxT2tPages comment (NTAG216's real capacity).
+uint8_t s_lm_pages[kListenMaxPages][kListenPageLen];
+uint8_t s_lm_page_count = 0;
+// Mirrors RFAL's gRFAL.Lm.state == RFAL_LM_STATE_ACTIVE_A/_Ax: true once the
+// ACTIVE state ENTRY (listenEnterActive()) has run for the current selection,
+// so it runs exactly once per selection rather than on every tick.
+bool s_lm_active_entered = false;
+uint32_t s_lm_read_count = 0;
+
+// Largest received frame this responder will pull out of the FIFO. Every
+// command it answers is 2 bytes + CRC (T2T READ, HLTA) and the longest real
+// T2T command of any kind is WRITE's 6 bytes + CRC, so 32 is generous; a
+// larger frame is not a command this read-only Type 2 emulation can answer
+// and is discarded (with a CLEAR_FIFO) rather than truncated.
+constexpr uint8_t kLmMaxRxLen = 32U;
+
+// --- Frame-servicing budget, and why it is not a per-tick register read ----
+// The reader's own T2T READ timeout is 5 ms ([REF-T2T] rfal_t2t.cpp:53
+// RFAL_FDT_POLL_READ_MAX = rfalConvMsTo1fc(5), "TS T2T 1.0 table 18"). One
+// listen_poll() tick costs ~1.2 ms of I2C before it even looks at the FIFO,
+// and one LVGL frame on this 1280x720 display costs far more than 5 ms -- so
+// answering at most one frame per loop() iteration would miss EVERY command a
+// real reader sends. Once the PTA reports its active state, this driver
+// therefore stays inside a bounded servicing loop, re-sampling the IRQ status
+// registers directly (~0.45 ms per look) so the answer latency is one I2C
+// round trip rather than one UI frame.
+//
+// Bounded twice over, and only ever entered while a reader has actually
+// SELECTed us:
+//   * kLmServiceIdleMs -- leave as soon as the reader has been quiet this
+//     long. Real readers send their commands back to back (well under 1 ms
+//     apart), so 12 ms is generous think-time without being a stall.
+//   * kLmServiceBudgetMs -- a hard ceiling per tick regardless. 250 ms is
+//     sized against the real work: a full NTAG215 dump is 135 pages = 34 READ
+//     commands at ~4 ms each = ~140 ms, so an entire real read completes
+//     inside one tick. Nothing is lost if it does not -- RXE latches in the
+//     status register and the frame stays in the FIFO -- the answer just
+//     arrives a UI frame later. 250 ms leaves a 20x margin against the ~5 s
+//     task-watchdog window this project has already been bitten by twice
+//     (hal/ir_unit.h's and hal/storage_sd.cpp's own header comments).
+constexpr uint32_t kLmServiceBudgetMs = 250U;
+constexpr uint32_t kLmServiceIdleMs   = 12U;
+
+// [REF-T2T] rfal_t2t.cpp:56 RFAL_T2T_ACK = 0x0A and :57 RFAL_T2T_ACK_MASK =
+// 0x0F, plus [MI2] MFRC522_I2C.h:308 stating the rule directly: "The MIFARE
+// Classic uses a 4 bit ACK/NAK. Any other value than 0xA is NAK." So a NAK is
+// a single 4-BIT frame (RFAL_T2T_ACK_NACK_LEN = 1 byte / 4 bits, :55) whose
+// low nibble is anything but 0x0A, carrying no CRC. 0x00 is used here; the
+// specific non-ACK nibble is not itself cited anywhere in the vendored
+// sources, and per the rule above it does not need to be.
+constexpr uint8_t kT2tNakNibble  = 0x00U;
+constexpr uint16_t kT2tNakBits   = 4U;
+static_assert((kT2tNakNibble & 0x0FU) != 0x0AU,
+              "a NAK must not carry the ACK value 0x0A ([REF-T2T] "
+              "RFAL_T2T_ACK / [MI2] MFRC522_I2C.h:308)");
+
 // The real RFAL_LM_STATE_IDLE state entry, ported. [REF]
 // rfalListenSetState()'s RFAL_LM_STATE_IDLE case (rfal_rfst25r3916.cpp:
 // 2673-2695).
@@ -2990,6 +3382,12 @@ bool listenEnterIdle() {
 // and again from listen_poll() whenever the reader's field goes away.
 bool listenEnterPowerOff() {
     s_listen_field_on = false;
+    // The selection is over, so the ACTIVE state entry must run again next
+    // time a reader gets that far. (This function CLEARS d_106_ac_a a few
+    // writes below -- the exact bit listenEnterActive() sets -- so leaving the
+    // flag true would skip re-setting it and the responder would never see a
+    // frame after the next selection.)
+    s_lm_active_entered = false;
 
     if (!changeRegisterBits(kRegOpControl, kOpControlRxEn, kOpControlRxEn) || // [REF] :2635
         !executeCommandRaw(kCmdStop)) {                                      // [REF] :2636
@@ -3069,6 +3467,343 @@ bool listenEnterPowerOff() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// The PICC-side data-exchange responder (2026-08-24 content-emulation
+// extension). See this section's SOURCES block for every citation below.
+// ---------------------------------------------------------------------------
+
+// The real RFAL_LM_STATE_ACTIVE_A / _ACTIVE_Ax state entry, ported. [REF]
+// rfalListenSetState() (rfal_rfst25r3916.cpp:2705-2712).
+//
+// The load-bearing write is SETTING d_106_ac_a -- the same bit
+// listenEnterPowerOff() CLEARS to arm the PTA's autonomous anticollision.
+// Once a reader has finished selecting us, that hardware engine must stop
+// intercepting frames, so that everything the reader sends next is delivered
+// to firmware as an ordinary RXE receive for this file to interpret. Without
+// it the PTA would keep treating incoming frames as anticollision traffic and
+// the responder below would never see a single command.
+//
+// NOT ported: [REF] :2707-2711's st25r3916GetInterrupt(PAR|CRC|ERR2|ERR1) and
+// st25r3916EnableInterrupts(RXE). The first is redundant here -- listen_poll()
+// has just consumed all four status registers via sampleIrqs() (they are
+// read-and-clear), which is strictly more than RFAL clears. The second is a
+// no-op for the same reason listenEnterPowerOff() already documents at
+// length: this driver never writes the four IRQ MASK registers at all, so
+// every source is already enabled at Set Default's own reset value.
+bool listenEnterActive() {
+    return changeRegisterBits(kRegPassiveTarget, kPtDisable106Ac, kPtDisable106Ac);
+}
+
+// The real RFAL_LM_STATE_SLEEP_A entry, ported. [REF] rfalListenSleepStart()
+// (:2516-2529). This is what a real HLTA/SLP_REQ from the reader means: the
+// emulated tag stops answering data commands and parks in HALT, from which
+// ONLY a WUPA wakes it again -- a genuinely distinct protocol state from
+// "the field went away".
+//
+// HOW IT COMPOSES WITH THE EXISTING FIELD-LOSS PATH, stated explicitly since
+// the two are easy to confuse:
+//   * HALT (here) leaves the chip powered, the field still present, and
+//     re-ARMS the PTA's autonomous anticollision (d_106_ac_a cleared again)
+//     so the hardware itself can answer the reader's next WUPA and walk
+//     ready_l1_x/ready_l2_x -> active_x on its own. listen_poll() then sees
+//     pta_state back at 0xD and re-runs listenEnterActive(), so a reader that
+//     HALTs and re-selects is served again with no software re-arming.
+//   * Field loss (listenEnterPowerOff(), unchanged) is the harder reset: chip
+//     activity stopped, PTA sent back to Sense/Idle, MODE re-written.
+//   * The user-visible ListenState is deliberately NOT downgraded by a HALT.
+//     A reader HALTing us right after reading is a NORMAL, successful end to
+//     a transaction -- it is what nfca_detect() itself does to every tag it
+//     reads -- so reporting "no longer selected" there would replace a true
+//     success message with a misleading one. The latch is released only by
+//     real field loss, exactly as the baseline already did for kSelected.
+//
+// NOT ported from [REF]: its trailing rfalIsExtFieldOn() check and
+// rfalListenStop()-on-link-loss (:2541-2544). listen_poll()'s own
+// efd_o/EOF handling already covers field loss on the very next tick, via a
+// path that recovers (POWER_OFF re-entry) instead of tearing the session down.
+bool listenEnterSleep() {
+    if (!changeRegisterBits(kRegPassiveTarget, kPtDisable106Ac, 0U) || // [REF] :2517
+        !executeCommandRaw(kCmdGotoSleep)) {                          // [REF] :2518
+        return false;
+    }
+    // [REF] :2519-2521 -- the same MODE value listenEnterPowerOff() writes.
+    if (!changeRegisterBits(
+            kRegMode,
+            static_cast<uint8_t>(kModeTarg | kModeOmMask | kModeNfcArMask),
+            static_cast<uint8_t>(kModeTarg | kModeOm3 | kModeOm0 | kModeNfcArOff))) {
+        return false;
+    }
+    // [REF] :2528-2529
+    if (!changeRegisterBits(kRegIso14443aNfc, kIso14443aNfcF0, 0U)) {
+        return false;
+    }
+    return executeCommandRaw(kCmdUnmaskReceiveData);
+}
+
+// The Listen Mode transmit half. Deliberately NOT transceive(): that function
+// opens with CMD_STOP + CMD_RESET_RXGAIN, and [REF] rfalPrepareTransceive()
+// (:1150-1160) branches on exactly this -- "In Passive Listen Mode do not use
+// STOP as it stops FDT timer", issuing CMD_CLEAR_FIFO instead. This was
+// checked against the vendored source rather than assumed identical to the
+// reader path, and it is not identical. Everything after that IS the same
+// sequence transceive()'s own TX half already uses: the parity/framing
+// programme ([REF] :1190-1209), AGC on ([REF] :1211-1216), the BIT-count
+// register pair, the FIFO load, then TRANSMIT_WITH_CRC / WITHOUT_CRC ([REF]
+// rfalTransceiveTx() :1341-1350, :1370-1375).
+//
+// `bits` is a BIT count, not a byte count, because a real T2T NAK is 4 bits
+// ([REF-T2T] RFAL_T2T_ACK_NACK_LEN's own "1 byte (4 bits)" annotation) and
+// this chip's NUM_TX_BYTES1/2 pair is natively a bit counter ([EH]
+// st25r3916SetNumTxBits(), st25r3916.cpp:364-368) -- the same registers
+// transceive() already writes, just not always a multiple of 8.
+//
+// Deliberately does NOT wait for TXE afterwards. RFAL waits because its state
+// machine has somewhere to go next; here a wait would have to consume the IRQ
+// status registers, and those are read-and-CLEAR -- swallowing the RXE of the
+// reader's NEXT command, which arrives within a millisecond or two. The
+// servicing loop re-samples them on its own a moment later, which both
+// observes the transmit completing and catches that next command.
+bool listenTransmit(const uint8_t *data, uint16_t bits, bool with_crc) {
+    const uint16_t bytes = static_cast<uint16_t>((bits + 7U) / 8U);
+    if (data == nullptr || bytes == 0U || bytes > 255U) {
+        return false;
+    }
+    if (!executeCommandRaw(kCmdClearFifo)) { // [REF] :1159, NOT CMD_STOP
+        return false;
+    }
+    // [REF] :1190-1209: hardware parity in both directions, no NFCIP-1
+    // framing. antcl is included in the mask (and cleared) because [DS]
+    // Table 27 says it "Must be set to 0 for all other frames and modes",
+    // and the reader path's transceive() is what may have last set it.
+    if (!changeRegisterBits(kRegIso14443aNfc,
+                            static_cast<uint8_t>(kIso14443aNoTxPar | kIso14443aNoRxPar |
+                                                 kIso14443aNfcF0 | kIso14443aAntcl),
+                            0U)) {
+        return false;
+    }
+    if (!changeRegisterBits(kRegRxConf2, kRxConf2AgcEn, kRxConf2AgcEn)) { // [REF] :1214
+        return false;
+    }
+    // [EH] st25r3916SetNumTxBits(): low byte to NUM_TX_BYTES2 (23h), high byte
+    // to NUM_TX_BYTES1 (22h). Identical to transceive()'s own call site.
+    if (!writeRegisterRaw(kRegNumTxBytes2, static_cast<uint8_t>(bits & 0xFFU)) ||
+        !writeRegisterRaw(kRegNumTxBytes1, static_cast<uint8_t>(bits >> 8))) {
+        return false;
+    }
+    if (!writeFifoRaw(data, static_cast<uint8_t>(bytes))) {
+        return false;
+    }
+    return executeCommandRaw(with_crc ? kCmdTxWithCrc : kCmdTxWithoutCrc);
+}
+
+bool listenSendNak() {
+    const uint8_t nak = kT2tNakNibble;
+    // No CRC: a 4-bit ACK/NAK frame carries none ([REF-T2T]
+    // rfalT2TPollerRead()'s own ERR_INCOMPLETE_BYTE + 1-byte/4-bit detection
+    // at :130 is what a NAK looks like to a reader).
+    return listenTransmit(&nak, kT2tNakBits, /*with_crc=*/false);
+}
+
+// Builds the real 16-byte answer to a T2T READ of `block`. Returns false when
+// the request is genuinely out of range and must be NAKed instead.
+//
+// THE END-OF-MEMORY WRAP is not an approximation -- it reproduces the exact
+// real behaviour this project already had to compensate for on the READING
+// side: [AM] nfc_amiibo.cpp's own donor-cited trim (RFID2.cpp:264-265) exists
+// because "a Type 2 tag's MIFARE_Read near the end of memory returns the last
+// valid page's data repeated to fill the 16-byte response rather than NAKing
+// immediately". An emulated tag that instead NAKed a partially-in-range READ
+// would behave differently from the real tag its page image was captured
+// from, and would break a reader walking the tag four pages at a time.
+bool buildT2tReadResponse(uint8_t block, uint8_t (&resp)[kT2tReadDataLen]) {
+    if (s_lm_page_count == 0U || block >= s_lm_page_count) {
+        return false;
+    }
+    for (uint8_t i = 0; i < kT2tPagesPerRead; i++) {
+        uint16_t page = static_cast<uint16_t>(block) + i;
+        if (page >= s_lm_page_count) {
+            page = static_cast<uint16_t>(s_lm_page_count - 1U);
+        }
+        std::memcpy(&resp[i * kT2tPageLen], s_lm_pages[page], kT2tPageLen);
+    }
+    return true;
+}
+
+enum class LmFrame : uint8_t {
+    kNone,      // nothing usable in the FIFO (discarded)
+    kServiced,  // a command was interpreted and answered
+    kHalted,    // the reader sent HLTA; the PTA is now parked in Sleep/Halt
+    kIoError,   // I2C failure
+};
+
+// Reads ONE received frame out of the FIFO and answers it. Modelled directly
+// on [REF] rfalRunListenModeWorker()'s RFAL_LM_STATE_ACTIVE_A/_Ax RXE branch
+// (:2856-2887) for everything up to "here are the raw command bytes"; the
+// interpretation and response-building after that are the application's job
+// in RFAL's own layering, and are this project's own.
+LmFrame listenServiceFrame(uint32_t irqs) {
+    // [REF] :2861 st25r3916GetNumFIFOBytes(), i.e. the same FIFO status
+    // register pair transceive() already decodes.
+    uint8_t st1 = 0;
+    uint8_t st2 = 0;
+    if (!readRegisterRaw(kRegFifoStatus1, &st1) ||
+        !readRegisterRaw(kRegFifoStatus2, &st2)) {
+        return LmFrame::kIoError;
+    }
+    const uint16_t n = static_cast<uint16_t>(
+        (static_cast<uint16_t>((st2 & kFifoStatus2ByteHiMask) >> kFifoStatus2ByteHiShift) << 8) |
+        st1);
+
+    // [REF] :2863-2881: CRC/ERR1/PAR, or a frame no longer than the CRC
+    // itself, is not a command -- discard it with CLEAR_FIFO +
+    // UNMASK_RECEIVE_DATA and stay where we are. (RFAL additionally drops
+    // back to IDLE/SLEEP here; this driver does not, deliberately: it tracks
+    // the PTA's own state register rather than a software mirror of it, so
+    // the next listen_poll() tick reads the truth from the hardware instead
+    // of guessing. A genuinely lost selection shows up there as pta_state
+    // leaving active.)
+    const uint32_t rx_errors = kIrqCrc | kIrqErr1 | kIrqPar;
+    if ((irqs & rx_errors) != 0U || n <= kCrcLen || n > kLmMaxRxLen) {
+        executeCommandRaw(kCmdClearFifo);
+        executeCommandRaw(kCmdUnmaskReceiveData);
+        return LmFrame::kNone;
+    }
+
+    uint8_t buf[kLmMaxRxLen] = {0};
+    if (!readFifoRaw(buf, static_cast<uint8_t>(n))) {
+        return LmFrame::kIoError;
+    }
+    // [REF] :2884 `*gRFAL.Lm.rxLen -= RFAL_CRC_LEN` -- the chip verified the
+    // CRC in hardware (a mismatch was rejected above) but still leaves the two
+    // bytes in the FIFO, exactly as transceive()'s own crc_rx path already
+    // documents at length for the reader direction.
+    const uint16_t len = static_cast<uint16_t>(n - kCrcLen);
+
+    // --- T2T READ (0x30 + block number) ------------------------------------
+    // [REF-T2T] rfal_t2t.cpp:74 RFAL_T2T_CMD_READ, :80-84 rfalT2TReadReq
+    // ("T2T 1.0 5.2 and table 11"): the command is exactly {code, blNo}.
+    if (len == 2U && buf[0] == kT2tCmdRead) {
+        uint8_t resp[kT2tReadDataLen] = {0};
+        if (!buildT2tReadResponse(buf[1], resp)) {
+            // Out of range (or no page image captured at all) -- the real
+            // answer is a NAK. [REF-T2T] :130 cites "T2T 1.0 5.2.1.7 The
+            // Reader/Writer SHALL treat a NACK in response to a READ Command
+            // as a Protocol Error", i.e. this is the defined way for a Type 2
+            // tag to refuse a READ.
+            (void)listenSendNak();
+            return LmFrame::kServiced;
+        }
+        // 16 bytes with CRC appended in hardware -- [REF-T2T] rfal_t2t.h:64
+        // RFAL_T2T_READ_DATA_LEN, and rfalT2TPollerRead():127 passing
+        // RFAL_TXRX_FLAGS_DEFAULT (CRC on) for the reader's own side of the
+        // same exchange.
+        if (!listenTransmit(resp, static_cast<uint16_t>(kT2tReadDataLen) * 8U,
+                            /*with_crc=*/true)) {
+            return LmFrame::kIoError;
+        }
+        s_lm_read_count++;
+        if (s_lm_read_count == 1U) {
+            Serial.printf("quarky-tab5: [st25r3916] Listen Mode: answered a real "
+                          "T2T READ (page %u) with captured content -- a reader "
+                          "is genuinely reading this emulated tag\n",
+                          (unsigned)buf[1]);
+        }
+        return LmFrame::kServiced;
+    }
+
+    // --- HLTA / SLP_REQ (0x50 0x00) ----------------------------------------
+    // kSlpReq is this file's own already-cited constant ([EH] rfal_nfca.cpp:
+    // 58-61, "Digital 1.1 6.9.1 & Table 20") -- the very bytes nfca_detect()
+    // SENDS as a reader. Answering it correctly is the mirror image.
+    if (len == sizeof(kSlpReq) && buf[0] == kSlpReq[0] && buf[1] == kSlpReq[1]) {
+        // A real tag acknowledges HLTA by staying SILENT (ISO14443-3 6.4.3,
+        // the same rule nfca_detect() relies on from the other side), so
+        // nothing is transmitted here -- only the state change.
+        Serial.println("quarky-tab5: [st25r3916] Listen Mode: reader sent HLTA "
+                       "-- parking the emulated tag in HALT (only a WUPA wakes "
+                       "it now)");
+        if (!listenEnterSleep()) {
+            return LmFrame::kIoError;
+        }
+        return LmFrame::kHalted;
+    }
+
+    // --- Anything else -----------------------------------------------------
+    // T2T WRITE (0xA2) and SECTOR SELECT (0xC2) ([REF-T2T] rfal_t2t.cpp:75-76)
+    // are deliberately unimplemented -- this is read-only emulation, matching
+    // the read-only discipline this project's EMV reader already follows.
+    // GET_VERSION is unimplemented for the reason spelled out in full in this
+    // section's "DISCLOSED GAP" note (no citable source for its command byte
+    // or response layout in any vendored source, and NAKing it is what a real
+    // plain MIFARE Ultralight does anyway). RATS (0xE0) likewise: ISO14443-4
+    // card emulation is out of scope.
+    //
+    // All of them get a NAK, and the emulated tag deliberately stays ACTIVE
+    // afterwards. A strict MIFARE Ultralight returns to IDLE after NAKing an
+    // unsupported command; staying ACTIVE is a deliberate interoperability
+    // deviation, disclosed here, so that a reader which probes with an
+    // unsupported command first (GET_VERSION being the common real case) can
+    // still go straight on to the plain READs that carry the tag's content
+    // instead of having to re-run anticollision.
+    Serial.printf("quarky-tab5: [st25r3916] Listen Mode: NAKing unsupported "
+                  "command 0x%02X (len=%u)\n", buf[0], (unsigned)len);
+    (void)listenSendNak();
+    return LmFrame::kServiced;
+}
+
+// The bounded ACTIVE-state servicing loop. See kLmServiceBudgetMs's own
+// comment for why this is a loop rather than one frame per listen_poll()
+// tick. Returns false only on a real I2C failure.
+bool listenServiceActive(uint32_t irqs) {
+    if (!s_lm_active_entered) {
+        if (!listenEnterActive()) {
+            return false;
+        }
+        s_lm_active_entered = true;
+    }
+
+    const uint32_t budget_end = millis() + kLmServiceBudgetMs;
+    uint32_t quiet_since = millis();
+    uint32_t acc = irqs;
+
+    for (;;) {
+        if ((acc & kIrqEof) != 0U) {
+            // The reader's field went away mid-exchange. Leave immediately and
+            // let listen_poll()'s existing, unchanged field-loss path run on
+            // the next tick -- it is the one that re-enters POWER_OFF.
+            return true;
+        }
+        if ((acc & kIrqRxe) != 0U) {
+            const LmFrame r = listenServiceFrame(acc);
+            if (r == LmFrame::kIoError) {
+                return false;
+            }
+            if (r == LmFrame::kHalted) {
+                // The PTA is parked in Sleep/Halt and its autonomous
+                // anticollision is re-armed; the ACTIVE entry must run again
+                // if the reader wakes us with a WUPA.
+                s_lm_active_entered = false;
+                return true;
+            }
+            quiet_since = millis();
+        }
+
+        if (static_cast<int32_t>(millis() - budget_end) >= 0) {
+            return true;
+        }
+        if (static_cast<int32_t>(millis() - (quiet_since + kLmServiceIdleMs)) >= 0) {
+            return true;
+        }
+
+        yield(); // ~0.45 ms of I2C per iteration; keep the RTOS/WDT happy
+                 // anyway, exactly as waitIrqs() already does.
+        acc = 0;
+        if (!sampleIrqs(&acc)) {
+            return false;
+        }
+    }
+}
+
 } // namespace
 
 bool listen_start(const ListenConfig &cfg) {
@@ -3141,9 +3876,40 @@ bool listen_start(const ListenConfig &cfg) {
     }
 
     // AUX (0x0A): NFCID length select. [REF] rfalListenStart():2439/2443.
-    if (!changeRegisterBits(kRegAux, kAuxNfcIdMask,
+    //
+    // no_crc_rx is cleared in the same write (2026-08-24, with the
+    // content-emulation extension). It is not part of RFAL's own
+    // rfalListenStart() because RFAL never sets it outside the two reader-side
+    // short-frame/anticollision exchanges that need it -- but THIS driver's
+    // transceive() sets and clears it per call, so whichever reader-path
+    // exchange ran last decides what Listen Mode inherits. It must be 0 here:
+    // the responder below relies on the chip verifying the received CRC in
+    // hardware and reporting a mismatch via I_crc, which is exactly what
+    // [REF] rfalRunListenModeWorker()'s ACTIVE_A branch (:2857-2870) checks
+    // before trusting a frame. Harmless for the anticollision/SELECT sequence
+    // that was verified against two real readers today (the PTA hardware
+    // handles those frames itself and [DS] Table 36 Note 1 applies
+    // receive-without-CRC automatically for them regardless).
+    if (!changeRegisterBits(kRegAux,
+                            static_cast<uint8_t>(kAuxNfcIdMask | kAuxNoCrcRx),
                             (cfg.uid_len == 4U) ? kAuxNfcId4Bytes : kAuxNfcId7Bytes)) {
         return false;
+    }
+
+    // Copy the real captured page image (if any) into the driver's own
+    // storage. Clamped rather than rejected: a caller with a larger image
+    // still gets the pages that fit, which is strictly better than refusing to
+    // emulate at all, and kListenMaxPages already covers NTAG216, the largest
+    // tag in the family this responds for.
+    s_lm_page_count = 0;
+    s_lm_read_count = 0;
+    s_lm_active_entered = false;
+    std::memset(s_lm_pages, 0, sizeof(s_lm_pages));
+    if (cfg.pages != nullptr && cfg.page_count > 0U) {
+        s_lm_page_count = (cfg.page_count > kListenMaxPages) ? kListenMaxPages
+                                                             : cfg.page_count;
+        std::memcpy(s_lm_pages, cfg.pages,
+                    static_cast<size_t>(s_lm_page_count) * kListenPageLen);
     }
 
     // Build and write the 15-byte PT_A memory block. [REF] rfalListenStart():
@@ -3227,7 +3993,14 @@ bool listen_start(const ListenConfig &cfg) {
     s_listen_state = ListenState::kIdle;
     Serial.printf("quarky-tab5: [st25r3916] Listen Mode armed "
                   "(NFC-A, 106 kb/s, hardware PTA auto-anticollision); "
+                  "%u pages of real captured content to answer T2T READs with%s; "
                   "external field %s\n",
+                  (unsigned)s_lm_page_count,
+                  (s_lm_page_count == 0U)
+                      ? " (UID/SAK/ATQA-only emulation -- every data command "
+                        "will be NAKed; re-scan and re-save this tag on the NFC "
+                        "unit to capture its pages)"
+                      : "",
                   s_listen_field_on ? "already present -- entered IDLE"
                                     : "not present yet -- parked in POWER_OFF, "
                                       "listen_poll() will enter IDLE when it appears");
@@ -3323,21 +4096,49 @@ ListenState listen_poll() {
 
     const uint8_t state = static_cast<uint8_t>(pts & kPtaStateMask);
     if (state == kPtaStActive || state == kPtaStActiveX) {
-        // Latched: once a reader has SELECTed us, keep reporting kSelected
-        // (rather than flipping back to kIdle on, e.g., a HALT the reader
-        // sends right after reading) until the field genuinely disappears
-        // (handled above). That is the one event this baseline promises to
-        // report, and it is real user-visible information worth keeping on
-        // screen.
-        s_listen_state = ListenState::kSelected;
-    } else if (s_listen_state != ListenState::kSelected) {
-        s_listen_state = ListenState::kIdle;
+        // Latched: once a reader has SELECTed us, keep reporting at least
+        // kSelected (rather than flipping back to kIdle on, e.g., a HALT the
+        // reader sends right after reading) until the field genuinely
+        // disappears (handled above). That is real user-visible information
+        // worth keeping on screen.
+        if (s_listen_state != ListenState::kDataRead) {
+            s_listen_state = ListenState::kSelected;
+        }
+
+        // The 2026-08-24 content-emulation extension: this is where the
+        // baseline used to simply stop. A reader that has SELECTed us is
+        // about to send real commands, and answering them is the whole
+        // difference between "our UID was accepted" and "a reader actually
+        // read this tag". Bounded -- see kLmServiceBudgetMs.
+        if (!listenServiceActive(irqs)) {
+            s_listen_state = ListenState::kHardwareError;
+            return s_listen_state;
+        }
+        if (s_lm_read_count > 0U) {
+            // Latched for the same reason kSelected is, and released by the
+            // same event (real field loss, handled above).
+            s_listen_state = ListenState::kDataRead;
+        }
+    } else {
+        // Not selected right now. If the PTA left the active state without
+        // going through our own HALT handler (the reader walked away
+        // mid-transaction, or re-ran anticollision), the ACTIVE state entry
+        // must run again next time it gets there.
+        s_lm_active_entered = false;
+        if (s_listen_state != ListenState::kSelected &&
+            s_listen_state != ListenState::kDataRead) {
+            s_listen_state = ListenState::kIdle;
+        }
     }
     return s_listen_state;
 }
 
 ListenState listen_get_state() {
     return s_listen_state;
+}
+
+uint32_t listen_get_read_count() {
+    return s_lm_read_count;
 }
 
 void listen_stop() {
@@ -3347,6 +4148,11 @@ void listen_stop() {
     s_listen_armed = false;
     s_listen_state = ListenState::kNotArmed;
     s_listen_field_on = false;
+    s_lm_active_entered = false;
+    s_lm_page_count = 0;
+    // s_lm_read_count is deliberately NOT zeroed here: listen_start() zeroes
+    // it, and leaving it alone lets a caller read the final count back after
+    // tearing the session down.
 
     executeCommandRaw(kCmdStop); // [DS] Table 13 C2h: stop all activities
 

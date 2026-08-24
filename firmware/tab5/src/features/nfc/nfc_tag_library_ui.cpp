@@ -19,6 +19,7 @@
 #include <lvgl.h>
 
 #include <cstdio>
+#include <cstring>
 
 extern FeatureRegistry g_registry;
 extern StorageSD storage; // defined in main.cpp (Phase 1 Task 10); handed to
@@ -72,9 +73,19 @@ void show_tag(int idx) {
     }
     char uid_str[64];
     NfcCommon::format_uid(tag.uid, tag.uid_len, uid_str, sizeof(uid_str));
-    char buf[160];
-    std::snprintf(buf, sizeof(buf), "%s\n%s\nUID (%u bytes): %s", s_names[idx], tag.type_name,
-                  (unsigned)tag.uid_len, uid_str);
+    char buf[224];
+    // page_count is surfaced because it is exactly what decides whether the
+    // "Emulate" button below can answer a reader's READ commands or only its
+    // anticollision -- see nfc_emulate.h's own scope comment.
+    std::snprintf(buf, sizeof(buf),
+                  "%s\n%s\nUID (%u bytes): %s\nContent: %s",
+                  s_names[idx], tag.type_name, (unsigned)tag.uid_len, uid_str,
+                  (tag.page_count > 0) ? "captured pages -- full emulation"
+                                       : "none -- UID/SAK/ATQA emulation only");
+    if (tag.page_count > 0) {
+        std::snprintf(buf + std::strlen(buf), sizeof(buf) - std::strlen(buf),
+                      " (%u pages)", (unsigned)tag.page_count);
+    }
     if (s_detail_label != nullptr) {
         lv_label_set_text(s_detail_label, buf);
     }

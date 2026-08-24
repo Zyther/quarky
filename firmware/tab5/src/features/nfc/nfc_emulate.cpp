@@ -24,12 +24,29 @@ enum class EmulateState : uint8_t {
     kArming,        // screen just opened; the next poll() tick arms Listen Mode
     kWaiting,       // armed; St25r3916::listen_poll() reports kIdle
     kSelected,      // St25r3916::listen_poll() reports kSelected
+    kDataRead,      // St25r3916::listen_poll() reports kDataRead -- a reader
+                    // has actually READ real page content back, which is the
+                    // only state that means emulation worked end to end
     kFailed,        // listen_start() failed, or listen_poll() reported
                     // kHardwareError -- latched, no retry until re-entry
 };
 
 EmulateState s_state = EmulateState::kArming;
 NfcCommon::TagInfo s_tag{};
+
+// The two headers each declare their own page-image size (the driver
+// deliberately does not include nfc_common.h -- it is a register-level driver
+// with no feature-layer dependencies). This translation unit is the one place
+// that sees both, so it is where the two are held to agree.
+static_assert(NfcCommon::kMaxT2tPages == St25r3916::kListenMaxPages,
+              "NfcCommon::TagInfo's page image and Listen Mode's own must be "
+              "the same size, or listen_start() would silently truncate");
+static_assert(NfcCommon::kT2tPageLen == St25r3916::kListenPageLen,
+              "T2T page length must match on both sides");
+
+// Last read count rendered, so the status line can be refreshed as a reader
+// works through the tag without repainting the label on every poll() tick.
+uint32_t s_shown_read_count = 0;
 
 lv_obj_t *s_status_label = nullptr;
 lv_obj_t *s_tag_label = nullptr;
@@ -65,6 +82,13 @@ void run_arm() {
     }
     cfg.sak = s_tag.sak;
 
+    // The real captured page image, if this saved record has one (see
+    // nfc_common.h's own page_count/pages comment for why it exists and what
+    // page_count == 0 means). listen_start() COPIES it, so pointing at
+    // s_tag's own storage is safe.
+    cfg.pages = (s_tag.page_count > 0) ? &s_tag.pages[0][0] : nullptr;
+    cfg.page_count = s_tag.page_count;
+
     if (!St25r3916::listen_start(cfg)) {
         s_state = EmulateState::kFailed;
         s_unit_armed = false;
@@ -77,7 +101,20 @@ void run_arm() {
 
     s_unit_armed = true;
     s_state = EmulateState::kWaiting;
-    set_status("Waiting for a reader...");
+    s_shown_read_count = 0;
+    if (s_tag.page_count > 0) {
+        set_status("Waiting for a reader...");
+    } else {
+        // Honest, actionable: this saved record predates page capture (or came
+        // from the RFID2 unit, or is not a Type 2 tag at all), so a reader
+        // will complete anticollision and then get a NAK for everything --
+        // which is exactly the "reader keeps re-polling" behaviour real
+        // hardware showed on 2026-08-24.
+        set_status("Waiting for a reader...\n"
+                   "NOTE: this saved tag has no page content, so only its\n"
+                   "UID/SAK/ATQA can be emulated. Re-scan and re-save it on\n"
+                   "\"NFC: Tag Read\" to capture its pages.");
+    }
 }
 
 void teardown() {
@@ -108,9 +145,10 @@ lv_obj_t *build_screen() {
     s_tag_label = lv_label_create(content);
     char uid_str[64];
     NfcCommon::format_uid(s_tag.uid, s_tag.uid_len, uid_str, sizeof(uid_str));
-    char buf[160];
-    std::snprintf(buf, sizeof(buf), "%s\nUID: %s\nSAK %02X", s_tag.type_name,
-                  uid_str, (unsigned)s_tag.sak);
+    char buf[192];
+    std::snprintf(buf, sizeof(buf), "%s\nUID: %s\nSAK %02X | %u pages of content",
+                  s_tag.type_name, uid_str, (unsigned)s_tag.sak,
+                  (unsigned)s_tag.page_count);
     lv_label_set_text(s_tag_label, buf);
 
     s_status_label = lv_label_create(content);
@@ -159,16 +197,38 @@ void poll() {
         case St25r3916::ListenState::kIdle:
             if (s_state != EmulateState::kWaiting) {
                 s_state = EmulateState::kWaiting;
+                s_shown_read_count = 0;
                 set_status("Waiting for a reader...");
             }
             break;
         case St25r3916::ListenState::kSelected:
             if (s_state != EmulateState::kSelected) {
                 s_state = EmulateState::kSelected;
-                set_status("Reader detected this tag's UID!\n"
-                          "(UID/SAK/ATQA only -- no data exchange yet.)");
+                s_shown_read_count = 0;
+                set_status("Reader completed anticollision + SELECT.\n"
+                           "Waiting for it to read data...");
             }
             break;
+        case St25r3916::ListenState::kDataRead: {
+            // The state that actually means emulation worked: a real reader
+            // sent a real T2T READ and got real captured page content back.
+            // Repainted whenever the count moves so the user can watch a
+            // reader walk the tag, not just see a one-shot message.
+            const uint32_t reads = St25r3916::listen_get_read_count();
+            if (s_state != EmulateState::kDataRead || reads != s_shown_read_count) {
+                s_state = EmulateState::kDataRead;
+                s_shown_read_count = reads;
+                char msg[160];
+                std::snprintf(msg, sizeof(msg),
+                              "Reader is READING this tag!\n"
+                              "%lu READ command%s answered with real captured\n"
+                              "page content (%u pages available).",
+                              (unsigned long)reads, (reads == 1) ? "" : "s",
+                              (unsigned)s_tag.page_count);
+                set_status(msg);
+            }
+            break;
+        }
         case St25r3916::ListenState::kHardwareError:
             s_state = EmulateState::kFailed;
             s_unit_armed = false; // the chip already stopped answering;

@@ -213,13 +213,30 @@ static bool try_read_rfid2_uid(NfcCommon::TagInfo *out) {
 // chip's IRQ status registers (this hardware has no IRQ line). Implemented in
 // St25r3916::nfca_detect(); see st25r3916_driver.cpp for the citations and for
 // what is deliberately not implemented (multi-tag collision resolution).
+// SAK 0x00 is the real NFC Forum Type 2 Tag (MIFARE Ultralight / NTAG21x
+// family) marker, not a guess: the vendored MFRC522_I2C library's own
+// PICC_GetType() has `case 0x00: return PICC_TYPE_MIFARE_UL;`, and
+// nfc_amiibo.cpp already dispatches on exactly that value (via
+// PICC_TYPE_MIFARE_UL) for its own real page-read loop on the RFID2 unit.
+// The real NTAG this project has in hand reports exactly this SAK.
+static constexpr uint8_t kSakMifareUltralight = 0x00U;
+
 static bool try_read_nfc_uid(NfcCommon::TagInfo *out) {
     if (out == nullptr) {
         return false;
     }
 
     St25r3916::Iso14443aTag tag{};
-    const St25r3916::NfcaResult res = St25r3916::nfca_detect(&tag);
+    // keep_active=true, ALWAYS -- the SAK that decides whether page content is
+    // worth reading is only known after this call returns, and a tag HALTed by
+    // the default auto-SLP_REQ answers nothing afterwards. Every path below
+    // therefore owes the tag an explicit HALT: t2t_read_pages() sends one
+    // itself (documented in its own header comment), and the non-Type-2 path
+    // calls nfca_halt() directly. Without that, a card left sitting on the
+    // antenna would stay ACTIVE, ignore the next pass's WUPA, and read exactly
+    // once per physical presentation -- the precise bug nfca_detect()'s own
+    // SLP_REQ step exists to prevent.
+    const St25r3916::NfcaResult res = St25r3916::nfca_detect(&tag, /*keep_active=*/true);
 
     switch (res) {
         case St25r3916::NfcaResult::kFound:
@@ -228,9 +245,16 @@ static bool try_read_nfc_uid(NfcCommon::TagInfo *out) {
             return false;
         case St25r3916::NfcaResult::kCollision:
             set_status("Multiple tags -- present one at a time");
+            // A tag may well have got part-way through selection before this
+            // was reported; HALT so the next pass's WUPA still reaches it.
+            // (kNoTag needs none -- nothing answered at all -- and
+            // kHardwareError is a dead bus, where another exchange is
+            // pointless.)
+            St25r3916::nfca_halt();
             return false;
         case St25r3916::NfcaResult::kProtocolError:
             set_status("Tag answered but the exchange failed");
+            St25r3916::nfca_halt();
             return false;
         case St25r3916::NfcaResult::kHardwareError:
         default:
@@ -242,6 +266,7 @@ static bool try_read_nfc_uid(NfcCommon::TagInfo *out) {
     }
 
     if (tag.uid_len == 0 || tag.uid_len > sizeof(out->uid)) {
+        St25r3916::nfca_halt(); // see the keep_active=true note above
         return false;
     }
     out->uid_len = tag.uid_len;
@@ -261,6 +286,55 @@ static bool try_read_nfc_uid(NfcCommon::TagInfo *out) {
     out->sak = tag.sak;
     out->atqa[0] = tag.atqa[0];
     out->atqa[1] = tag.atqa[1];
+
+    // --- Real page-content capture (2026-08-24, Task 24's content-emulation
+    // extension) -----------------------------------------------------------
+    // Why it lives HERE rather than in a new screen: this is already the one
+    // place in the project where an NFC-unit scan becomes a TagInfo that the
+    // "Save to Library" button then writes to SD, and the Emulate screen
+    // consumes that exact record. Capturing the pages anywhere else would
+    // mean a second scan of the same tag, and a saved record that may or may
+    // not have content depending on which screen the user happened to use.
+    //
+    // COST, disclosed: t2t_read_pages() runs one T2T READ per 4 pages
+    // (~4 ms each on this 100 kHz bus), so this branch adds ~50 ms for an
+    // NTAG213, ~140 ms for an NTAG215 and ~240 ms for an NTAG216 to the ONE
+    // poll() tick that finds such a tag. That is the same class of disclosed,
+    // one-shot budget exception as run_bring_up()'s own ~205 ms tick
+    // documented above -- it happens once per successful scan, not at the
+    // 4 Hz scanning cadence, and is nowhere near the ~5 s task watchdog.
+    //
+    // Non-Type-2 tags (EMV cards at SAK 0x20, MIFARE Classic at 0x08/0x18,
+    // ...) skip this entirely and keep page_count == 0, i.e. exactly the
+    // UID/SAK/ATQA-only record Task 10 originally scoped.
+    out->page_count = 0;
+    if (tag.sak == kSakMifareUltralight) {
+        uint8_t pages = 0;
+        // t2t_read_pages() sends the trailing HALT itself, success or
+        // failure -- see its header comment.
+        const bool ok = St25r3916::t2t_read_pages(
+            &out->pages[0][0], sizeof(out->pages), &pages);
+        out->page_count = pages;
+        if (pages > 0) {
+            // Deliberately states the MEASURED page count rather than mapping
+            // it to a product name. nfc_amiibo.cpp's page_count_tag_name()
+            // does have a real, cited 45/135/231 -> NTAG213/215/216 mapping,
+            // but it also documents (from real hardware, 2026-08-21) that a
+            // genuine amiibo-programmed tag defeats the companion CC-byte
+            // detection -- so a bare measured count is the claim that is
+            // always true. If the read failed outright, the original
+            // "ISO14443A SAK 00" name is left alone rather than replaced with
+            // a misleading "0 pg".
+            std::snprintf(out->type_name, sizeof(out->type_name),
+                          "Ultralight/NTAG %u pg", (unsigned)pages);
+        }
+        Serial.printf("quarky-tab5: [nfc-read] Type 2 tag (SAK 00): captured %u "
+                      "pages (%u bytes)%s\n",
+                      (unsigned)pages, (unsigned)(pages * NfcCommon::kT2tPageLen),
+                      ok ? "" : " -- read failed, saving UID/SAK/ATQA only");
+    } else {
+        St25r3916::nfca_halt(); // see the keep_active=true note above
+    }
     return true;
 }
 
@@ -431,9 +505,21 @@ void poll() {
     uid_str[0] = '\0';
     NfcCommon::format_uid(info.uid, info.uid_len, uid_str, sizeof(uid_str));
 
-    char result[128];
-    std::snprintf(result, sizeof(result), "%s\nUID (%u bytes): %s",
-                  info.type_name, (unsigned)info.uid_len, uid_str);
+    char result[192];
+    if (info.page_count > 0) {
+        // Real captured page content -- worth surfacing, since it is what
+        // decides whether emulating this saved tag can answer a reader's READ
+        // commands or only its anticollision.
+        std::snprintf(result, sizeof(result),
+                      "%s\nUID (%u bytes): %s\n%u pages captured (%u bytes) -- "
+                      "Emulate can answer READs",
+                      info.type_name, (unsigned)info.uid_len, uid_str,
+                      (unsigned)info.page_count,
+                      (unsigned)(info.page_count * NfcCommon::kT2tPageLen));
+    } else {
+        std::snprintf(result, sizeof(result), "%s\nUID (%u bytes): %s",
+                      info.type_name, (unsigned)info.uid_len, uid_str);
+    }
     lv_label_set_text(s_result_label, result);
 
     s_last_found_tag = info;

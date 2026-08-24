@@ -87,14 +87,27 @@ bool load(IStorage &storage, const char *name, NfcCommon::TagInfo *out) {
     if (out_len != sizeof(NfcCommon::TagInfo)) {
         return false;
     }
-    NfcCommon::TagInfo tmp{};
-    std::memcpy(&tmp, raw, sizeof(tmp));
+    // Copied straight into *out rather than via a local TagInfo staging copy.
+    // That staging copy was harmless while a record was 38 bytes; as of
+    // 2026-08-24's page-content extension a record is ~1 KB, and holding two
+    // of them plus the read buffer on the stack of an LVGL event callback
+    // (nfc_tag_library_ui.cpp's show_tag()) is real stack pressure for no
+    // benefit -- the exact-size check above has already passed by this point,
+    // so there is nothing left that could reject the record and leave *out
+    // needing to be untouched.
+    std::memcpy(out, raw, sizeof(NfcCommon::TagInfo));
     // Defense in depth: force a NUL within type_name regardless of what was
     // actually on disk, so a caller's %s formatting (nfc_tag_library_ui.cpp)
     // can never read past this struct even if some other bug ever manages
     // to write a non-terminated record.
-    tmp.type_name[sizeof(tmp.type_name) - 1] = '\0';
-    *out = tmp;
+    out->type_name[sizeof(out->type_name) - 1] = '\0';
+    // Same reasoning for page_count: a corrupt or hand-edited record must not
+    // be able to make the Listen Mode responder index past pages[]. Clamped
+    // rather than rejected, matching this module's existing "repair what can
+    // be repaired, reject only a wrong-sized record" policy.
+    if (out->page_count > NfcCommon::kMaxT2tPages) {
+        out->page_count = NfcCommon::kMaxT2tPages;
+    }
     return true;
 }
 

@@ -35,9 +35,14 @@ namespace NfcTagLibrary {
 
 // Saves tag under /quarky/captures/nfc/<hex-uid>.tag as a fixed-layout binary
 // dump of the TagInfo struct itself (uid[10] + uid_len + type_name[24] +
-// sak[1] + atqa[2] = 38 bytes as of Task 24; every member is byte-sized, so
+// sak[1] + atqa[2] + page_count[1] + pages[231][4] = 963 bytes as of
+// 2026-08-24's page-content extension; every member is still byte-sized, so
 // there is no compiler padding to worry about -- writing sizeof(tag) raw
-// bytes is a faithful, lossless record).
+// bytes is a faithful, lossless record). A record saved before that extension
+// is 38 bytes and now fails load()'s exact-size check: a known, disclosed
+// consequence of growing the struct (see nfc_common.h's own comment), fixed
+// by re-scanning and re-saving the tag, which is worth doing anyway since
+// that is what captures its page content in the first place.
 // Deliberately no separate "name" parameter: the filename is derived from the
 // tag's own UID, so re-saving the same physical tag overwrites its prior
 // library entry (via write_capture_file()'s overwrite semantics) rather than

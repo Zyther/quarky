@@ -13,11 +13,21 @@
 // listen_poll()/listen_stop()) -- see that file's "NFC-A Listen Mode" SOURCES
 // section for the real register/protocol citations.
 //
-// SCOPE: read-only UID/SAK/ATQA emulation of a tag already saved in Task 10's
-// tag library (NfcTagLibrary). Once a reader completes SELECT this reports
-// "selected" and stops there -- answering whatever the reader sends next
-// (RATS, READ, etc.) is full memory-content emulation, the plan's own
-// explicitly out-of-scope stretch goal, and is NOT implemented.
+// SCOPE, as extended on 2026-08-24: read-only emulation of a tag already saved
+// in Task 10's tag library (NfcTagLibrary). Anticollision/SELECT is answered
+// for ANY saved tag from its UID/SAK/ATQA; and for a saved NFC Forum Type 2
+// Tag (MIFARE Ultralight / NTAG21x family, SAK 0x00) whose record also carries
+// real captured page content, the reader's subsequent T2T READ commands are
+// answered with that real content too -- which is what makes a real reader
+// show a stable "tag found" instead of re-polling forever. See
+// st25r3916_driver.h's ListenConfig/ListenState comments and the .cpp's Listen
+// Mode SOURCES section for the real citations and for what remains out of
+// scope (ISO14443-4/T=CL emulation, MIFARE Classic, T2T WRITE, GET_VERSION).
+//
+// A saved record with page_count == 0 -- anything scanned before 2026-08-24,
+// anything scanned on the RFID2 unit, and every non-Type-2 tag -- still
+// emulates UID/SAK/ATQA only, and this screen says so explicitly rather than
+// leaving the user to wonder why their reader keeps re-polling.
 //
 // NOT a standalone main-menu tile: unlike every other NFC feature module in
 // this project, there is no register_module() here. This screen is reached

@@ -33,12 +33,53 @@ namespace NfcCommon {
 // -- ordinary MIFARE Ultralight tags report exactly this), so it is NOT a
 // usable sentinel; both real save paths always populate it directly from
 // their own already-verified SAK byte (s_mfrc.uid.sak / tag.sak).
+//
+// page_count/pages added 2026-08-24 by Task 24's content-emulation extension,
+// under the exact same additive, byte-sized discipline (and with the exact
+// same disclosed consequence) as the sak/atqa addition described above: a
+// .tag file written before this change is shorter than the new sizeof() and
+// now fails nfc_tag_library.cpp's existing exact-size load() check, so old
+// library entries need a re-scan/re-save rather than a migration.
+//
+// WHY they exist at all: Listen Mode emulation that answers only
+// anticollision/SELECT is useless in practice -- confirmed on real hardware
+// on 2026-08-24 against two real external readers (an iPhone running NFC
+// Tools and a Chameleon Ultra). Both walked the emulated tag's full
+// anticollision/SELECT sequence successfully (the chip's PTA state register
+// reliably reached its "active" state) and then BOTH gave up and re-polled,
+// because every real reader reads something back before it declares a tag
+// found -- and this project had no captured page content to answer with.
+// See st25r3916_driver.cpp's "NFC Forum Type 2 Tag page read" and Listen
+// Mode sections for the real capture/responder halves.
+//
+// SIZING: kMaxT2tPages is 231, which is NTAG216's real page count -- the
+// largest tag in the NTAG21x family that either of this project's two
+// already-ported real donor detections recognises (nfc_amiibo.cpp's
+// cc_tag_name()/page_count_tag_name(), both citing RFID2.cpp:434-447's
+// Capability-Container table: 0x12 -> NTAG213/45 pages, 0x3E -> NTAG215/135,
+// 0x6D -> NTAG216/231). nfc_amiibo.cpp's own kMaxPages is 256 -- the donor's
+// loop BOUND (RFID2.cpp:428 iterates page 0..252 in groups of 4) rather than
+// any real tag's capacity -- which is the right cap for a transient in-RAM
+// dump but 100 bytes of dead weight in a struct that is stored on SD, copied
+// by value between screens and held in several file-scope statics at once.
+// 231 pages is 924 bytes, so a .tag record is 963 bytes.
+//
+// page_count == 0 is the "no page content captured" state and is what every
+// non-Type-2 tag (EMV cards, MIFARE Classic) and every RFID2/WS1850S-unit
+// scan still stores -- emulation of those falls back to the original
+// UID/SAK/ATQA-only behaviour rather than answering with zeros.
+constexpr uint8_t kT2tPageLen  = 4;   // NFC Forum T2T block length (RFAL's own
+                                      // RFAL_T2T_BLOCK_LEN, rfal_t2t.h)
+constexpr uint8_t kMaxT2tPages = 231; // NTAG216, see above
+
 struct TagInfo {
     uint8_t uid[10];
     uint8_t uid_len;
     char type_name[24];
     uint8_t sak;      // SEL_RES, real for both save paths.
     uint8_t atqa[2];  // SENS_RES, wire order (LSB first); {0,0} if not captured.
+    uint8_t page_count;                        // 0 = no page content captured
+    uint8_t pages[kMaxT2tPages][kT2tPageLen];  // real captured T2T page image
 };
 
 // Formats uid as "04:A3:F1:..." (matching the project’s hex-with-colons style).

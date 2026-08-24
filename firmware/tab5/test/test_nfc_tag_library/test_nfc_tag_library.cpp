@@ -91,7 +91,13 @@ private:
     struct Entry {
         bool used = false;
         char path[128] = {};
-        uint8_t buf[256] = {}; // generous for a 35-byte TagInfo record
+        // Sized FROM the real record rather than hardcoded: TagInfo grew from
+        // 35 to 38 bytes (Task 24's sak/atqa) and then to ~963 (2026-08-24's
+        // page-content extension), and a fixed 256-byte buffer would have made
+        // every save() in this suite silently start returning false. The +64
+        // headroom is what test_load_rejects_oversized_corrupt_record() below
+        // needs to write a deliberately oversized record.
+        uint8_t buf[sizeof(NfcCommon::TagInfo) + 64] = {};
         size_t len = 0;
     };
     static constexpr int kMaxEntries = 16;
@@ -255,6 +261,92 @@ void test_list_respects_max_names_cap() {
     TEST_ASSERT_EQUAL_INT(2, count); // capped at max_names even though 5 were saved
 }
 
+// ── 2026-08-24 page-content extension ────────────────────────────────────
+// NfcCommon::TagInfo now also carries a real captured NFC Forum Type 2 Tag
+// page image (see nfc_common.h). The save/load format is still a raw
+// fixed-layout struct dump, so these exercise the parts of that which are
+// genuinely testable off-hardware: that the page bytes survive the round trip
+// byte for byte, that a record with no content stays at the page_count == 0
+// sentinel, and that load()'s clamp defends the Listen Mode responder against
+// an out-of-range page_count in a corrupt/hand-edited record.
+
+void test_page_content_round_trips_byte_for_byte() {
+    FakeStorage storage;
+    const uint8_t uid[] = {0x04, 0x73, 0x45, 0xE4, 0x3A, 0x02, 0x89};
+    NfcCommon::TagInfo tag;
+    build_tag(&tag, uid, sizeof(uid), "Ultralight/NTAG 135 pg");
+    tag.sak = 0x00;
+    tag.atqa[0] = 0x44;
+    tag.atqa[1] = 0x00;
+
+    // A recognisably non-uniform image, so a shifted/truncated copy fails
+    // rather than accidentally matching.
+    tag.page_count = 135; // NTAG215's real page count
+    for (uint8_t p = 0; p < tag.page_count; p++) {
+        for (uint8_t b = 0; b < NfcCommon::kT2tPageLen; b++) {
+            tag.pages[p][b] = static_cast<uint8_t>((p * 7u) + (b * 31u) + 1u);
+        }
+    }
+
+    TEST_ASSERT_TRUE(NfcTagLibrary::save(storage, tag));
+
+    char names[8][64];
+    TEST_ASSERT_EQUAL_INT(1, NfcTagLibrary::list(storage, names, 8));
+
+    NfcCommon::TagInfo loaded{};
+    TEST_ASSERT_TRUE(NfcTagLibrary::load(storage, names[0], &loaded));
+
+    TEST_ASSERT_EQUAL_UINT8(tag.sak, loaded.sak);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(tag.atqa, loaded.atqa, 2);
+    TEST_ASSERT_EQUAL_UINT8(135, loaded.page_count);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(&tag.pages[0][0], &loaded.pages[0][0],
+                                  tag.page_count * NfcCommon::kT2tPageLen);
+}
+
+void test_tag_without_page_content_keeps_zero_sentinel() {
+    FakeStorage storage;
+    const uint8_t uid[] = {0x08, 0x92, 0x2F, 0x97};
+    NfcCommon::TagInfo tag;
+    build_tag(&tag, uid, sizeof(uid), "ISO14443A SAK 20");
+    tag.sak = 0x20; // an EMV-style card: not a Type 2 tag, nothing to capture
+
+    TEST_ASSERT_TRUE(NfcTagLibrary::save(storage, tag));
+
+    char names[8][64];
+    TEST_ASSERT_EQUAL_INT(1, NfcTagLibrary::list(storage, names, 8));
+
+    NfcCommon::TagInfo loaded{};
+    TEST_ASSERT_TRUE(NfcTagLibrary::load(storage, names[0], &loaded));
+    TEST_ASSERT_EQUAL_UINT8(0, loaded.page_count);
+}
+
+void test_load_clamps_out_of_range_page_count() {
+    FakeStorage storage;
+    const uint8_t uid[] = {0x01, 0x02, 0x03, 0x04};
+    NfcCommon::TagInfo tag;
+    build_tag(&tag, uid, sizeof(uid), "Corrupt");
+    TEST_ASSERT_TRUE(NfcTagLibrary::save(storage, tag));
+
+    char names[8][64];
+    TEST_ASSERT_EQUAL_INT(1, NfcTagLibrary::list(storage, names, 8));
+
+    // Rewrite the SAME record, correctly sized (so it still passes load()'s
+    // exact-size check) but with a page_count larger than pages[] can hold --
+    // what a corrupt SD sector or a hand-edited .tag file could produce.
+    // Without the clamp this value would reach ListenConfig::page_count and
+    // then index past the driver's page image.
+    NfcCommon::TagInfo corrupt = tag;
+    corrupt.page_count = 255;
+    char path[128];
+    std::snprintf(path, sizeof(path), "/quarky/captures/nfc/%s", names[0]);
+    TEST_ASSERT_TRUE(storage.write_capture_file(
+        path, reinterpret_cast<const uint8_t *>(&corrupt), sizeof(corrupt)));
+
+    NfcCommon::TagInfo loaded{};
+    TEST_ASSERT_TRUE(NfcTagLibrary::load(storage, names[0], &loaded));
+    TEST_ASSERT_EQUAL_UINT8(NfcCommon::kMaxT2tPages, loaded.page_count);
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_save_then_load_round_trip);
@@ -264,5 +356,8 @@ int main(int argc, char **argv) {
     RUN_TEST(test_list_returns_multiple_distinct_saved_tags);
     RUN_TEST(test_load_rejects_oversized_corrupt_record);
     RUN_TEST(test_list_respects_max_names_cap);
+    RUN_TEST(test_page_content_round_trips_byte_for_byte);
+    RUN_TEST(test_tag_without_page_content_keeps_zero_sentinel);
+    RUN_TEST(test_load_clamps_out_of_range_page_count);
     return UNITY_END();
 }

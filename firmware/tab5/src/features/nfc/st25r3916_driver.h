@@ -136,6 +136,44 @@ bool nfca_poller_begin();
 // not) rather than relying on a HALT it never sent.
 NfcaResult nfca_detect(Iso14443aTag *out, bool keep_active = false);
 
+// Sends SLP_REQ (HLTA) to whatever tag is currently ACTIVE, parking it in
+// HALT. Exposed by Phase 3 Task 24's content-emulation extension (2026-08-24)
+// so a caller that used keep_active=true, and then decided NOT to run any
+// follow-on exchange, can still restore the exact post-condition
+// nfca_detect(..., keep_active=false) would have left behind. Without it,
+// such a tag stays ACTIVE and ignores the WUPA that starts the next detection
+// pass -- i.e. it would read exactly once per physical presentation, the very
+// bug nfca_detect()'s own SLP_REQ step exists to prevent. Like that step, the
+// outcome is deliberately not checked (ISO14443-3 6.4.3: the PICC
+// acknowledges HLTA by staying silent). No-op if the poller isn't running.
+void nfca_halt();
+
+// --- NFC Forum Type 2 Tag (MIFARE Ultralight / NTAG21x family) page read ---
+// Added 2026-08-24 by Task 24's content-emulation extension. See
+// st25r3916_driver.cpp's "NFC Forum Type 2 Tag page read" SOURCES section for
+// the real citations (ST's own RFAL T2T layer, rfal_t2t.cpp/.h, plus the
+// already-ported real donor loop in features/nfc/nfc_amiibo.cpp, which reads
+// the same real protocol through the SEPARATE RFID2/WS1850S unit).
+//
+// Reads the tag's real page content, 4 pages (16 bytes) per T2T READ command,
+// starting at page 0 and stopping at the tag's own real end-of-memory. The
+// caller MUST have just had nfca_detect(&tag, /*keep_active=*/true) return
+// kFound -- a HALTed tag answers nothing here. This function ALWAYS ends by
+// sending SLP_REQ itself (nfca_halt() above), success or failure, so the
+// caller is left in exactly the state a plain nfca_detect() would have left
+// it in and must not send its own.
+//
+// `out` receives page_count * 4 bytes. Returns true when at least one page
+// was captured; *pages_out is the real page count either way.
+//
+// COST, disclosed rather than assumed: one T2T READ per 4 pages, each a full
+// transceive() exchange (~4 ms on this 100 kHz bus), so a real NTAG213 (45
+// pages) costs ~50 ms, an NTAG215 (135) ~140 ms and an NTAG216 (231) ~240 ms.
+// That is a deliberate, one-shot-per-scan poll() budget exception in the same
+// class as nfc_read.cpp's own already-documented ~205 ms bring-up tick, and
+// nowhere near the ~5 s task-watchdog window.
+bool t2t_read_pages(uint8_t *out, size_t cap_bytes, uint8_t *pages_out);
+
 // Stops the poller: field_off() plus a Stop-all-activities so no timer or
 // receive state is left running. Safe to call when begin() was never called.
 void nfca_poller_end();
@@ -256,12 +294,33 @@ bool apdu_transceive(const uint8_t *tx, size_t tx_len,
 // (Passive Target Status register, 0x21) are ordinary polled I2C access, so
 // this needs no IRQ pin, exactly like nfca_detect() above.
 //
-// SCOPE: read-only UID/SAK/ATQA emulation only -- once a reader completes
-// SELECT, this reports kSelected and stops there. Answering whatever the
-// reader sends next (RATS, READ, etc. -- full memory-content emulation) is
-// the plan's own explicitly out-of-scope stretch goal and is NOT
-// implemented; see the .cpp for exactly which RFAL Listen Mode states this
-// covers (IDLE/READY_A/ACTIVE_A only, no SLEEP_A/second-cascade support).
+// SCOPE, as extended on 2026-08-24. The original Task 24 baseline stopped at
+// "a reader completed SELECT" and answered nothing afterwards; real-hardware
+// testing that day showed that makes emulation useless in practice (two real
+// readers -- an iPhone running NFC Tools and a Chameleon Ultra -- both
+// completed the full anticollision/SELECT against the emulated tag and then
+// gave up and re-polled, because every real reader reads something back
+// before declaring a tag found). So this now ALSO answers the real NFC Forum
+// Type 2 Tag (MIFARE Ultralight / NTAG21x family) READ command from a
+// captured page image. Still out of scope, honestly:
+//   * ISO14443-4 / T=CL card emulation (RATS and everything past it). An EMV
+//     card saved in the library still emulates its UID/SAK/ATQA only.
+//   * MIFARE Classic emulation (CRYPTO1). A separate, much larger task,
+//     explicitly not attempted here.
+//   * T2T WRITE (0xA2) and SECTOR SELECT (0xC2). Read-only emulation, the
+//     same discipline this project's EMV reader already follows.
+//   * GET_VERSION. See the .cpp's own disclosure -- there is no citable
+//     source for its command byte or response layout anywhere in this
+//     project's vendored RFAL/MFRC522 sources, so rather than invent one this
+//     driver NAKs it, exactly as a real plain MIFARE Ultralight (SAK 0x00,
+//     the family this emulates) genuinely does.
+constexpr uint8_t kListenPageLen  = 4;   // T2T block length
+constexpr uint8_t kListenMaxPages = 231; // NTAG216; must match
+                                         // NfcCommon::kMaxT2tPages (a
+                                         // static_assert in nfc_emulate.cpp,
+                                         // the one translation unit that sees
+                                         // both headers, enforces this)
+
 struct ListenConfig {
     uint8_t uid[10];  // Only the first uid_len bytes are used.
     uint8_t uid_len;  // MUST be 4 or 7 -- Listen Mode's PT memory format (like
@@ -269,6 +328,15 @@ struct ListenConfig {
                       // representation. listen_start() rejects anything else.
     uint8_t atqa[2];  // SENS_RES, wire order (LSB first).
     uint8_t sak;      // SEL_RES.
+
+    // Real captured T2T page image to answer READ commands from, page 0
+    // first, 4 bytes per page. COPIED by listen_start() into the driver's own
+    // storage, so the caller's buffer needs no lifetime past that call.
+    // nullptr / page_count == 0 means "no content emulation": the chip still
+    // answers anticollision/SELECT exactly as before, and every data command
+    // that follows gets a NAK.
+    const uint8_t *pages;
+    uint8_t page_count;  // clamped to kListenMaxPages
 };
 
 enum class ListenState : uint8_t {
@@ -276,6 +344,10 @@ enum class ListenState : uint8_t {
     kIdle,           // Armed; the chip's PTA engine is waiting for a reader.
     kSelected,       // A reader completed anticollision+SELECT with our UID
                      // (latched until the reader's field goes away).
+    kDataRead,       // A reader went further and actually READ page content
+                     // back -- the state that means emulation genuinely
+                     // worked end to end, not just that our UID was accepted.
+                     // Also latched until the field goes away.
     kHardwareError,  // I2C failure while polling -- listen_stop() and retry.
 };
 
@@ -306,10 +378,30 @@ bool listen_start(const ListenConfig &cfg);
 // (returns kNotArmed immediately without touching the bus). The single
 // blocking wait it can reach is the same bounded 10 ms oscillator-stable poll
 // field_on() uses, and only on the first field edge after a full power-down.
+//
+// ONE DISCLOSED EXCEPTION to that per-tick cost, added 2026-08-24 with the
+// content-emulation extension: once a reader has actually SELECTed us, this
+// tick STAYS INSIDE a bounded frame-servicing loop for as long as that reader
+// keeps sending commands, up to a hard 250 ms ceiling per tick and exiting
+// early after ~12 ms with no further frame. That is not optional politeness:
+// a real reader's own T2T READ timeout is 5 ms (RFAL's
+// RFAL_FDT_POLL_READ_MAX, "TS T2T 1.0 table 18"), while one full LVGL frame
+// on this 1280x720 display takes far longer than that, so answering only once
+// per loop() iteration would miss every single command. The loop is entered
+// ONLY while the chip reports its PTA "active" state, is bounded in both wall
+// clock and I2C work, and 250 ms leaves a 20x margin against the ~5 s
+// task-watchdog window this project has already been bitten by twice.
 ListenState listen_poll();
 
 // Last state computed by listen_poll(), without touching the bus.
 ListenState listen_get_state();
+
+// How many T2T READ commands this Listen Mode session has actually answered
+// with real page content. Zeroed by listen_start(); NOT reset when a reader's
+// field comes and goes, so it counts a whole emulation session rather than
+// one presentation. Purely informational (the UI shows it as real evidence
+// that a reader read data back); no bus access.
+uint32_t listen_get_read_count();
 
 // Tears Listen Mode down: stops chip activity, restores REG_MODE (targ bit
 // back to initiator/0) and REG_PASSIVE_TARGET (back to fully disabled) so a
