@@ -165,17 +165,39 @@ void nfca_poller_end();
 // should be attempted.
 bool iso14443_4_activate();
 
+// Copies the ATS captured by the most recent successful
+// iso14443_4_activate() into `out` (verbatim, CRC-stripped, TL byte first)
+// and returns how many bytes were written -- 0 if no activation has succeeded
+// since the last one was attempted, or if out/cap are unusable. Added by the
+// Flipper ".nfc" export path (nfc_flipper_format.h), which needs the card's
+// real T0/TA(1)/TB(1)/TC(1)/T1...Tk interface bytes; activate() itself
+// consumes only TB's FWI nibble, so without this the ATS is discarded.
+size_t iso14443_4_get_ats(uint8_t *out, size_t cap);
+
 // Sends one C-APDU wrapped in an ISO14443-4 I-block and returns the unwrapped
 // R-APDU in `rx`. Transparently answers S(WTX) waiting-time-extension
 // requests (bounded -- see the .cpp) since real EMV cards use these during
-// slower operations (GET PROCESSING OPTIONS in particular). Does NOT
-// implement I-block chaining in either direction: every APDU this driver
-// sends or receives is expected to fit in one frame, which the RATS exchange
-// arranges for by declaring a generous-but-buffer-safe FSD (see the .cpp) and
-// which holds for the read-only EMV command set this project's EMV feature
-// module sends. Requires iso14443_4_activate() to have already succeeded.
-// Returns false (and *rx_len = 0) on any protocol/timeout/I2C failure or on
-// an R-block/chaining response this function does not handle.
+// slower operations (GET PROCESSING OPTIONS in particular).
+//
+// PICC->PCD I-block chaining IS handled (added 2026-08-23 after a real
+// Mastercard-style card answered a READ RECORD with PCB 0x12 -- an I-block
+// with the chaining bit set -- because its record does not fit this driver's
+// declared FSD of 128 bytes): each chained fragment is acknowledged with an
+// R(ACK) and its INF field appended, until a final non-chained I-block
+// arrives, so a caller still sees exactly ONE logically-complete R-APDU
+// regardless of how many frames it took. Bounded in both rounds and total
+// size, and sharing (not extending) the same per-call time envelope the
+// S(WTX) path already had -- see the .cpp's kMaxChainingRounds /
+// kMaxReassembledLen / kMaxApduCallMs.
+//
+// PCD->PICC chaining is still NOT implemented: every C-APDU this project
+// sends is well under 32 bytes and fits one frame by construction.
+//
+// `rx_cap` may be up to kMaxReassembledLen (512) -- larger than one frame,
+// precisely so a reassembled response fits. Requires iso14443_4_activate() to
+// have already succeeded. Returns false (and *rx_len = 0) on any
+// protocol/timeout/I2C failure, on a response that would overrun `rx_cap`, or
+// on an R-block/S-block response this function does not handle.
 bool apdu_transceive(const uint8_t *tx, size_t tx_len,
                      uint8_t *rx, size_t rx_cap, size_t *rx_len);
 

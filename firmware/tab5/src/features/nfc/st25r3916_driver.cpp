@@ -558,12 +558,39 @@ constexpr uint32_t kIrqCrc  = 0x00800000U; // 1Ch bit 7
 // NRT's 64/fc steps exactly as [REF] rfalISO14443ATransceiveShortFrame() does.
 constexpr uint32_t kNfcaFwt1fc  = 1620U;
 constexpr uint32_t kFwtAdjust1fc = 64U + 512U + 64U;
-constexpr uint8_t  kNrtSteps64fc =
-    static_cast<uint8_t>((kNfcaFwt1fc + kFwtAdjust1fc) / 64U); // 35 -> ~165 us
+constexpr uint16_t kNrtSteps64fc =
+    static_cast<uint16_t>((kNfcaFwt1fc + kFwtAdjust1fc) / 64U); // 35 -> ~165 us
 static_assert(kNrtSteps64fc != 0,
               "an NRT of zero means 'timer not started' ([DS] Table 49) -- the "
               "no-response timeout would never fire and every miss would hang "
               "until the software deadline instead");
+
+// RATS/ISO14443-4-activation NRT, real bug found & fixed via real-hardware
+// testing (2026-08-23): transceive() used to hardcode EVERY exchange's
+// hardware no-response timer to kNrtSteps64fc (~165us -- correct for a plain
+// NFC-A anticollision reply) regardless of which command was being sent.
+// RATS legitimately takes longer: a real card's ATS-generation logic (it may
+// need to compute/format its answer, not just echo a fixed frame) needs the
+// activation-specific timeout RFAL itself uses, confirmed directly against
+// [REF] ~/src/wilson-elechouse/ST25R3916/NFC-RFAL/src/rfal_isoDep.cpp:202-210:
+//   RFAL_ISODEP_T4T_DTIME_POLL_11 = 216960 (1/fc) -- "Delta Time for polling
+//   during Activation (ATS): 16.4ms, Digital 1.1 13.8.1.1 & A.6 -- use 16ms
+//   as testcase T4AT_BI_10_03 sends a frame exactly at the border" (216960 /
+//   13560 = 16.0ms exactly -- a deliberately chosen literal, not a derived
+//   approximation)
+//   RFAL_ISODEP_T4T_FWT_ACTIVATION = 71680 + RFAL_ISODEP_T4T_DTIME_POLL_11
+//   = 288640 (1/fc) -- "Activation frame waiting time FWT(act) = 71680/fc
+//   (~5286us), Digital 1.1 13.8.1.1 & A.6" is the base FWT; RFAL adds the
+//   16ms polling-delta margin ON TOP of it for the real activation timeout
+//   it actually uses (rfal_isoDep.cpp:933, the real RATS transceive call) --
+//   both terms are real and both are needed, not a double-count.
+// Confirmed on real hardware: with the old fixed ~165us NRT, RATS got a
+// genuine hardware-timer Xfer::kNoResponse on TWO different real payment
+// cards, consistently -- not a per-card fluke. 288640/64 = 4510 exactly (a
+// clean multiple, a good sign this is the intended real value): using this
+// for RATS specifically, all other calls unaffected (still default to
+// kNrtSteps64fc).
+constexpr uint16_t kRatsNrtSteps64fc = 4510U; // 288640 (1/fc) / 64 = ~21.29ms
 
 // FDT(listen) min for NFC-A: [REF] rfal_rf.h:239 RFAL_FDT_LISTEN_NFCA_POLLER
 // = 1172 (1/fc), less [REF] rfal_rfst25r3916.h:283,325's
@@ -795,15 +822,27 @@ enum class Xfer : uint8_t {
     kIo,          // the chip/bus stopped answering
 };
 
+// [REF] rfal_rf.h:99 RFAL_CRC_LEN = 2 -- the ISO14443 CRC_A width. This
+// chip's FIFO still contains these 2 bytes after a crc_rx=true receive even
+// though the CRC was already verified in hardware; see transceive()'s own
+// content_len comment below for the real bug this constant's use fixes.
+constexpr uint16_t kCrcLen = 2U;
+
 // `short_cmd` is 0 for an ordinary FIFO-sourced frame, or the C6h/C7h direct
 // command for REQA/WUPA. Those two are 7-bit short frames the chip generates
 // itself ([DS] Table 13) and cannot be expressed as FIFO bytes, so `tx`/
 // `tx_len` are ignored when one is given.
+// `nrt_steps` (64/fc units) sizes the CHIP's own hardware no-response timer
+// for this specific exchange -- defaults to kNrtSteps64fc (~165us, correct
+// for a plain NFC-A anticollision reply). Pass kRatsNrtSteps64fc for RATS;
+// see that constant's own declaration comment for the real bug this
+// parameterization fixes (every call used to share one fixed, too-short
+// value regardless of which command was actually being sent).
 Xfer transceive(uint8_t short_cmd,
                 const uint8_t *tx, uint8_t tx_len, bool crc_tx,
                 bool antcl, bool crc_rx,
                 uint8_t *rx, uint8_t rx_cap, uint8_t *rx_len,
-                uint32_t deadline_ms) {
+                uint32_t deadline_ms, uint16_t nrt_steps = kNrtSteps64fc) {
     if (rx_len != nullptr) {
         *rx_len = 0;
     }
@@ -834,11 +873,17 @@ Xfer transceive(uint8_t short_cmd,
     }
 
     // Timers, in 64/fc steps for both ([DS] Table 51 bits mrt_step/nrt_step).
+    // NRT is a 16-bit counter (kRegNrt1 = high byte, kRegNrt2 = low byte) --
+    // real bug fixed here (2026-08-23): this used to hardcode kRegNrt1 to 0,
+    // silently capping every exchange's no-response wait at 255 steps
+    // (~1.2ms) regardless of `nrt_steps`. RATS needs kRatsNrtSteps64fc=4510,
+    // which does not fit in the low byte alone -- see that constant's own
+    // declaration comment for the real citation and hardware confirmation.
     if (!changeRegisterBits(kRegTimerEmvCtrl,
                             static_cast<uint8_t>(kTimerEmvMrtStep | kTimerEmvNrtStep), 0U) ||
         !writeRegisterRaw(kRegMaskRxTimer, kMrtSteps64fc) ||
-        !writeRegisterRaw(kRegNrt1, 0U) ||
-        !writeRegisterRaw(kRegNrt2, kNrtSteps64fc)) {
+        !writeRegisterRaw(kRegNrt1, static_cast<uint8_t>(nrt_steps >> 8)) ||
+        !writeRegisterRaw(kRegNrt2, static_cast<uint8_t>(nrt_steps & 0xFFU))) {
         return Xfer::kIo;
     }
 
@@ -922,8 +967,30 @@ Xfer transceive(uint8_t short_cmd,
     if (!readFifoRaw(rx, static_cast<uint8_t>(n))) {
         return Xfer::kIo;
     }
+    // Real bug found & fixed via real-hardware testing (2026-08-23): when
+    // crc_rx is true, this chip already verifies the CRC in hardware (a
+    // mismatch already returned Xfer::kProtocol above) but still places the
+    // 2 already-verified CRC bytes in the FIFO on top of the real content --
+    // [EH]'s own rfalTransceiveRx() does exactly this unconditional
+    // subtraction (rfal_rfst25r3916.cpp:1730-1738: "By default CRC will not
+    // be placed into the rxBuffer... tmp -= RFAL_CRC_LEN", RFAL_CRC_LEN=2,
+    // rfal_rf.h:99), which this driver had not been doing at this shared,
+    // single choke point every crc_rx=true caller passes through. First
+    // found via three real ATS responses from real payment cards, each
+    // exactly 2 bytes longer than its own self-declared TL length field
+    // (iso14443_4_activate() had a narrower, ATS-specific workaround for
+    // this before this driver-wide fix landed); nfca_detect()'s own SEL_RES
+    // handling already tolerated either length without needing the
+    // subtraction (it only ever reads byte 0). Fixing it HERE means every
+    // crc_rx=true caller (SEL_REQ, SLP_REQ, RATS, and Task 13's I-block/WTX
+    // exchanges) gets the real, CRC-stripped content length automatically,
+    // matching what every caller already assumed before this bug was found.
+    uint16_t content_len = n;
+    if (crc_rx && content_len > kCrcLen) {
+        content_len = static_cast<uint16_t>(content_len - kCrcLen);
+    }
     if (rx_len != nullptr) {
-        *rx_len = static_cast<uint8_t>(n);
+        *rx_len = static_cast<uint8_t>(content_len);
     }
     return Xfer::kOk;
 }
@@ -1336,7 +1403,30 @@ NfcaResult nfca_detect(Iso14443aTag *out, bool keep_active) {
         return NfcaResult::kHardwareError;
     }
 
-    const uint32_t deadline = millis() + kDetectBudgetMs;
+    // NOT const: refreshed before every transceive() call below (WUPA, then
+    // each cascade level's SDD_REQ and SEL_REQ). kDetectBudgetMs's own
+    // comment says it "bound[s] a wedged bus, not normal operation" for ONE
+    // exchange -- computing it once here and reusing it unrefreshed across
+    // an entire multi-cascade-level resolution silently turns a per-call
+    // budget into a shrinking, shared one. Real bug found via real-hardware
+    // testing (2026-08-23): a 7-byte-UID contactless payment card -- the
+    // first tag this driver was ever tested against that needs a second
+    // cascade level -- got a genuine Xfer::kNoResponse (confirmed via
+    // temporary diagnostic instrumentation: zero bytes back, not a corrupted
+    // response) on cascade level 1's SDD_REQ. Every prior real-hardware test
+    // of this driver used a 4-byte-UID tag (single cascade level, 3 total
+    // exchanges -- WUPA+SDD+SEL -- comfortably inside 25ms), so this
+    // shared-deadline bug was never exercised before. A 7-byte UID needs 5
+    // exchanges (WUPA + 2x SDD_REQ + 2x SEL_REQ), and by real measurement
+    // (this function's own per-call cost-model comment above
+    // kDetectBudgetMs: ~0.3ms/register write, ~0.8ms/IRQ read, roughly a
+    // dozen I2C operations per transceive() call) the original 25ms shared
+    // budget was already exhausted, or nearly so, by the time cascade level
+    // 1's SDD_REQ was attempted -- so waitIrqs() saw its own software
+    // deadline already past and reported kNoResponse immediately, regardless
+    // of whether the tag itself would have answered in its real ~165us NRT
+    // window ([DS]-cited kNrtSteps64fc comment above).
+    uint32_t deadline = millis() + kDetectBudgetMs;
 
     *out = Iso14443aTag{};
 
@@ -1365,9 +1455,14 @@ NfcaResult nfca_detect(Iso14443aTag *out, bool keep_active) {
         case Xfer::kNoResponse: return NfcaResult::kNoTag;
         case Xfer::kCollision:  return NfcaResult::kCollision;
         case Xfer::kIo:         return NfcaResult::kHardwareError;
-        default:                return NfcaResult::kProtocolError;
+        default:
+            Serial.println("quarky-tab5: [st25r3916] DIAG nfca_detect: WUPA "
+                           "xfer returned an unexpected outcome");
+            return NfcaResult::kProtocolError;
     }
     if (atqa_len < 2) {
+        Serial.printf("quarky-tab5: [st25r3916] DIAG nfca_detect: ATQA short, "
+                      "len=%u\n", (unsigned)atqa_len);
         return NfcaResult::kProtocolError;
     }
     out->atqa[0] = atqa[0];
@@ -1380,27 +1475,49 @@ NfcaResult nfca_detect(Iso14443aTag *out, bool keep_active) {
     for (uint8_t level = 0; level < 3; level++) {
         const uint8_t sel_cmd = selCmdForLevel(level);
 
+        // Refreshed every iteration -- see this deadline variable's own
+        // declaration comment above for why a single budget computed once
+        // before this loop started a real bug on 7-byte-UID tags.
+        deadline = millis() + kDetectBudgetMs;
+
         uint8_t sdd_req[2] = {sel_cmd, kNvbAnticollision};
         uint8_t sdd_res[8] = {0};
         uint8_t sdd_len = 0;
-        switch (transceive(/*short_cmd=*/0U, sdd_req, sizeof(sdd_req), /*crc_tx=*/false,
+        const Xfer sdd_xfer = transceive(/*short_cmd=*/0U, sdd_req, sizeof(sdd_req), /*crc_tx=*/false,
                            /*antcl=*/true, /*crc_rx=*/false,
-                           sdd_res, sizeof(sdd_res), &sdd_len, deadline)) {
+                           sdd_res, sizeof(sdd_res), &sdd_len, deadline);
+        switch (sdd_xfer) {
             case Xfer::kOk:         break;
             case Xfer::kCollision:  return NfcaResult::kCollision;
             case Xfer::kIo:         return NfcaResult::kHardwareError;
             case Xfer::kNoResponse: // a tag answered WUPA and then went silent
-            default:                return NfcaResult::kProtocolError;
+            default:
+                Serial.printf("quarky-tab5: [st25r3916] DIAG nfca_detect: "
+                              "SDD_REQ (cascade level %u) xfer=%u (0=kOk,1=kNoResponse,"
+                              "2=kCollision,3=kProtocol,4=kIo) sdd_len=%u\n",
+                              (unsigned)level, (unsigned)sdd_xfer, (unsigned)sdd_len);
+                return NfcaResult::kProtocolError;
         }
         if (sdd_len != kSddResLen) {
+            Serial.printf("quarky-tab5: [st25r3916] DIAG nfca_detect: SDD_RES "
+                          "wrong length at level %u: got %u, want %u\n",
+                          (unsigned)level, (unsigned)sdd_len, (unsigned)kSddResLen);
             return NfcaResult::kProtocolError;
         }
         // BCC check, [EH] rfal_nfca.cpp:332 / rfalNfcaCalculateBcc().
         const uint8_t bcc = static_cast<uint8_t>(sdd_res[0] ^ sdd_res[1] ^
                                                  sdd_res[2] ^ sdd_res[3]);
         if (bcc != sdd_res[4]) {
+            Serial.printf("quarky-tab5: [st25r3916] DIAG nfca_detect: BCC "
+                          "mismatch at level %u: uid=%02X%02X%02X%02X bcc=%02X "
+                          "computed=%02X\n", (unsigned)level, sdd_res[0],
+                          sdd_res[1], sdd_res[2], sdd_res[3], sdd_res[4], bcc);
             return NfcaResult::kProtocolError;
         }
+
+        // Refreshed again -- a separate transceive() call from SDD_REQ above,
+        // same reasoning as this loop's own top-of-iteration refresh.
+        deadline = millis() + kDetectBudgetMs;
 
         // SEL_REQ: SEL_CMD, NVB=70h, the 4 UID bytes, BCC -- with CRC.
         const uint8_t sel_req[7] = {sel_cmd,    kNvbSelect, sdd_res[0], sdd_res[1],
@@ -1414,7 +1531,11 @@ NfcaResult nfca_detect(Iso14443aTag *out, bool keep_active) {
             case Xfer::kCollision:  return NfcaResult::kCollision;
             case Xfer::kIo:         return NfcaResult::kHardwareError;
             case Xfer::kNoResponse:
-            default:                return NfcaResult::kProtocolError;
+            default:
+                Serial.printf("quarky-tab5: [st25r3916] DIAG nfca_detect: "
+                              "SEL_REQ (cascade level %u) got no/bad response\n",
+                              (unsigned)level);
+                return NfcaResult::kProtocolError;
         }
         // SEL_RES is one SAK byte. The chip VERIFIES the CRC in hardware (a
         // mismatch would have raised I_crc and been rejected above) but still
@@ -1423,6 +1544,9 @@ NfcaResult nfca_detect(Iso14443aTag *out, bool keep_active) {
         // (rfal_rfst25r3916.cpp:1735-1741). Expect 3; accept 1 rather than
         // fail if this silicon strips them, and log the surprise either way.
         if (sel_len < kSakLen) {
+            Serial.printf("quarky-tab5: [st25r3916] DIAG nfca_detect: SEL_RES "
+                          "too short at level %u: got %u bytes\n",
+                          (unsigned)level, (unsigned)sel_len);
             return NfcaResult::kProtocolError;
         }
         if (sel_len != (kSakLen + 2U) && sel_len != kSakLen) {
@@ -1437,11 +1561,17 @@ NfcaResult nfca_detect(Iso14443aTag *out, bool keep_active) {
         // cascade level follows.
         if (sdd_res[0] == kCascadeTag) {
             if (!append_uid(out, &sdd_res[1], 3)) {
+                Serial.printf("quarky-tab5: [st25r3916] DIAG nfca_detect: "
+                              "append_uid overflow at level %u (cascade)\n",
+                              (unsigned)level);
                 return NfcaResult::kProtocolError;
             }
             continue;
         }
         if (!append_uid(out, &sdd_res[0], 4)) {
+            Serial.printf("quarky-tab5: [st25r3916] DIAG nfca_detect: "
+                          "append_uid overflow at level %u (final)\n",
+                          (unsigned)level);
             return NfcaResult::kProtocolError;
         }
 
@@ -1471,6 +1601,8 @@ NfcaResult nfca_detect(Iso14443aTag *out, bool keep_active) {
 
     // Three cascade levels all reported "more to come" -- ISO14443-3 has no
     // fourth level, so the tag is not following the standard.
+    Serial.println("quarky-tab5: [st25r3916] DIAG nfca_detect: exhausted all "
+                   "3 cascade levels, still incomplete");
     return NfcaResult::kProtocolError;
 }
 
@@ -1546,17 +1678,44 @@ NfcaResult nfca_detect(Iso14443aTag *out, bool keep_active) {
 //       -- `ctrlMsgBuf[...] = param` where `param` is exactly the byte the
 //       request supplied, not a value this driver computes or negotiates.
 //
+//     - rfal_isoDep.cpp:678-705 the PICC-chaining receive branch this
+//       driver's own chaining support (added 2026-08-23) is ported from:
+//       `isoDep_PCBisChaining(rxPCB)` (:229, chaining bit 0x10 per :86) ->
+//       block-number match check (:682) -> `isoDep_ToggleBN` (:684) -> "Rule
+//       2 - Send ACK" via `isoDepHandleControlMsg(ISODEP_R_ACK, ...)` (:689),
+//       whose PCB is `isoDep_PCBRACK(gIsoDep.blockNumber)` (:389) = `0x00 |
+//       ISODEP_PCB_RBLOCK(0x80) | ISODEP_PCB_B6_BIT(0x20) |
+//       ISODEP_PCB_B2_BIT(0x02) | bn` (:253-254, with ISODEP_PCB_ACK=0x00 at
+//       :107) -- i.e. 0xA2|bn, built from the ALREADY-TOGGLED block number.
+//       R-blocks carry no INF (:95 ISODEP_RBLOCK_INF_LEN = 0).
+//
 // SCOPE, stated honestly, same policy as nfca_detect()'s own header comment:
-//   * No I-block chaining, either direction. Every C-APDU this project's EMV
-//     module sends and every R-APDU it expects fits in one I-block given the
-//     FSD=128 this driver declares. A card or command that needed chaining
-//     would be reported as a plain protocol/unsupported-PCB error rather than
-//     silently mis-assembled.
-//   * No R-block (ACK/NAK) handling on transmit. This driver never resends an
-//     I-block after a NAK; a NAK-shaped or unrecognised PCB in the response is
-//     treated as failure. Real EMV read-only exchanges over a short-range,
-//     single-command-per-frame link essentially never need this on the PCD
+//   * PICC->PCD I-block chaining IS handled, bounded in rounds
+//     (kMaxChainingRounds), in reassembled size (kMaxReassembledLen) and in
+//     wall clock (kMaxApduCallMs, shared with the S(WTX) path rather than
+//     added to it). This was NOT true before 2026-08-23: real-hardware
+//     testing against a real Mastercard-style card produced a READ RECORD
+//     response with PCB 0x12 -- an I-block with the chaining bit set,
+//     because its record does not fit the FSD=128 this driver declares --
+//     which the previous code silently accepted as if it were complete
+//     (the truncated TLV was then correctly refused by nfc_emv_read.cpp's
+//     own BER-TLV length-overflow guard, which is how the bug surfaced).
+//   * PCD->PICC chaining is still NOT implemented. Every C-APDU this
+//     project's EMV module sends is under 32 bytes and fits one frame by
+//     construction, so this direction has no real trigger; a command that
+//     needed it would simply be rejected by the tx_len bound rather than
+//     silently split.
+//   * No R-block RECEIVE handling, and no retransmission. This driver never
+//     resends an I-block after a NAK; a NAK-shaped or unrecognised PCB in the
+//     response is treated as failure, and RFAL's own "Rule 5 - PICC chaining
+//     invalid I-Block -> R-ACK" recovery (rfal_isoDep.cpp:702-703) is
+//     deliberately not ported either, since it exists to request a
+//     retransmission this driver has no path to consume. Real EMV read-only
+//     exchanges over a short-range link essentially never need this on the PCD
 //     side in practice; disclosed rather than silently assumed to be unneeded.
+//     (The one R-block this driver does SEND is the R(ACK) that drives PICC
+//     chaining forward, above -- that is a transmit-only use of the R-block
+//     encoding, not the receive/retransmit state machine described here.)
 //   * S(WTX) (waiting-time extension) IS handled, bounded to kMaxWtxRounds
 //     rounds per APDU -- see apdu_transceive()'s own comment for why (a real
 //     card is reasonably likely to ask for one during GET PROCESSING OPTIONS,
@@ -1596,6 +1755,46 @@ constexpr uint8_t kPcbWtxType    = 0x30U;
 constexpr uint8_t kPcbB2Bit      = 0x02U; // MUST be 1 on every I/S-block
 constexpr uint8_t kPcbB6Bit      = 0x20U; // MUST be 0 on a valid I-block
 
+// --- PICC->PCD I-block chaining (added 2026-08-23, real-hardware driven) ---
+// [REF] rfal_isoDep.cpp:86  ISODEP_PCB_CHAINING_BIT = 0x10U -- "Bit mask for
+// the chaining bit of an ISO DEP I-Block in PCB". A received I-block with
+// this bit SET is a non-final fragment: the card has more of this R-APDU to
+// send and is waiting for an R(ACK) before sending it.
+constexpr uint8_t kPcbChainingBit = 0x10U;
+// [REF] rfal_isoDep.cpp:68  ISODEP_PCB_RBLOCK = 0x80U, :85 ISODEP_PCB_B6_BIT
+// = 0x20U, :83 ISODEP_PCB_B2_BIT = 0x02U, :107 ISODEP_PCB_ACK = 0x00U, and
+// the two macros that compose them:
+//   :253 isoDep_PCBRBlock(bn) = 0x00 | RBLOCK | B6_BIT | B2_BIT | (bn & 0x01)
+//   :254 isoDep_PCBRACK(bn)   = isoDep_PCBRBlock(bn) | ISODEP_PCB_ACK
+// i.e. R(ACK) = 0xA2 | bn -- 0xA2 for block number 0, 0xA3 for 1. The ACK
+// subtype is the ZERO value of the 0x10 R-block type bit ([REF] :106-108,
+// ISODEP_PCB_Rx_MASK=0x10, ACK=0x00, NAK=0x10), so nothing is OR'd in for it.
+constexpr uint8_t kPcbRBlockAckBase = 0xA2U;
+
+// Bound 1 of 2 on chaining reassembly: how many R(ACK)/fragment rounds this
+// driver will run for ONE apdu_transceive() call. 8 is chosen against the
+// real frame size this driver negotiates: RATS declares FSDI=7/FSD=128
+// (kRatsParam above), and real cards answer with an FSC of at least 32-64
+// bytes, so 8 fragments carry 256-1000+ bytes of INF -- far more than any
+// real EMV READ RECORD response (see kMaxReassembledLen below). A card that
+// still has not finished after 8 fragments is either malfunctioning or
+// sending something this read-only reader has no use for; failing there is
+// preferable to an unbounded loop, which is exactly the class of bug this
+// project has already been bitten by twice (hal/ir_unit.h's and
+// hal/storage_sd.cpp's own header comments on real watchdog-timeout crashes).
+constexpr uint8_t kMaxChainingRounds = 8U;
+
+// Bound 2 of 2: the largest reassembled R-APDU this driver will hand back,
+// independent of how few rounds it took. Real EMV READ RECORD responses --
+// the only responses observed to chain on real hardware, because a single
+// record can carry Track 2 equivalent data, cardholder name, CVM list, and
+// a 128/176/248-byte issuer public-key certificate at once -- top out around
+// 250-300 bytes; 512 leaves generous headroom over that without letting a
+// hostile or broken card drive this driver's memory use up. apdu_transceive()
+// additionally refuses to write past the CALLER's own rx_cap, so this is the
+// ceiling on what a caller may usefully ask for, not a hidden buffer.
+constexpr size_t kMaxReassembledLen = 512U;
+
 // Per-exchange wall-clock cap. Computed from the card's own declared FWI
 // (via fwiToFwtMs() below) but hard-clamped here to keep a single
 // apdu_transceive() call -- and, more importantly, the handful of them a full
@@ -1619,6 +1818,19 @@ constexpr uint32_t kMaxSingleExchangeMs = 500U;
 // even against a card that does nothing but ask for extensions.
 constexpr uint8_t kMaxWtxRounds = 2U;
 
+// Whole-call wall-clock envelope for ONE apdu_transceive(), shared by the
+// S(WTX) rounds and the PICC->PCD chaining rounds rather than being added to
+// them. Deliberately EQUAL to the worst case the WTX path alone already had
+// before chaining existed ((1 + kMaxWtxRounds) * kMaxSingleExchangeMs =
+// 1500 ms), so adding chaining does NOT widen this driver's already-reasoned
+// worst-case contribution to nfc_emv_read.cpp's kOverallReadBudgetMs or to
+// the ~5 s ESP32 task-watchdog margin (hal/ir_unit.h's and
+// hal/storage_sd.cpp's own header comments record the two real crashes that
+// discipline comes from). Checked before every additional exchange (WTX ack
+// or chaining R(ACK)), the same way nfc_emv_read.cpp's apdu_step() checks its
+// own overall budget before every top-level APDU.
+constexpr uint32_t kMaxApduCallMs = (1U + kMaxWtxRounds) * kMaxSingleExchangeMs;
+
 // [REF] rfal_isoDep.cpp:805-807: "FWT = (256 x 16/fC) x 2^FWI => 2^(FWI+12)",
 // fc = 13.56 MHz. Returns milliseconds, rounded up by one, then clamped to
 // kMaxSingleExchangeMs -- see that constant's own comment for why the clamp
@@ -1636,8 +1848,44 @@ uint32_t fwiToFwtMs(uint8_t fwi) {
     return ms;
 }
 
+// Converts an already-clamped ms timeout (kMaxSingleExchangeMs's own comment
+// explains the clamp) into 64/fc steps for the CHIP's own hardware NRT
+// register -- real bug found & fixed via real-hardware testing (2026-08-23):
+// apdu_transceive()'s own transceive() calls never passed an nrt_steps
+// argument at all, silently defaulting to kNrtSteps64fc (~165us, correct
+// only for anticollision replies) regardless of this FWI-derived timeout
+// already being computed and stored in s_apdu_timeout_ms -- the exact same
+// class of bug already found and fixed for RATS's own NRT (see
+// kRatsNrtSteps64fc's declaration comment). Clamped to 0xFFFFU (the NRT
+// register's own real max in 64/fc mode, [REF]
+// ~/src/wilson-elechouse/ST25R3916/ST25R3916_ELECHOUSE/src/st25r3916.cpp:49
+// ST25R3916_NRT_MAX): this driver only ever configures 64/fc mode (never the
+// alternate 4096/fc mode RFAL's own st25r3916SetNoResponseTime() falls back
+// to for larger values), so a pathologically high FWI could in principle
+// need more than the ~309ms this mode can represent -- in that rare case the
+// hardware NRT clamps below the still-independent software `deadline_ms`,
+// which only makes a bad exchange fail slightly sooner, never later or
+// incorrectly.
+uint16_t msToNrtSteps64fc(uint32_t ms) {
+    const uint64_t steps = (static_cast<uint64_t>(ms) * 13560U) / 64U;
+    return steps > 0xFFFFU ? 0xFFFFU : static_cast<uint16_t>(steps);
+}
+
 uint8_t s_pcb_block_number = 0U;
 uint32_t s_apdu_timeout_ms = 0U;
+uint16_t s_apdu_nrt_steps = 0U; // set alongside s_apdu_timeout_ms, both
+                                // derived from the same FWI value
+
+// Last ATS received by iso14443_4_activate(), verbatim and CRC-stripped
+// (TL byte first, exactly as it came off the wire). Retained so a feature
+// module can export the card's real ISO14443-4 interface bytes -- Phase 3
+// Task 13's Flipper ".nfc" exporter writes T0/TA(1)/TB(1)/TC(1)/T1...Tk
+// straight out of this, and there is nowhere else in this driver those bytes
+// survive (activate() parses only TB's FWI nibble and discards the rest).
+// Cleared at the start of every activation so a stale ATS from a previous
+// card can never be exported against a new one.
+uint8_t s_ats[kAtsMaxLen] = {0};
+uint8_t s_ats_len = 0U;
 
 } // namespace
 
@@ -1646,9 +1894,11 @@ bool iso14443_4_activate() {
         return false;
     }
     s_pcb_block_number = 0U;
+    s_ats_len = 0U; // never export a previous card's ATS -- see s_ats above
     s_apdu_timeout_ms = fwiToFwtMs(kFwiDefault); // refined below once the
                                                  // real ATS is read, if it
                                                  // says otherwise
+    s_apdu_nrt_steps = msToNrtSteps64fc(s_apdu_timeout_ms);
 
     const uint8_t rats_req[2] = {kCmdRats, kRatsParam};
     uint8_t ats[kAtsMaxLen] = {0};
@@ -1656,23 +1906,40 @@ bool iso14443_4_activate() {
     // Activation gets its own generous-but-bounded deadline, separate from
     // kMaxSingleExchangeMs: RATS is a one-time cost per tag, not repeated per
     // APDU, so there is no "several of these in a row" risk to guard against
-    // the way there is for apdu_transceive()'s steady-state calls.
+    // the way there is for apdu_transceive()'s steady-state calls. This 100ms
+    // SOFTWARE deadline was never the problem -- see kRatsNrtSteps64fc's own
+    // declaration comment: the chip's own HARDWARE no-response timer was
+    // firing at ~165us, long before this software deadline could matter.
     const uint32_t deadline = millis() + 100U;
     const Xfer xr = transceive(/*short_cmd=*/0U, rats_req, sizeof(rats_req),
                                /*crc_tx=*/true, /*antcl=*/false, /*crc_rx=*/true,
-                               ats, sizeof(ats), &ats_len, deadline);
+                               ats, sizeof(ats), &ats_len, deadline,
+                               kRatsNrtSteps64fc);
     if (xr != Xfer::kOk) {
         Serial.printf("quarky-tab5: [st25r3916] RATS (0xE0) failed, xfer=%u\n",
                       static_cast<unsigned>(xr));
         return false;
     }
     // [REF] rfal_isoDep.cpp:936-938's own ATS validity gate: TL must equal
-    // the actual received length, and be at least the 1-byte minimum.
+    // the actual received length, and be at least the 1-byte minimum. `ats`
+    // here is already CRC-stripped by transceive() itself -- real bug found
+    // via real-hardware testing (2026-08-23), see that function's own
+    // content_len comment for the full story: this chip keeps 2
+    // already-verified CRC bytes in the FIFO on every crc_rx=true receive,
+    // confirmed on three different real ATS responses (each exactly TL+2
+    // bytes long before that fix) and fixed once, centrally, rather than
+    // patched separately at every call site including this one.
     if (ats_len < kAtsMinLen || ats[0] != ats_len) {
         Serial.printf("quarky-tab5: [st25r3916] ATS malformed: len=%u TL=0x%02X\n",
                       (unsigned)ats_len, ats_len > 0 ? ats[0] : 0);
         return false;
     }
+
+    // Retain the whole validated ATS for iso14443_4_get_ats() -- see s_ats's
+    // own declaration comment. Done AFTER the TL/length validity gate above
+    // so only a well-formed ATS is ever exported.
+    memcpy(s_ats, ats, ats_len);
+    s_ats_len = ats_len;
 
     uint8_t fwi = kFwiDefault;
     if (ats_len >= 2U) {
@@ -1693,11 +1960,21 @@ bool iso14443_4_activate() {
         // irrelevant here.
     }
     s_apdu_timeout_ms = fwiToFwtMs(fwi);
+    s_apdu_nrt_steps = msToNrtSteps64fc(s_apdu_timeout_ms);
 
     Serial.printf("quarky-tab5: [st25r3916] ISO14443-4 activated: ATS len=%u "
                   "FWI=%u -> per-exchange timeout %u ms\n",
                   (unsigned)ats_len, (unsigned)fwi, (unsigned)s_apdu_timeout_ms);
     return true;
+}
+
+size_t iso14443_4_get_ats(uint8_t *out, size_t cap) {
+    if (out == nullptr || cap == 0U || s_ats_len == 0U) {
+        return 0;
+    }
+    const size_t n = (static_cast<size_t>(s_ats_len) < cap) ? s_ats_len : cap;
+    memcpy(out, s_ats, n);
+    return n;
 }
 
 bool apdu_transceive(const uint8_t *tx, size_t tx_len,
@@ -1711,9 +1988,18 @@ bool apdu_transceive(const uint8_t *tx, size_t tx_len,
     // One PCB byte precedes the APDU; transceive()'s own tx_len parameter is
     // a uint8_t, so this driver's usable APDU size tops out at 254 bytes --
     // far more than any command nfc_emv_read.cpp sends (all under 32 bytes).
-    if (tx_len > 254U || rx_cap > 255U) {
+    // rx_cap is NOT capped at 255 any more (it was, before PICC->PCD chaining
+    // existed, because one frame was one response): a reassembled R-APDU can
+    // legitimately be longer than a single frame. It is capped at
+    // kMaxReassembledLen instead -- see that constant's own comment.
+    if (tx_len > 254U || rx_cap > kMaxReassembledLen) {
         return false;
     }
+
+    // Whole-call envelope shared by the WTX and chaining rounds below; see
+    // kMaxApduCallMs for why this is equal to (not added to) the worst case
+    // the WTX path alone already had.
+    const uint32_t call_deadline = millis() + kMaxApduCallMs;
 
     uint8_t frame[255];
     frame[0] = static_cast<uint8_t>(kPcbB2Bit | (s_pcb_block_number & 0x01U));
@@ -1722,70 +2008,157 @@ bool apdu_transceive(const uint8_t *tx, size_t tx_len,
 
     uint8_t resp[255];
     uint8_t resp_len = 0;
+    // nrt_steps=s_apdu_nrt_steps: real bug found & fixed via real-hardware
+    // testing (2026-08-23) -- this call used to omit the nrt_steps argument
+    // entirely, silently defaulting to the anticollision-tuned ~165us NRT
+    // regardless of s_apdu_timeout_ms already being computed for exactly
+    // this purpose. See s_apdu_nrt_steps's own declaration comment.
     Xfer xr = transceive(/*short_cmd=*/0U, frame, frame_len, /*crc_tx=*/true,
                          /*antcl=*/false, /*crc_rx=*/true,
                          resp, sizeof(resp), &resp_len,
-                         millis() + s_apdu_timeout_ms);
+                         millis() + s_apdu_timeout_ms, s_apdu_nrt_steps);
+    Serial.printf("quarky-tab5: [st25r3916] DIAG apdu_transceive: sent frame_len=%u "
+                  "pcb=0x%02X tx[0..4]=%02X %02X %02X %02X -- xfer=%u resp_len=%u\n",
+                  (unsigned)frame_len, frame[0], tx_len > 0 ? tx[0] : 0,
+                  tx_len > 1 ? tx[1] : 0, tx_len > 2 ? tx[2] : 0, tx_len > 3 ? tx[3] : 0,
+                  (unsigned)xr, (unsigned)resp_len);
+    if (resp_len > 0) {
+        char hexbuf[3 * 32 + 1] = {0};
+        const uint8_t dump_len = resp_len < 32U ? resp_len : 32U;
+        for (uint8_t i = 0; i < dump_len; i++) {
+            snprintf(&hexbuf[i * 3], 4, "%02X ", resp[i]);
+        }
+        Serial.printf("quarky-tab5: [st25r3916] DIAG apdu_transceive: resp bytes: %s\n",
+                      hexbuf);
+    }
 
-    for (uint8_t wtx_round = 0; ; wtx_round++) {
-        if (xr != Xfer::kOk || resp_len == 0) {
+    // Reassembly cursor. Every accepted fragment's INF field (the frame minus
+    // its own PCB byte) is appended here; for the overwhelmingly common
+    // single-frame case the loop below runs exactly once and this behaves
+    // identically to the pre-chaining code.
+    size_t assembled = 0;
+
+    for (uint8_t chain_round = 0; ; chain_round++) {
+        // --- S(WTX) sub-loop, unchanged in behavior, now also bounded by the
+        // whole-call deadline. A card may request a waiting-time extension
+        // before ANY fragment, not just the first, so this lives inside the
+        // chaining loop.
+        for (uint8_t wtx_round = 0; ; wtx_round++) {
+            if (xr != Xfer::kOk || resp_len == 0) {
+                Serial.println("quarky-tab5: [st25r3916] DIAG apdu_transceive: giving up -- "
+                               "xfer not kOk or zero-length response");
+                return false;
+            }
+            const uint8_t p = resp[0];
+            const bool is_s_wtx = ((p & kPcbTypeMask) == kPcbSBlockType) &&
+                                  ((p & kPcbSTypeMask) == kPcbWtxType);
+            if (!is_s_wtx) {
+                break;
+            }
+            // [REF] rfal_isoDep.cpp:415-421: the WTX ack echoes the SAME PCB
+            // and the SAME one-byte power-multiplier INF field the request
+            // carried.
+            if (resp_len < 2U || wtx_round >= kMaxWtxRounds ||
+                static_cast<int32_t>(millis() - call_deadline) >= 0) {
+                Serial.println("quarky-tab5: [st25r3916] S(WTX) request malformed, "
+                               "too many rounds, or call budget exhausted -- "
+                               "giving up on this APDU");
+                return false;
+            }
+            const uint8_t ack[2] = {p, resp[1]};
+            xr = transceive(/*short_cmd=*/0U, ack, sizeof(ack), /*crc_tx=*/true,
+                            /*antcl=*/false, /*crc_rx=*/true,
+                            resp, sizeof(resp), &resp_len,
+                            millis() + s_apdu_timeout_ms, s_apdu_nrt_steps);
+        }
+
+        const uint8_t pcb = resp[0];
+        // [REF] ISODEP_PCB_IB_VALID_MASK/VAL: bits (0x20|0x02) must read
+        // (0|0x02) on a real I-block -- the B2 must-be-1 bit set AND the B6
+        // must-be-0 bit clear, on top of the type bits identifying an I-block
+        // in the first place.
+        const bool is_i_block = ((pcb & kPcbTypeMask) == kPcbIBlockType) &&
+                                ((pcb & kPcbB2Bit) != 0U) &&
+                                ((pcb & kPcbB6Bit) == 0U);
+        // [REF] rfal_isoDep.cpp:709-712 (final block) and :682 (chained
+        // block, which applies the identical `isoDep_GetBN(rxPCB) ==
+        // gIsoDep.blockNumber` test): the PICC's I-block echoes the SAME
+        // block-number bit the PCD's last frame carried -- RFAL itself treats
+        // a mismatch as a mandatory reject (Digital 1.1 15.2.6.4 / EMVCo 2.6
+        // 10.3.5.4), not an optional check. Missing this would let a stale or
+        // duplicate I-block (e.g. a retransmission after RF noise) be
+        // silently accepted as the answer to whatever was just sent.
+        const bool bn_matches = (pcb & 0x01U) == (s_pcb_block_number & 0x01U);
+        if (!is_i_block || !bn_matches) {
+            Serial.printf("quarky-tab5: [st25r3916] DIAG apdu_transceive: rejected -- "
+                          "pcb=0x%02X is_i_block=%u bn_matches=%u expected_bn=%u\n",
+                          pcb, (unsigned)is_i_block, (unsigned)bn_matches,
+                          (unsigned)(s_pcb_block_number & 0x01U));
+            // An R-block, a malformed/unsupported S-block, or an I-block with
+            // the wrong block number -- not handled (see this section's
+            // SOURCES note on scope). Reported as failure rather than guessed
+            // at. NOTE this deliberately does NOT implement RFAL's own "Rule
+            // 5 - PICC chaining invalid I-Block -> R-ACK" recovery
+            // (rfal_isoDep.cpp:702-703): that is a retransmission-request
+            // path, and this driver has no retransmission behavior in either
+            // direction (see the R-block scope bullet above).
             return false;
         }
-        const uint8_t pcb = resp[0];
-        const bool is_s_wtx = ((pcb & kPcbTypeMask) == kPcbSBlockType) &&
-                              ((pcb & kPcbSTypeMask) == kPcbWtxType);
-        if (!is_s_wtx) {
+
+        const size_t inf_len = static_cast<size_t>(resp_len) - 1U;
+        if (inf_len > rx_cap - assembled) {
+            Serial.printf("quarky-tab5: [st25r3916] apdu_transceive: reassembled "
+                          "response would exceed caller capacity (%u + %u > %u)\n",
+                          (unsigned)assembled, (unsigned)inf_len, (unsigned)rx_cap);
+            return false;
+        }
+        memcpy(&rx[assembled], &resp[1], inf_len);
+        assembled += inf_len;
+
+        // [REF] rfal_isoDep.cpp:269 isoDep_ToggleBN(): the block number
+        // toggles after every accepted I-block -- both the final one (:712)
+        // and each chained one (:684). Done here, once, for both cases.
+        s_pcb_block_number ^= 1U;
+
+        // [REF] rfal_isoDep.cpp:86 ISODEP_PCB_CHAINING_BIT / :229
+        // isoDep_PCBisChaining(). Bit clear -> this was the last fragment.
+        if ((pcb & kPcbChainingBit) == 0U) {
             break;
         }
-        // [REF] rfal_isoDep.cpp:415-421: the WTX ack echoes the SAME PCB and
-        // the SAME one-byte power-multiplier INF field the request carried.
-        if (resp_len < 2U || wtx_round >= kMaxWtxRounds) {
-            Serial.println("quarky-tab5: [st25r3916] S(WTX) request malformed "
-                           "or too many rounds -- giving up on this APDU");
+
+        if (chain_round >= kMaxChainingRounds ||
+            static_cast<int32_t>(millis() - call_deadline) >= 0) {
+            Serial.printf("quarky-tab5: [st25r3916] apdu_transceive: PICC chaining "
+                          "exceeded its bound (round=%u, %u bytes so far) -- giving up\n",
+                          (unsigned)chain_round, (unsigned)assembled);
             return false;
         }
-        const uint8_t ack[2] = {pcb, resp[1]};
-        xr = transceive(/*short_cmd=*/0U, ack, sizeof(ack), /*crc_tx=*/true,
+
+        // [REF] rfal_isoDep.cpp:678-700, the PICC-chaining branch of
+        // rfalIsoDepDataExchangePCD()'s receive handling, ported literally:
+        // on a chained I-block with the expected block number, RFAL toggles
+        // its block number FIRST (:684 isoDep_ToggleBN) and only then emits
+        // "Rule 2 - Send ACK" (:689 isoDepHandleControlMsg(ISODEP_R_ACK)),
+        // whose PCB is isoDep_PCBRACK(gIsoDep.blockNumber) (:389) -- i.e. the
+        // ALREADY-TOGGLED number. The toggle above therefore happens before
+        // this R(ACK) is built, matching RFAL's ordering exactly; getting it
+        // backwards would ACK with the previous block number and stall the
+        // chain. The R-block carries no INF field ([REF] :95
+        // ISODEP_RBLOCK_INF_LEN = 0), so the frame is the single PCB byte.
+        const uint8_t rack[1] = {
+            static_cast<uint8_t>(kPcbRBlockAckBase | (s_pcb_block_number & 0x01U))};
+        Serial.printf("quarky-tab5: [st25r3916] DIAG apdu_transceive: PICC chaining "
+                      "(pcb=0x%02X), sending R(ACK)=0x%02X for fragment %u\n",
+                      pcb, rack[0], (unsigned)(chain_round + 1));
+        xr = transceive(/*short_cmd=*/0U, rack, sizeof(rack), /*crc_tx=*/true,
                         /*antcl=*/false, /*crc_rx=*/true,
                         resp, sizeof(resp), &resp_len,
-                        millis() + s_apdu_timeout_ms);
+                        millis() + s_apdu_timeout_ms, s_apdu_nrt_steps);
     }
 
-    const uint8_t pcb = resp[0];
-    // [REF] ISODEP_PCB_IB_VALID_MASK/VAL: bits (0x20|0x02) must read (0|0x02)
-    // on a real I-block -- the B2 must-be-1 bit set AND the B6 must-be-0 bit
-    // clear, on top of the type bits identifying an I-block in the first
-    // place.
-    const bool is_i_block = ((pcb & kPcbTypeMask) == kPcbIBlockType) &&
-                            ((pcb & kPcbB2Bit) != 0U) &&
-                            ((pcb & kPcbB6Bit) == 0U);
-    // [REF] rfal_isoDep.cpp:709-712: the PICC's I-block response echoes the
-    // SAME block-number bit the PCD's request carried (the PCD-side toggle
-    // below applies only to the NEXT frame this driver sends) -- RFAL itself
-    // treats a mismatch here as a mandatory reject (Digital 1.1 15.2.6.4 /
-    // EMVCo 2.6 10.3.5.4), not an optional check. Missing this would let a
-    // stale or duplicate I-block (e.g. a retransmission after RF noise) be
-    // silently accepted as the answer to whatever was just sent.
-    const bool bn_matches = (pcb & 0x01U) == (s_pcb_block_number & 0x01U);
-    if (!is_i_block || !bn_matches) {
-        // An R-block, a malformed/unsupported S-block, or an I-block with
-        // the wrong block number -- not handled (see this section's SOURCES
-        // note on scope). Reported as failure rather than guessed at.
-        return false;
-    }
-
-    const size_t inf_len = static_cast<size_t>(resp_len) - 1U;
-    if (inf_len > rx_cap) {
-        return false;
-    }
-    memcpy(rx, &resp[1], inf_len);
     if (rx_len != nullptr) {
-        *rx_len = inf_len;
+        *rx_len = assembled;
     }
-    // [REF] rfal_isoDep.cpp:269 isoDep_ToggleBN(): the block number toggles
-    // after every successful round-trip, ready for the next I-block this
-    // driver sends.
-    s_pcb_block_number ^= 1U;
     return true;
 }
 

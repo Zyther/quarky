@@ -1,7 +1,11 @@
 #include "nfc_emv_read.h"
 
 #include "st25r3916_driver.h"
+#include "nfc_common.h"
+#include "nfc_flipper_format.h"
+#include "nfc_tag_library.h"
 #include "../../hal/nfc_pn532.h" // nfc_release_external_i2c() -- GPIO53 arbiter
+#include "../../hal/storage_sd.h"
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
 
@@ -59,15 +63,34 @@
 //           this read-only, single-buffer, find-one-tag use case does not
 //           need.
 //
-// SCOPE / DISCLOSED GAP: the Visa-specific PDOL-based GET PROCESSING OPTIONS
-// path (`EMVReader::emv_read_visa()` in the donor, keyed off `emv_ask_for_pdol()`
-// returning a non-empty PDOL) is NOT implemented. This module always sends
-// the no-PDOL GPO (`80 A8 00 00 02 83 00 00`) and, if the card responds with
-// an error (a card that requires its PDOL echoed back will reject this),
-// reports a clear "may require a PDOL" failure rather than reading nothing
-// silently and calling it success. Per this task's brief, the no-PDOL path is
-// the required baseline and this is the honestly-disclosed gap, not a
-// half-working guess at the Visa path.
+// PDOL-BASED GPO PATH -- IMPLEMENTED as of 2026-08-23 (this was previously
+// documented here as a disclosed gap; it no longer is). Real-hardware
+// evidence drove it: a real Visa card completed SELECT PPSE and SELECT AID
+// (AID A0 00 00 00 03 10 10, "VISA CREDIT") and then answered the no-PDOL GPO
+// with the real EMV status bytes 69 85, "Conditions of use not satisfied" --
+// i.e. that card genuinely requires its PDOL echoed back. build_pdol_gpo()
+// below now does exactly that, and the no-PDOL GPO remains the fallback for
+// cards whose FCI carries no tag 9F38 at all (a real Mastercard-style card in
+// hand behaves that way and its whole existing path is unchanged).
+//   - [DONOR] EMVReader::emv_ask_for_pdol() (emv_reader.cpp:128-149) is where
+//     the donor looks for tag 9F38 in the SELECT AID response; this module
+//     does the same with its own ber_tlv_find().
+//   - [DONOR] EMVReader::emv_read_visa() (emv_reader.cpp:151-230) is the real,
+//     donor-tested Visa GPO payload every default fill value below is taken
+//     from, byte for byte. See kPdolDefaults' own comment for the per-tag
+//     mapping and for the ONE deliberate difference: the donor sends a FIXED
+//     33-byte payload that happens to match the standard Visa PDOL, whereas
+//     this module walks the card's OWN PDOL tag/length list and fills each
+//     requested data object from that same value table. For a card whose PDOL
+//     is the standard Visa one the two produce byte-identical output; for any
+//     other PDOL ordering or length the donor's fixed payload would simply be
+//     wrong, which is why this module drives it from the card's real request.
+//
+// SCOPE / REMAINING DISCLOSED GAPS: this is still a READ-ONLY reader -- it
+// sends no GENERATE AC, computes no cryptogram, and the PDOL values below are
+// deliberately inert (zero amount, fixed unpredictable number). It does not
+// implement Flipper's/other tooling's deeper EMV parsing (no application
+// currency/label extraction beyond the AID dictionary, no transaction log).
 //
 // EXECUTION MODEL: a single button-tap-triggered synchronous read, run
 // entirely inside ONE poll() tick once a card is detected -- see
@@ -86,6 +109,15 @@
 // ===========================================================================
 
 extern FeatureRegistry g_registry;
+
+// The real global StorageSD (defined in main.cpp, Phase 1 Task 10), handed to
+// NfcTagLibrary::save() / NfcFlipperFormat::write() at their call sites --
+// both take IStorage& by dependency injection (see nfc_tag_library.h's header
+// comment for why), exactly as nfc_read.cpp's own "Save to Library" button
+// already does. Declared at file scope, NOT inside this file's anonymous
+// namespace, so it refers to that one real object rather than an
+// internal-linkage declaration that would never link.
+extern StorageSD storage;
 
 namespace NfcEmvRead {
 
@@ -246,6 +278,34 @@ struct EmvResult {
     const char *fail_reason = nullptr;
 };
 
+// Response capacity for one (possibly reassembled) R-APDU. Matches the
+// driver's own kMaxReassembledLen -- St25r3916::apdu_transceive() rejects any
+// rx_cap larger than that outright. Raised from the previous 255 because
+// PICC->PCD I-block chaining is now handled there (real hardware: a real
+// Mastercard-style card's SFI-2 READ RECORD came back as a chained I-block,
+// PCB 0x12), so a single logical response can legitimately exceed one frame.
+constexpr size_t kApduRxCap = 512;
+
+// File-scope, not stack locals. Two 512-byte buffers plus this module's other
+// locals inside read_emv_card() would put ~1 KB of transient APDU buffering on
+// the LVGL/poll() task's stack at a non-trivial call depth (poll() ->
+// attempt_read() -> read_emv_card()), for no benefit -- this module is a
+// single screen driven from a single task and read_emv_card() is not
+// reentrant regardless (it already keeps s_read_deadline_ms in a static). Same
+// reasoning rf433_sub_format.cpp's build_signed_durations() documents for its
+// own working buffer.
+uint8_t s_apdu_rx[kApduRxCap];
+uint8_t s_record_rx[kApduRxCap];
+
+// Backing store for the one failure message that is FORMATTED rather than a
+// string literal (the GPO status-word report). EmvResult::fail_reason is a
+// `const char *` pointing at literals everywhere else; this keeps that
+// contract intact without giving the struct a buffer every other path would
+// waste. Safe for the same reason the two buffers above are: single screen,
+// single task, and the pointer is consumed by the caller within the same
+// poll() tick that set it.
+char s_fail_buf[96];
+
 // Real total wall-clock budget for one full read attempt (RATS + up to ~10
 // APDU exchanges). Checked before every single apdu_step() call below, in
 // addition to st25r3916_driver.cpp's own per-exchange kMaxSingleExchangeMs
@@ -255,16 +315,13 @@ struct EmvResult {
 constexpr uint32_t kOverallReadBudgetMs = 2500U;
 uint32_t s_read_deadline_ms = 0;
 
-bool apdu_step(const uint8_t *tx, uint8_t tx_len, uint8_t *rx, uint8_t *rx_len_out,
-              uint8_t rx_cap) {
+bool apdu_step(const uint8_t *tx, size_t tx_len, uint8_t *rx, size_t *rx_len_out,
+              size_t rx_cap) {
     *rx_len_out = 0;
     if (static_cast<int32_t>(millis() - s_read_deadline_ms) >= 0) {
         return false; // overall read budget exceeded -- give up, don't retry
     }
-    size_t rx_len = 0;
-    const bool ok = St25r3916::apdu_transceive(tx, tx_len, rx, rx_cap, &rx_len);
-    *rx_len_out = static_cast<uint8_t>(rx_len);
-    return ok;
+    return St25r3916::apdu_transceive(tx, tx_len, rx, rx_cap, rx_len_out);
 }
 
 // PAN (tag 5A) is BCD -- one byte holds two decimal digits, padded with a
@@ -299,11 +356,188 @@ void format_pan(const uint8_t *pan_bytes, size_t pan_len, char *out, size_t out_
     out[oi] = '\0';
 }
 
+// --- PDOL (tag 9F38) handling -----------------------------------------------
+// See this file's header comment for the [DONOR] citation. Every value below
+// is lifted byte-for-byte from EMVReader::emv_read_visa()'s own `payload[]`
+// (emv_reader.cpp:155-204), including that function's own inline labels:
+//
+//   9F66 (4) = 20 00 00 00       "TTQ - Visa Standard"
+//   9F02 (6) = 00 00 00 00 00 00 "Amount 0"
+//   9F03 (6) = 00 00 00 00 00 00 "Amount Other 0"
+//   9F1A (2) = 03 80             "Country: Italy"  <- the donor's own choice
+//   95   (5) = 00 00 00 00 00    "TVR: No errors"
+//   5F2A (2) = 09 78             "Currency: Euro"
+//   9A   (3) = 25 11 25          "Date: 25 Nov 25"
+//   9C   (1) = 00                "Tx Type: Purchase"
+//   9F37 (4) = 12 34 56 78       "Unpredictable Num"
+//
+// The country/currency/date values are the donor's, kept rather than
+// "corrected": they are the combination actually tested against real cards,
+// nothing here performs a transaction, and a card that answers GPO at all
+// answers it for any self-consistent terminal profile. Changing them to a
+// different country/currency would be an untested guess, which is exactly
+// what this project's citation discipline exists to avoid.
+//
+// Any PDOL data object the card asks for that is NOT in this table is filled
+// with zeros for its requested length -- the only defensible default, and the
+// same thing the donor's fixed payload effectively does for the fields it
+// zeroes.
+struct PdolDefault {
+    uint8_t tag[2];
+    uint8_t tag_len;
+    uint8_t value[6];
+    uint8_t value_len;
+};
+
+constexpr PdolDefault kPdolDefaults[] = {
+    {{0x9F, 0x66}, 2, {0x20, 0x00, 0x00, 0x00}, 4},
+    {{0x9F, 0x02}, 2, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, 6},
+    {{0x9F, 0x03}, 2, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, 6},
+    {{0x9F, 0x1A}, 2, {0x03, 0x80}, 2},
+    {{0x95, 0x00}, 1, {0x00, 0x00, 0x00, 0x00, 0x00}, 5},
+    {{0x5F, 0x2A}, 2, {0x09, 0x78}, 2},
+    {{0x9A, 0x00}, 1, {0x25, 0x11, 0x25}, 3},
+    {{0x9C, 0x00}, 1, {0x00}, 1},
+    {{0x9F, 0x37}, 2, {0x12, 0x34, 0x56, 0x78}, 4},
+};
+constexpr size_t kPdolDefaultCount = sizeof(kPdolDefaults) / sizeof(kPdolDefaults[0]);
+
+// Real PDOLs are short (the standard Visa one is 9 entries / 33 value bytes).
+// Both bounds are defensive caps against a malformed or hostile 9F38, not
+// limits any real card approaches -- same discipline as the AFL cap below and
+// as st25r3916_driver.cpp's own chaining bounds.
+constexpr size_t kMaxPdolEntries = 24;
+constexpr size_t kMaxPdolDataLen = 120; // keeps Lc (= data + 2) < 128, so the
+                                        // tag-83 length stays single-byte
+
+// Builds the PDOL-based GET PROCESSING OPTIONS command from the card's own
+// PDOL (a DOL: a bare sequence of tag/length pairs with no values, EMV Book 3
+// Annex A / ISO 7816-4 5.2.2 -- the same tag and length encodings
+// ber_tlv_tag_len()/ber_tlv_len() above already implement, reused here rather
+// than re-written). Output shape, per [DONOR] emv_read_visa()'s payload:
+//   80 A8 00 00 <Lc> 83 <data_len> <data...> 00
+// Returns the total command length, or 0 if the PDOL is malformed or asks for
+// more than this module is willing to build.
+size_t build_pdol_gpo(const uint8_t *pdol, size_t pdol_len, uint8_t *out, size_t out_cap) {
+    uint8_t data[kMaxPdolDataLen];
+    size_t data_len = 0;
+    size_t pos = 0;
+    size_t entries = 0;
+
+    while (pos < pdol_len) {
+        if (++entries > kMaxPdolEntries) {
+            return 0;
+        }
+        size_t tlen = 0;
+        if (!ber_tlv_tag_len(pdol, pdol_len, pos, &tlen) || pos + tlen > pdol_len) {
+            return 0;
+        }
+        size_t llen = 0;
+        size_t want = 0;
+        if (!ber_tlv_len(pdol, pdol_len, pos + tlen, &llen, &want)) {
+            return 0;
+        }
+        const uint8_t *tag = &pdol[pos];
+        pos += tlen + llen;
+
+        if (want > kMaxPdolDataLen || data_len + want > sizeof(data)) {
+            return 0;
+        }
+        memset(&data[data_len], 0, want); // zero is the default for anything
+                                          // not in kPdolDefaults, and the pad
+                                          // for a short known value
+        for (size_t i = 0; i < kPdolDefaultCount; i++) {
+            if (kPdolDefaults[i].tag_len != tlen ||
+                memcmp(kPdolDefaults[i].tag, tag, tlen) != 0) {
+                continue;
+            }
+            const size_t n = (kPdolDefaults[i].value_len < want) ? kPdolDefaults[i].value_len
+                                                                 : want;
+            memcpy(&data[data_len], kPdolDefaults[i].value, n);
+            break;
+        }
+        data_len += want;
+    }
+
+    if (data_len == 0) {
+        return 0; // an empty PDOL is not a PDOL path -- caller falls back
+    }
+    const size_t cmd_len = 5 + 2 + data_len + 1;
+    if (cmd_len > out_cap) {
+        return 0;
+    }
+    out[0] = 0x80;
+    out[1] = 0xA8;
+    out[2] = 0x00;
+    out[3] = 0x00;
+    out[4] = static_cast<uint8_t>(2 + data_len); // Lc
+    out[5] = 0x83;                               // command template tag
+    out[6] = static_cast<uint8_t>(data_len);
+    memcpy(&out[7], data, data_len);
+    out[7 + data_len] = 0x00; // Le
+    return cmd_len;
+}
+
+// --- Track 2 equivalent data (tag 57) ---------------------------------------
+// [DONOR] emv_read_visa()'s own inline comments describe this layout exactly:
+// "Index 8 is separator 'D' and first digit of ValidTo month / Index 9 is
+// second digit of ValidTo month and first digit of ValidTo year / Index 10 is
+// second digit of ValidTo year and first digit of Service Code". That is the
+// real ISO 7813 track-2 layout: packed BCD nibbles, PAN digits first, the
+// nibble 0xD as the field separator, then a 4-digit YYMM expiry, then the
+// service code.
+//
+// The donor hardcodes the separator's position (it assumes an 8-byte/16-digit
+// PAN and indexes 8/9/10 directly). This walks nibbles and finds the real
+// separator instead, so a 15- or 19-digit PAN parses correctly too -- same
+// layout, no fixed-offset assumption. Returns false if no separator or fewer
+// than 4 expiry digits follow it.
+bool parse_track2(const uint8_t *t2, size_t t2_len, char *pan_out, size_t pan_cap,
+                  char *expiry_out, size_t expiry_cap) {
+    uint8_t digits[40];
+    size_t n = 0;
+    for (size_t i = 0; i < t2_len && n + 2 <= sizeof(digits); i++) {
+        digits[n++] = static_cast<uint8_t>((t2[i] >> 4) & 0x0FU);
+        digits[n++] = static_cast<uint8_t>(t2[i] & 0x0FU);
+    }
+    size_t sep = n;
+    for (size_t i = 0; i < n; i++) {
+        if (digits[i] == 0x0DU) {
+            sep = i;
+            break;
+        }
+    }
+    if (sep == n || sep == 0 || sep + 4 >= n) {
+        return false;
+    }
+
+    // PAN digits are digits[0..sep). Re-pack them into the same BCD byte
+    // layout format_pan() already consumes (it is the shared PAN-formatting
+    // convention this module took from [DONOR] display_emv()), rather than
+    // duplicating that function's spacing logic here.
+    uint8_t pan_bcd[20];
+    size_t pb = 0;
+    for (size_t i = 0; i < sep && pb < sizeof(pan_bcd); i += 2) {
+        const uint8_t hi = digits[i];
+        const uint8_t lo = (i + 1 < sep) ? digits[i + 1] : 0x0FU; // odd count -> 'F' pad
+        pan_bcd[pb++] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    format_pan(pan_bcd, pb, pan_out, pan_cap);
+
+    // YYMM follows the separator; displayed MM/YY, same convention the AFL
+    // path's tag-5F24 handling already uses.
+    std::snprintf(expiry_out, expiry_cap, "%u%u/%u%u",
+                  (unsigned)digits[sep + 3], (unsigned)digits[sep + 4],
+                  (unsigned)digits[sep + 1], (unsigned)digits[sep + 2]);
+    return true;
+}
+
 // The full read sequence: SELECT PPSE -> SELECT AID -> GET PROCESSING OPTIONS
-// (no-PDOL) -> walk the AFL with READ RECORD. Returns false with
-// out->fail_reason set on any step failing; out->vendor may still be filled
-// in (AID is known before GPO/READ RECORD run) even when PAN extraction later
-// fails, which the caller displays either way.
+// (PDOL-based when the card's FCI carries tag 9F38, otherwise no-PDOL) ->
+// walk the AFL with READ RECORD. Returns false with out->fail_reason set on
+// any step failing; out->vendor may still be filled in (AID is known before
+// GPO/READ RECORD run) even when PAN extraction later fails, which the caller
+// displays either way.
 bool read_emv_card(EmvResult *out) {
     *out = EmvResult{};
     s_read_deadline_ms = millis() + kOverallReadBudgetMs;
@@ -313,8 +547,9 @@ bool read_emv_card(EmvResult *out) {
         return false;
     }
 
-    uint8_t rx[255];
-    uint8_t rx_len = 0;
+    uint8_t *const rx = s_apdu_rx; // see s_apdu_rx's own comment (file-scope,
+                                   // not a ~1 KB pair of stack locals)
+    size_t rx_len = 0;
 
     // 1. SELECT PPSE ("2PAY.SYS.DDF01"). [DONOR] emv_ask_for_aid().
     static const uint8_t kSelectPpse[] = {
@@ -322,7 +557,7 @@ bool read_emv_card(EmvResult *out) {
         0x32, 0x50, 0x41, 0x59, 0x2E, 0x53, 0x59, 0x53, 0x2E,
         0x44, 0x44, 0x46, 0x30, 0x31,
         0x00};
-    if (!apdu_step(kSelectPpse, sizeof(kSelectPpse), rx, &rx_len, sizeof(rx))) {
+    if (!apdu_step(kSelectPpse, sizeof(kSelectPpse), rx, &rx_len, kApduRxCap)) {
         out->fail_reason = "SELECT PPSE failed (not a contactless payment card?)";
         return false;
     }
@@ -361,33 +596,120 @@ bool read_emv_card(EmvResult *out) {
     select_aid[4] = 0x07;
     memcpy(&select_aid[5], aid, 7);
     select_aid[12] = 0x00;
-    if (!apdu_step(select_aid, sizeof(select_aid), rx, &rx_len, sizeof(rx))) {
+    if (!apdu_step(select_aid, sizeof(select_aid), rx, &rx_len, kApduRxCap)) {
         out->fail_reason = "SELECT AID failed";
         return false;
     }
 
-    // 3. GET PROCESSING OPTIONS, no-PDOL. [DONOR]
-    // emv_get_processing_options_no_pdol(). REQUIRED BASELINE per this task's
-    // brief -- see this file's header SCOPE/DISCLOSED GAP note for the
-    // Visa/PDOL path this deliberately does not implement.
+    // 3. GET PROCESSING OPTIONS. Two real variants, chosen by what the card's
+    // own FCI asks for:
+    //   (a) tag 9F38 (PDOL) present -> echo the requested data objects back in
+    //       a tag-83 command template. [DONOR] emv_ask_for_pdol() finds the
+    //       tag; emv_read_visa() supplies every fill value. Real hardware
+    //       needs this: a real Visa card answered variant (b) with 69 85,
+    //       "Conditions of use not satisfied".
+    //   (b) no PDOL -> the plain `80 A8 00 00 02 83 00 00`. [DONOR]
+    //       emv_get_processing_options_no_pdol(). Unchanged baseline; a real
+    //       Mastercard-style card in hand still takes exactly this path.
+    static const uint8_t kTagPdol[] = {0x9F, 0x38};
     static const uint8_t kGpoNoPdol[] = {0x80, 0xA8, 0x00, 0x00, 0x02, 0x83, 0x00, 0x00};
-    if (!apdu_step(kGpoNoPdol, sizeof(kGpoNoPdol), rx, &rx_len, sizeof(rx))) {
-        out->fail_reason = "GET PROCESSING OPTIONS failed (card may require a "
-                           "PDOL -- not supported by this reader)";
+
+    const uint8_t *pdol_ptr = nullptr;
+    size_t pdol_len = 0;
+    uint8_t gpo_cmd[5 + 2 + kMaxPdolDataLen + 1];
+    size_t gpo_len = 0;
+    bool used_pdol = false;
+
+    if (ber_tlv_find(rx, rx_len, kTagPdol, sizeof(kTagPdol), &pdol_ptr, &pdol_len) &&
+        pdol_len > 0) {
+        gpo_len = build_pdol_gpo(pdol_ptr, pdol_len, gpo_cmd, sizeof(gpo_cmd));
+        if (gpo_len == 0) {
+            out->fail_reason = "Card's PDOL (tag 9F38) is malformed or too large";
+            return false;
+        }
+        used_pdol = true;
+        Serial.printf("quarky-tab5: [nfc-emv-read] card requested a PDOL (%u bytes) "
+                      "-- sending PDOL-based GPO (%u bytes)\n",
+                      (unsigned)pdol_len, (unsigned)gpo_len);
+    } else {
+        memcpy(gpo_cmd, kGpoNoPdol, sizeof(kGpoNoPdol));
+        gpo_len = sizeof(kGpoNoPdol);
+    }
+
+    if (!apdu_step(gpo_cmd, gpo_len, rx, &rx_len, kApduRxCap)) {
+        // No blind retry of the other variant: the card told us which one it
+        // wants via its own FCI, and a second guess would only add latency to
+        // a card that is genuinely non-compliant or out of range.
+        out->fail_reason = used_pdol
+            ? "GET PROCESSING OPTIONS failed even with the card's own PDOL "
+              "(non-compliant or unusual card)"
+            : "GET PROCESSING OPTIONS failed (no PDOL in the card's FCI)";
         return false;
     }
 
-    static const uint8_t kTagAfl[] = {0x94};
-    const uint8_t *afl_ptr = nullptr;
-    size_t afl_len = 0;
-    if (!ber_tlv_find(rx, rx_len, kTagAfl, sizeof(kTagAfl), &afl_ptr, &afl_len) ||
-        afl_len == 0 || (afl_len % 4) != 0) {
-        out->fail_reason = "No Application File Locator (tag 94) in GPO response";
+    // A transport-level success is not an EMV-level success: the card can
+    // (and, on real hardware, did) answer with a status word instead of data.
+    // The real Visa card's no-PDOL GPO came back as exactly `69 85`
+    // ("Conditions of use not satisfied") and the old code reported that as
+    // the far less useful "No Application File Locator (tag 94)". Surface the
+    // real SW1SW2 so the next failure is diagnosable from the screen alone.
+    // ISO 7816-4: a normal completion is 90 00, in the LAST two bytes of the
+    // R-APDU.
+    if (rx_len < 2 || rx[rx_len - 2] != 0x90 || rx[rx_len - 1] != 0x00) {
+        std::snprintf(s_fail_buf, sizeof(s_fail_buf),
+                      "GPO rejected by card: SW=%02X%02X (%s PDOL)",
+                      rx_len >= 2 ? rx[rx_len - 2] : 0,
+                      rx_len >= 2 ? rx[rx_len - 1] : 0,
+                      used_pdol ? "with the card's own" : "no");
+        out->fail_reason = s_fail_buf;
         return false;
     }
+
+    // The GPO response comes in one of two real EMV shapes (EMV Book 3
+    // 6.5.8.4), and which one a card uses is not predictable from the AID:
+    //   Format 2, template tag 77: AIP (82) and AFL (94) as ordinary nested
+    //     TLVs -- what ber_tlv_find() already handled before this task.
+    //   Format 1, template tag 80: a bare concatenation, AIP in the first 2
+    //     bytes and the AFL in everything after, with NO inner tags at all.
+    // A Format 1 response was never parseable by the tag-94 search alone, so
+    // it is handled explicitly rather than reported as "no AFL".
+    static const uint8_t kTagAfl[] = {0x94};
+    static const uint8_t kTagGpoFmt1[] = {0x80};
+    static const uint8_t kTagTrack2[] = {0x57};
+    const uint8_t *afl_ptr = nullptr;
+    size_t afl_len = 0;
     uint8_t afl[64];
+
+    if (ber_tlv_find(rx, rx_len, kTagAfl, sizeof(kTagAfl), &afl_ptr, &afl_len) &&
+        afl_len >= 4 && (afl_len % 4) == 0) {
+        // Format 2 -- as before.
+    } else if (ber_tlv_find(rx, rx_len, kTagGpoFmt1, sizeof(kTagGpoFmt1), &afl_ptr,
+                            &afl_len) &&
+               afl_len >= 6 && ((afl_len - 2) % 4) == 0) {
+        afl_ptr += 2; // skip the AIP
+        afl_len -= 2;
+    } else {
+        // Some cards answer a PDOL-based GPO with Track 2 equivalent data
+        // (tag 57) directly and no AFL to walk at all -- which is exactly what
+        // [DONOR] emv_read_visa() reads out of its own GPO response ("PAN
+        // found in Track 2 Equivalent Data"). Take it and stop; there is
+        // nothing further to read.
+        const uint8_t *t2 = nullptr;
+        size_t t2_len = 0;
+        if (ber_tlv_find(rx, rx_len, kTagTrack2, sizeof(kTagTrack2), &t2, &t2_len) &&
+            t2_len > 0 &&
+            parse_track2(t2, t2_len, out->pan, sizeof(out->pan), out->expiry,
+                         sizeof(out->expiry))) {
+            out->ok = true;
+            return true;
+        }
+        out->fail_reason = "No Application File Locator (tag 94/80) in GPO response";
+        return false;
+    }
+
     if (afl_len > sizeof(afl)) {
         afl_len = sizeof(afl); // defensive cap -- real AFLs are a handful of entries
+        afl_len -= (afl_len % 4);
     }
     memcpy(afl, afl_ptr, afl_len);
 
@@ -410,10 +732,10 @@ bool read_emv_card(EmvResult *out) {
         for (uint8_t rec = rec_start; rec <= rec_end; rec++) {
             const uint8_t read_record[5] = {
                 0x00, 0xB2, rec, static_cast<uint8_t>((sfi << 3) | 0x04U), 0x00};
-            uint8_t rec_rx[255];
-            uint8_t rec_rx_len = 0;
+            uint8_t *const rec_rx = s_record_rx; // file-scope, see its comment
+            size_t rec_rx_len = 0;
             if (!apdu_step(read_record, sizeof(read_record), rec_rx, &rec_rx_len,
-                          sizeof(rec_rx))) {
+                          kApduRxCap)) {
                 continue; // some AFL-listed records may legitimately not exist
             }
 
@@ -423,6 +745,18 @@ bool read_emv_card(EmvResult *out) {
                 ber_tlv_find(rec_rx, rec_rx_len, kTagPan, sizeof(kTagPan), &v, &vlen) &&
                 vlen > 0) {
                 format_pan(v, vlen, out->pan, sizeof(out->pan));
+                got_pan = true;
+            }
+            // Fallback for records that carry Track 2 equivalent data (tag 57)
+            // but no separate tag 5A -- a real and common shape, and the one
+            // [DONOR] emv_read_visa() relies on exclusively. Only consulted
+            // when tag 5A has not already produced a PAN.
+            if (!got_pan &&
+                ber_tlv_find(rec_rx, rec_rx_len, kTagTrack2, sizeof(kTagTrack2), &v,
+                             &vlen) &&
+                vlen > 0 &&
+                parse_track2(v, vlen, out->pan, sizeof(out->pan), out->expiry,
+                             sizeof(out->expiry))) {
                 got_pan = true;
             }
             if (out->expiry[0] == '\0' &&
@@ -444,7 +778,7 @@ bool read_emv_card(EmvResult *out) {
     }
 
     if (!got_pan) {
-        out->fail_reason = "Read the card's records but found no PAN (tag 5A)";
+        out->fail_reason = "Read the card's records but found no PAN (tag 5A/57)";
         return false;
     }
     out->ok = true;
@@ -472,6 +806,17 @@ constexpr uint32_t kScanIntervalMs = 250; // same cadence as nfc_read.cpp
 
 lv_obj_t *s_status_label = nullptr;
 lv_obj_t *s_result_label = nullptr;
+lv_obj_t *s_save_label = nullptr;
+
+// --- Saveable snapshot of the last successful read ---------------------------
+// Both save actions below need the ISO14443-3 identity (UID/SAK/ATQA) that
+// nfca_detect() already produced plus, for the .nfc export, the real ATS
+// iso14443_4_activate() captured. Neither costs an extra exchange -- they are
+// by-products of the read that just succeeded -- so they are snapshotted here
+// the moment it succeeds and the buttons simply write them out.
+bool s_have_card = false;
+NfcCommon::TagInfo s_last_tag{};
+NfcFlipperFormat::Iso14443_4aRecord s_last_nfc{};
 
 void set_status(const char *text) {
     if (s_status_label != nullptr) {
@@ -531,13 +876,53 @@ void render_result(const EmvResult &r) {
 // header note for why (unlike nfc_mifare_crack.cpp) this does not need a
 // separate worker task: nothing here is an uninterruptible multi-second
 // computation, only a bounded sequence of short I2C exchanges.
-void attempt_read() {
+// Snapshots the just-read card's ISO14443-3/4 identity for the two save
+// actions. Everything here was already captured by the read that just
+// succeeded -- nfca_detect() produced the UID/SAK/ATQA, iso14443_4_activate()
+// the ATS -- so this costs no extra RF exchange.
+//
+// The tag-library record deliberately reuses NfcCommon::TagInfo unchanged, so
+// a saved EMV card is immediately emulatable through Task 24's existing
+// Listen Mode ("Emulate" in the tag-library browse screen) with no new work on
+// that side: that path needs exactly UID + SAK + ATQA, all of which are real
+// here. type_name marks it as an EMV card and carries the vendor from the AID
+// dictionary, so it is distinguishable from a plain MIFARE/NTAG entry in the
+// browse list.
+void snapshot_card(const St25r3916::Iso14443aTag &tag, const EmvResult &r) {
+    s_last_tag = NfcCommon::TagInfo{};
+    memcpy(s_last_tag.uid, tag.uid, sizeof(s_last_tag.uid));
+    s_last_tag.uid_len = tag.uid_len;
+    s_last_tag.sak = tag.sak;
+    s_last_tag.atqa[0] = tag.atqa[0];
+    s_last_tag.atqa[1] = tag.atqa[1];
+    // type_name is char[24]; snprintf truncates safely for a long "Unknown
+    // vendor (AID ...)" string, which still reads as "EMV Unknown vendor..."
+    // in the browse list.
+    std::snprintf(s_last_tag.type_name, sizeof(s_last_tag.type_name), "EMV %s", r.vendor);
+
+    s_last_nfc = NfcFlipperFormat::Iso14443_4aRecord{};
+    memcpy(s_last_nfc.uid, tag.uid, sizeof(s_last_nfc.uid));
+    s_last_nfc.uid_len = tag.uid_len;
+    s_last_nfc.atqa[0] = tag.atqa[0];
+    s_last_nfc.atqa[1] = tag.atqa[1];
+    s_last_nfc.sak = tag.sak;
+    s_last_nfc.ats_len = static_cast<uint8_t>(
+        St25r3916::iso14443_4_get_ats(s_last_nfc.ats, sizeof(s_last_nfc.ats)));
+
+    s_have_card = true;
+}
+
+void attempt_read(const St25r3916::Iso14443aTag &tag) {
     EmvResult result{};
     const bool ok = read_emv_card(&result);
     if (ok) {
         render_result(result);
+        snapshot_card(tag, result);
         s_state = ScanState::kFound;
         set_status("Card read");
+        if (s_save_label != nullptr) {
+            lv_label_set_text(s_save_label, "");
+        }
         Serial.printf("quarky-tab5: [nfc-emv-read] read OK: vendor=%s pan=%s "
                       "expiry=%s\n",
                       result.vendor, result.pan, result.expiry);
@@ -560,11 +945,52 @@ void attempt_read() {
     // needs an explicit field cycle added later.
 }
 
+void set_save_status(const char *text) {
+    if (s_save_label != nullptr) {
+        lv_label_set_text(s_save_label, text);
+    }
+}
+
+// "Save .nfc": a real Flipper-format ISO14443-4A device file. See
+// nfc_flipper_format.h for the format citations.
+void do_save_nfc() {
+    if (!s_have_card || s_state != ScanState::kFound) {
+        set_save_status("Read a card first.");
+        return;
+    }
+    char path[96];
+    if (!NfcFlipperFormat::build_path(s_last_nfc, path, sizeof(path))) {
+        set_save_status("Save failed (no usable UID).");
+        return;
+    }
+    const bool ok = NfcFlipperFormat::write(storage, path, s_last_nfc);
+    char msg[128];
+    std::snprintf(msg, sizeof(msg), ok ? "Saved %s" : "Failed to write %s", path);
+    set_save_status(msg);
+    Serial.printf("quarky-tab5: [nfc-emv-read] .nfc export %s: %s\n",
+                  ok ? "OK" : "FAILED", path);
+}
+
+// "Save to Tag Library": the SAME record format Task 10 writes and Task 24's
+// Listen Mode "Emulate" already consumes -- see snapshot_card()'s comment.
+void do_save_library() {
+    if (!s_have_card || s_state != ScanState::kFound) {
+        set_save_status("Read a card first.");
+        return;
+    }
+    const bool ok = NfcTagLibrary::save(storage, s_last_tag);
+    set_save_status(ok ? "Saved to tag library (emulatable)." : "Library save failed.");
+    Serial.printf("quarky-tab5: [nfc-emv-read] tag-library save %s (type=%s)\n",
+                  ok ? "OK" : "FAILED", s_last_tag.type_name);
+}
+
 void teardown() {
     s_status_label = nullptr;
     s_result_label = nullptr;
+    s_save_label = nullptr;
     s_state = ScanState::kIdle;
     s_last_attempt_ms = 0;
+    s_have_card = false;
 
     if (s_unit_ready) {
         St25r3916::nfca_poller_end();
@@ -581,6 +1007,7 @@ lv_obj_t *build_screen() {
     s_state = ScanState::kIdle;
     s_unit_ready = false;
     s_last_attempt_ms = 0;
+    s_have_card = false;
 
     lv_obj_t *content = nullptr;
     lv_obj_t *screen = build_sub_screen("NFC: EMV Card Read", &content);
@@ -616,11 +1043,34 @@ lv_obj_t *build_screen() {
         if (s_result_label != nullptr) {
             lv_label_set_text(s_result_label, "");
         }
+        s_have_card = false; // a new scan invalidates the previous snapshot
+        set_save_status("");
     }, LV_EVENT_CLICKED, nullptr);
 
     s_result_label = lv_label_create(content);
     lv_label_set_long_mode(s_result_label, LV_LABEL_LONG_WRAP);
     lv_label_set_text(s_result_label, "No card read yet");
+
+    // Save actions, same button/handler convention as nfc_read.cpp's own
+    // "Save to Library" button (non-blocking handler, result reported in a
+    // dedicated label below them). Both re-check s_state/s_have_card
+    // themselves rather than being created/destroyed on success, matching
+    // that precedent.
+    lv_obj_t *save_nfc_btn = lv_button_create(content);
+    lv_obj_t *save_nfc_lbl = lv_label_create(save_nfc_btn);
+    lv_label_set_text(save_nfc_lbl, "Save .nfc (Flipper)");
+    lv_obj_add_event_cb(save_nfc_btn, [](lv_event_t *) { do_save_nfc(); },
+                        LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *save_lib_btn = lv_button_create(content);
+    lv_obj_t *save_lib_lbl = lv_label_create(save_lib_btn);
+    lv_label_set_text(save_lib_lbl, "Save to Tag Library");
+    lv_obj_add_event_cb(save_lib_btn, [](lv_event_t *) { do_save_library(); },
+                        LV_EVENT_CLICKED, nullptr);
+
+    s_save_label = lv_label_create(content);
+    lv_label_set_long_mode(s_save_label, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(s_save_label, "");
 
     lv_obj_add_event_cb(content, [](lv_event_t *) { teardown(); },
                         LV_EVENT_DELETE, nullptr);
@@ -663,8 +1113,8 @@ void poll() {
     const St25r3916::NfcaResult res = St25r3916::nfca_detect(&tag, /*keep_active=*/true);
     switch (res) {
         case St25r3916::NfcaResult::kFound:
-            attempt_read(); // single documented poll()-tick budget exception --
-                            // see attempt_read()'s own comment
+            attempt_read(tag); // single documented poll()-tick budget exception
+                               // -- see attempt_read()'s own comment
             return;
         case St25r3916::NfcaResult::kNoTag:
             return; // status already says "Present a payment card..."
