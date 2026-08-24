@@ -284,13 +284,28 @@ enum class ListenState : uint8_t {
 // Mode session -- the two share REG_MODE/REG_PASSIVE_TARGET on this silicon
 // and cannot run concurrently. Returns false on a bad uid_len or any I2C
 // failure during the arming sequence, in which case Listen Mode is NOT armed.
+//
+// Arming is NOT just register writes: it ends with the chip's own
+// POWER_OFF state entry and, if an external reader's field happens to be
+// present already, the IDLE entry too (RFAL's rfalListenStart() ends with the
+// identical "return rfalListenSetState(RFAL_LM_STATE_POWER_OFF)"). If no field
+// is present yet -- the normal case -- the chip is left enabled (en/rx_en on,
+// tx_en off, External Field Detector automatic) with the PTA engine parked in
+// its power-off state, and it is listen_poll() that performs the IDLE entry
+// the moment a reader appears. Skipping that transition is what made this
+// silently answer nothing on real readers before 2026-08-24; see the .cpp's
+// "REAL BUG FOUND & FIXED VIA REAL-HARDWARE TESTING (2026-08-24)" note.
 bool listen_start(const ListenConfig &cfg);
 
-// One non-blocking polling tick: reads the Passive Target Status register
-// plus the IRQ status registers ONCE and returns the updated state. Same
-// bounded-cost shape as nfca_detect() -- a few I2C register reads, no
-// waiting -- so it is safe to call every poll() tick, including when never
-// armed (returns kNotArmed immediately without touching the bus).
+// One polling tick: reads the IRQ status registers, the Passive Target Status
+// register and AUX_DISPLAY (for the external-field-detector bit) ONCE, drives
+// the chip's POWER_OFF <-> IDLE state entry on each field-presence edge, and
+// returns the updated state. Same bounded-cost shape as nfca_detect() -- three
+// I2C register reads on an ordinary tick, plus a handful of writes on a field
+// edge -- so it is safe to call every poll() tick, including when never armed
+// (returns kNotArmed immediately without touching the bus). The single
+// blocking wait it can reach is the same bounded 10 ms oscillator-stable poll
+// field_on() uses, and only on the first field edge after a full power-down.
 ListenState listen_poll();
 
 // Last state computed by listen_poll(), without touching the bus.
@@ -299,8 +314,9 @@ ListenState listen_get_state();
 // Tears Listen Mode down: stops chip activity, restores REG_MODE (targ bit
 // back to initiator/0) and REG_PASSIVE_TARGET (back to fully disabled) so a
 // later nfca_poller_begin() reader-path call is unaffected, then clears
-// rx_en (same "leave the oscillator running" policy as field_off()). Safe to
-// call when never armed.
+// rx_en and puts the External Field Detector back to off (both in one
+// OP_CONTROL write; same "leave the oscillator running" policy as
+// field_off()). Safe to call when never armed.
 void listen_stop();
 
 } // namespace St25r3916

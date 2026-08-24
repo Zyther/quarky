@@ -144,12 +144,16 @@ void poll() {
         return; // latched; re-enter the screen to retry
     }
 
-    // One bounded, non-blocking tick -- St25r3916::listen_poll() is a
-    // handful of I2C register reads, never a wait, so this is safe to call
-    // every loop() iteration without risking the ~5 s task-watchdog window
-    // this project has already been bitten by twice (hal/ir_unit.h's and
-    // hal/storage_sd.cpp's own header comments) -- there is no long blocking
-    // wait here to bound in the first place.
+    // One bounded tick -- St25r3916::listen_poll() is three I2C register reads
+    // on an ordinary tick, plus (only on a reader-field edge, i.e. at most
+    // twice per reader presentation) the handful of register writes and direct
+    // commands that drive the chip's POWER_OFF <-> IDLE state entry. So this is
+    // safe to call every loop() iteration without risking the ~5 s
+    // task-watchdog window this project has already been bitten by twice
+    // (hal/ir_unit.h's and hal/storage_sd.cpp's own header comments): the only
+    // blocking wait it can reach at all is the same bounded 10 ms
+    // oscillator-stable poll field_on() uses, and only if something had
+    // cleared OP_CONTROL.en behind our back.
     const St25r3916::ListenState st = St25r3916::listen_poll();
     switch (st) {
         case St25r3916::ListenState::kIdle:

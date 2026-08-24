@@ -2604,13 +2604,60 @@ bool apdu_transceive(const uint8_t *tx, size_t tx_len,
 //       SELECT) on its own once armed -- firmware's whole job is polling
 //       PASSIVE_TARGET_STATUS (0x21) to see which state it reached, exactly
 //       the same "polled status register instead of an IRQ pin" substitution
-//       nfca_detect() above already makes for the reader path.
+//       nfca_detect() above already makes for the reader path. BUT (see the
+//       2026-08-24 real-hardware bug note below) arming alone does NOT start
+//       that walk: rfalListenStart()'s own last statement is
+//       "return rfalListenSetState(RFAL_LM_STATE_POWER_OFF)" (:2501), and it
+//       is that state-entry sequence -- not the arming writes -- that puts the
+//       PTA engine into its operational cycle.
+//     - rfalListenSetState()'s RFAL_LM_STATE_POWER_OFF case (:2634-2671):
+//       set OP_CONTROL.rx_en (:2635), CMD_STOP (:2636), then for NFC-A clear
+//       PASSIVE_TARGET.d_106_ac_a and CMD_GOTO_SENSE (:2638-2641), clear
+//       ISO14443A_NFC.nfc_f0 (:2643), re-arm the interrupt set (:2644-2654),
+//       write MODE's targ/om/nfc_ar bits from the mdReg value built back in
+//       rfalListenStart() (:2658-2660), and finally branch on
+//       rfalIsExtFieldOn() (:2662): field already present -> re-enter the same
+//       switch with RFAL_LM_STATE_IDLE (a do/while(reSetState) loop, :2630/
+//       2663-2664); no field -> clear tx_en|rx_en|en (:2666-2669), i.e. power
+//       the receiver back down while waiting.
+//     - rfalListenSetState()'s RFAL_LM_STATE_IDLE case (:2673-2695): if
+//       OP_CONTROL.en is not already set, set en|rx_en in ONE write (:2675)
+//       and wait for the real OSC interrupt with a 10 ms timeout
+//       (:2677-2682); else just consume the pending OSC interrupt (:2684).
+//       Then, only if the PREVIOUS Lm state was ACTIVE_A, clear d_106_ac_a and
+//       re-issue CMD_GOTO_SENSE (:2687-2690). ALWAYS finish with CMD_CLEAR_FIFO
+//       then CMD_UNMASK_RECEIVE_DATA (:2692-2693).
+//     - rfalRunListenModeWorker()'s own POWER_OFF case (:2747-2757): the
+//       worker sits in POWER_OFF until the EON ("external field on")
+//       interrupt, and only then calls rfalListenSetState(IDLE) -- i.e. the
+//       POWER_OFF -> IDLE transition is software-driven every single time, not
+//       something the PTA hardware does by itself. This driver polls the same
+//       field-presence condition from AUX_DISPLAY.efd_o instead of taking the
+//       EON interrupt (see rfalIsExtFieldOn() below), for the same
+//       "no IRQ pin on this unit" reason as everywhere else in this file.
+//     - rfalIsExtFieldOn() (:2401-2404) -> [REF] st25r3916.h:154's
+//       st25r3916IsExtFieldOn() macro: literally
+//       "st25r3916CheckReg(ST25R3916_REG_AUX_DISPLAY,
+//        ST25R3916_REG_AUX_DISPLAY_efd_o, ST25R3916_REG_AUX_DISPLAY_efd_o)",
+//       i.e. AUX_DISPLAY (0x31) bit 6 ([REF] st25r3916_com.h:877). That single
+//       bit is the whole external-reader-present test.
+//     - rfalInitialize() (:110-112): "Enable External Field Detector as:
+//       Automatics" -- st25r3916ChangeRegisterBits(OP_CONTROL, en_fd_mask,
+//       en_fd_auto_efd). The EFD is OFF after Set Default, so efd_o (and the
+//       EON/EOF interrupts) are dead until this is written. RFAL does it once
+//       at init; this driver does it in listen_start() and undoes it in
+//       listen_stop() -- see those functions' own comments.
 //   ~/src/wilson-elechouse/ST25R3916/ST25R3916_ELECHOUSE/src/st25r3916_com.h
 //     - :107 REG_PASSIVE_TARGET=0x08 (RW), :143 REG_PASSIVE_TARGET_STATUS=
 //       0x21 (R); :392/393/395 the three "d_" (disable) bits d_ac_ap2p (bit
-//       3), d_212_424_1r (bit 2), d_106_ac_a (bit 0); :593-612 the
-//       pta_state<3:0> value table (idle=1, ready_l1=2, ready_l2=3, active=5,
-//       halt=9, ready_l1_x=0xA, ready_l2_x=0xB, active_x=0xD); :255-285 the
+//       3), d_212_424_1r (bit 2), d_106_ac_a (bit 0); :597-611 the
+//       pta_state<3:0> value table (power_off=0 [":597",
+//       pta_st_power_off -- this project's own first reading of this table
+//       skipped it, which cost a day; see the 2026-08-24 note below], idle=1,
+//       ready_l1=2, ready_l2=3, active=5, halt=9, ready_l1_x=0xA,
+//       ready_l2_x=0xB, active_x=0xD); :246-253 OP_CONTROL's en_fd<1:0>
+//       External Field Detector mode bits (bits 1:0; 00b = off, 11b =
+//       automatic); :877 AUX_DISPLAY's efd_o (bit 6); :255-285 the
 //       MODE register's targ (bit7), om3 (bit6), om0 (bit3) and nfc_ar<1:0>
 //       bits; :433-438 AUX register nfc_id<1:0> length-select bits
 //       (bits 5:4); :454-478 the RX_CONF1 lp/hz and RX_CONF2 amd_sel bits used by the
@@ -2621,12 +2668,13 @@ bool apdu_transceive(const uint8_t *tx, size_t tx_len,
 //       state", CMD_GOTO_SLEEP=0xCE "...to Sleep/Halt state" -- both plain
 //       one-byte direct commands, same I2C framing execute_command() above
 //       already uses; :99/107 CMD_UNMASK_RECEIVE_DATA=0xD1,
-//       CMD_CLEAR_FIFO=0xDB. (RFAL detects field loss via its own
-//       st25r3916IsExtFieldOn() macro reading AUX_DISPLAY's efd_o bit; this
-//       driver instead reuses the IRQ status word sampleIrqs() already reads
-//       for the reader path and checks its EOF bit -- st25r3916_interrupt.h:
-//       80, "external field off interrupt" -- one fewer register read per
-//       tick and no new bus primitive.)
+//       CMD_CLEAR_FIFO=0xDB; :154 st25r3916IsExtFieldOn() (see above).
+//       (Field presence is read from AUX_DISPLAY.efd_o exactly as RFAL's own
+//       macro does. The EOF bit of the IRQ status word sampleIrqs() already
+//       reads -- st25r3916_interrupt.h:80, "external field off interrupt" --
+//       is kept as a second, edge-triggered field-loss signal alongside it,
+//       because efd_o is a level and a reader that dips its field between two
+//       polling ticks would otherwise go unnoticed.)
 //   ~/src/wilson-elechouse/ST25R3916/ST25R3916_ELECHOUSE/src/st25r3916_com.cpp
 //     - st25r3916WritePTMem() (:474-542): confirms a genuine I2C (not
 //       SPI-only) code path exists for loading PT memory -- one mode byte
@@ -2681,6 +2729,44 @@ bool apdu_transceive(const uint8_t *tx, size_t tx_len,
 //     literal ANT_TUNE_A/B bytes the cited table specifies) is not
 //     independently re-verified against a real reader in this task -- that
 //     is exactly what Step 4's PAUSE FOR HARDWARE is for.
+//
+// REAL BUG FOUND & FIXED VIA REAL-HARDWARE TESTING (2026-08-24): Listen Mode
+// was armed correctly and still answered nothing. listen_start() logged
+// "Listen Mode armed" with a verified-correct PT memory image (a real saved
+// EMV card: uid_len=4, cfg.uid=08:92:2F:97, cfg.atqa=0400, cfg.sak=20,
+// pt_mem=08 92 2F 97 00 00 00 00 00 00 04 00 20 20 20), yet with TWO different
+// real external readers (an NFC Tools phone app and a Chameleon Ultra) held
+// against the antenna, listen_poll() reported pts=0x00 / irqs=0x00000080 (that
+// 0x80 is just I_osc from the oscillator start) and then pts=0x00 /
+// irqs=0x00000000 forever -- both readers said "no tag found".
+//
+// pts=0x00 is pta_state=0 = pta_st_power_off ([REF] st25r3916_com.h:597): the
+// PTA hardware state machine never left its power-off state, which is exactly
+// what the RFAL sources above say happens if firmware stops after the arming
+// writes. Two concrete defects, both of them sequencing, none of them register
+// VALUES (the arming values were and are correct):
+//   1. The External Field Detector was never enabled. Nothing in this driver
+//      ever wrote OP_CONTROL's en_fd<1:0>, so it sat at its post-Set-Default
+//      00b = off. With the EFD off, efd_o never asserts and the EON/EOF
+//      interrupts never fire -- the chip has no "a reader's field is here"
+//      signal at all, and the POWER_OFF -> IDLE transition (which is
+//      software-driven in RFAL, and now here) can never be triggered. RFAL
+//      enables it once at init ([REF] rfalInitialize():110-112); this port had
+//      simply never ported that line, because the reader path -- which drives
+//      its own field and needs no detector -- never missed it.
+//   2. The IDLE-entry commands ran in the wrong order and only once. The old
+//      tail issued CMD_GOTO_SENSE / CMD_CLEAR_FIFO / CMD_UNMASK_RECEIVE_DATA
+//      BEFORE OP_CONTROL.en was set and before osc_ok was polled, i.e. while
+//      the receiver was still down. [REF] rfalListenSetState()'s
+//      RFAL_LM_STATE_IDLE case (:2673-2695) does the opposite and for a
+//      reason: en|rx_en first, oscillator stable second, CLEAR_FIFO +
+//      UNMASK_RECEIVE_DATA last -- and it re-runs that whole sequence on every
+//      POWER_OFF -> IDLE transition, not once at arming time.
+// THE FIX: port RFAL's POWER_OFF -> (conditionally) IDLE state entry as
+// listenEnterPowerOff()/listenEnterIdle() below, call it from listen_start()'s
+// tail the way rfalListenStart():2501 does, and drive the same transition from
+// listen_poll() on every field-presence edge the way
+// rfalRunListenModeWorker():2747-2757 does.
 // ===========================================================================
 
 namespace {
@@ -2708,9 +2794,29 @@ constexpr uint8_t kPtArmed =
     static_cast<uint8_t>(kPtDisableAp2p | kPtDisable212424);
 
 // --- PASSIVE_TARGET_STATUS (0x21) pta_state<3:0> values.
+// (0x0 = pta_st_power_off, 0x1 = idle, 0x2/0x3 = ready_l1/l2, 0x9 = halt,
+// 0xA/0xB = ready_l1_x/l2_x are deliberately NOT defined as constants: this
+// driver only branches on "active-or-not". They ARE printed raw by the DIAG
+// line in listen_poll(), and 0x0 in particular is what identified the
+// 2026-08-24 bug documented above -- same unused-constant policy as the
+// 0xC2/0xC6/collision-register notes elsewhere in this file.)
 constexpr uint8_t kPtaStateMask   = 0x0FU;
 constexpr uint8_t kPtaStActive    = 0x05U;
 constexpr uint8_t kPtaStActiveX   = 0x0DU;
+
+// --- OP_CONTROL (0x02) External Field Detector mode, en_fd<1:0> = bits 1:0.
+// [REF] st25r3916_com.h:246-253. 00b leaves the detector off (the state after
+// Set Default, and what this driver ran in until 2026-08-24); 11b is the
+// "automatic" mode RFAL enables at init ([REF] rfalInitialize():112) and the
+// only mode in which AUX_DISPLAY.efd_o below means anything.
+constexpr uint8_t kOpControlEnFdMask    = 3U << 0;
+constexpr uint8_t kOpControlEnFdAutoEfd = 3U << 0;
+constexpr uint8_t kOpControlEnFdOff     = 0U << 0;
+
+// --- AUX_DISPLAY (0x31) efd_o (bit 6): 1 = an external reader's field is
+// present right now. [REF] st25r3916_com.h:877, read exactly as [REF]
+// st25r3916.h:154's st25r3916IsExtFieldOn() macro does.
+constexpr uint8_t kAuxDisplayEfdO = 1U << 6;
 
 // --- MODE (0x03) target-mode bits, distinct from the reader path's own
 // kModeOmIso14443a poller value above -- targ selects target(1)/initiator(0);
@@ -2801,6 +2907,167 @@ bool apply_listen_config() {
 
 bool s_listen_armed = false;
 ListenState s_listen_state = ListenState::kNotArmed;
+// Mirrors RFAL's own gRFAL.Lm.state split between RFAL_LM_STATE_POWER_OFF
+// (false -- no reader field, the PTA engine is parked) and everything from
+// RFAL_LM_STATE_IDLE onwards (true). The public ListenState deliberately does
+// NOT expose this: to the UI both are "armed, waiting".
+bool s_listen_field_on = false;
+
+// The real RFAL_LM_STATE_IDLE state entry, ported. [REF]
+// rfalListenSetState()'s RFAL_LM_STATE_IDLE case (rfal_rfst25r3916.cpp:
+// 2673-2695).
+//
+// This is the sequence whose absence was the 2026-08-24 bug (see this
+// section's bug note above): the three PTA commands are only meaningful once
+// the chip is enabled and its oscillator is stable, and they must be re-issued
+// on every entry into IDLE -- not once at arming time.
+//
+// NOT ported: [REF] :2687-2690's "if the PREVIOUS Lm state was ACTIVE_A, clear
+// d_106_ac_a and re-issue CMD_GOTO_SENSE" sub-case. This port only ever enters
+// IDLE from its own POWER_OFF equivalent (listenEnterPowerOff() below, and
+// listen_poll()'s field-appeared edge, which is the same transition), and
+// listenEnterPowerOff() performs exactly that clear+GOTO_SENSE pair itself a
+// few writes earlier -- so an "was the previous state active" parameter here
+// would be dead in every call this driver can make. The ACTIVE -> re-arm path
+// that sub-case exists for is covered by listen_poll()'s field-loss handling,
+// which routes back through listenEnterPowerOff().
+bool listenEnterIdle() {
+    uint8_t op = 0;
+    if (!readRegisterRaw(kRegOpControl, &op)) {
+        return false;
+    }
+    // In this port en is normally already set -- listen_start() turns the
+    // oscillator on before it arms anything, and listenEnterPowerOff()
+    // deliberately does not turn it back off (see its own tail comment) -- so
+    // the branch below is the exception, not the rule. It is kept because
+    // [REF] has it and because it is the only thing that would make a future
+    // "really power down between readers" change safe.
+    if ((op & kOpControlEn) == 0U) {
+        // ONE write setting en and rx_en together, exactly as [REF] :2675
+        // does -- not two read-modify-writes.
+        if (!writeRegisterRaw(
+                kRegOpControl,
+                static_cast<uint8_t>(op | kOpControlEn | kOpControlRxEn))) {
+            return false;
+        }
+        // [REF] :2677-2682 waits on the real OSC interrupt with a 10 ms
+        // timeout. We have no IRQ line ([M5]), so this polls osc_ok for the
+        // same bounded 10 ms -- byte-for-byte the pattern field_on() already
+        // uses for the reader path's own oscillator start, and the only
+        // blocking wait anywhere in the Listen Mode path.
+        bool osc_ok = false;
+        const uint32_t deadline = millis() + kOscStableTimeoutMs;
+        do {
+            uint8_t aux = 0;
+            if (readRegisterRaw(kRegAuxDisplay, &aux) &&
+                ((aux & kAuxDisplayOscOk) != 0U)) {
+                osc_ok = true;
+                break;
+            }
+        } while (static_cast<int32_t>(millis() - deadline) < 0);
+        if (!osc_ok) {
+            return false;
+        }
+    }
+    // ([REF] :2684's else branch consumes the pending OSC interrupt so a later
+    // wait cannot be satisfied by it. There is no per-source clear to make
+    // here: sampleIrqs() reads all four status registers read-and-clear, so
+    // the next listen_poll() tick consumes it as a matter of course -- and
+    // nothing in this path ever waits on OSC again.)
+
+    // [REF] :2692-2693 -- ALWAYS, and only now that en/rx_en are on and the
+    // oscillator is stable.
+    return executeCommandRaw(kCmdClearFifo) &&
+           executeCommandRaw(kCmdUnmaskReceiveData);
+}
+
+// The real RFAL_LM_STATE_POWER_OFF state entry, ported. [REF]
+// rfalListenSetState()'s RFAL_LM_STATE_POWER_OFF case (:2634-2671), including
+// its conditional tail-call into IDLE (:2662-2664's reSetState loop).
+//
+// Called from listen_start()'s tail -- which is what rfalListenStart():2501
+// does with its own "return rfalListenSetState(RFAL_LM_STATE_POWER_OFF)" --
+// and again from listen_poll() whenever the reader's field goes away.
+bool listenEnterPowerOff() {
+    s_listen_field_on = false;
+
+    if (!changeRegisterBits(kRegOpControl, kOpControlRxEn, kOpControlRxEn) || // [REF] :2635
+        !executeCommandRaw(kCmdStop)) {                                      // [REF] :2636
+        return false;
+    }
+
+    // NFC-A: re-enable the chip's 106 kb/s auto-anticollision and send the PTA
+    // engine back to its Sense/Idle entry point. [REF] :2638-2641.
+    if (!changeRegisterBits(kRegPassiveTarget, kPtDisable106Ac, 0U) ||
+        !executeCommandRaw(kCmdGotoSense)) {
+        return false;
+    }
+
+    // [REF] :2643 -- normal (non-FeliCa) framing.
+    if (!changeRegisterBits(kRegIso14443aNfc, kIso14443aNfcF0, 0U)) {
+        return false;
+    }
+
+    // [REF] :2644-2654 disables every interrupt and then clears-and-enables a
+    // specific set (NFCT, RXS, CRC, ERR1, OSC, ERR2, PAR, EON, EOF + the
+    // mode-specific WU_A/WU_A_X/RXE_PTA). Only the "clear" half is ported, and
+    // deliberately so: this driver has no IRQ pin and never writes the four
+    // IRQ MASK registers at all. [REF] st25r3916Initialize() (st25r3916.cpp:
+    // 119-120) states "After reset all interrupts are enabled, so disable them
+    // at first" -- this driver's init() issues Set Default and then leaves the
+    // mask registers at exactly that all-enabled reset value, so every source
+    // [REF] enables here is already enabled, and porting the "disable all"
+    // half could only hide status bits from sampleIrqs(). Clearing matters
+    // though: a stale EOF latched by the reader path (or by a previous Listen
+    // session) would otherwise read as this session's own field loss on the
+    // very first listen_poll() tick.
+    if (!clearIrqs()) {
+        return false;
+    }
+
+    // MODE (0x03): target mode, listen-NFCA sub-mode, no auto-response
+    // chaining -- [REF] :2658-2660 writes the mdReg value built back in
+    // rfalListenStart():2429/2464-2467, and writes it HERE (after the analog
+    // config, on every POWER_OFF entry), not as part of the arming block.
+    // Uses the full kModeOmMask (not just the om3|om0 bits this call happens
+    // to set), matching every other MODE-register write in this file -- the
+    // two om encodings this driver ever writes (reader's 0001b, listen's
+    // 1001b) both happen to have om1/om2 clear, so a narrower mask would be
+    // harmless today, but only the full-mask form is guaranteed not to leave a
+    // stray om1/om2 bit behind if that ever changes.
+    if (!changeRegisterBits(
+            kRegMode,
+            static_cast<uint8_t>(kModeTarg | kModeOmMask | kModeNfcArMask),
+            static_cast<uint8_t>(kModeTarg | kModeOm3 | kModeOm0 | kModeNfcArOff))) {
+        return false;
+    }
+
+    // [REF] :2662 -- is a reader's field ALREADY present? If so, RFAL loops
+    // straight back into the same switch as RFAL_LM_STATE_IDLE; that loop is
+    // this direct call.
+    uint8_t aux = 0;
+    if (!readRegisterRaw(kRegAuxDisplay, &aux)) {
+        return false;
+    }
+    if ((aux & kAuxDisplayEfdO) != 0U) {
+        s_listen_field_on = true;
+        return listenEnterIdle();
+    }
+
+    // DELIBERATE DEVIATION from [REF] :2666-2669, which clears tx_en, rx_en
+    // AND en here -- powering the receiver and the whole analog front end back
+    // down while no reader is near. RFAL can afford that because it is woken
+    // by the EON interrupt on a real IRQ line; this driver has no IRQ line
+    // ([M5]) and instead re-reads AUX_DISPLAY.efd_o on every listen_poll()
+    // tick -- and efd_o is produced by the External Field Detector, which is
+    // part of what clearing en would switch off. So the "armed but no field
+    // yet" state this driver leaves the chip in is: en=1, rx_en=1, tx_en=0
+    // (a Listen Mode target never drives its own carrier), EFD=automatic,
+    // MODE=target/listen-NFCA, PTA parked in pta_st_power_off. The only cost
+    // versus RFAL is idle current, which is irrelevant on a mains/battery
+    // tablet that is already running a 1280x720 display.
+    return true;
+}
 
 } // namespace
 
@@ -2819,6 +3086,58 @@ bool listen_start(const ListenConfig &cfg) {
     listen_stop();
     if (s_nfca_ready) {
         nfca_poller_end();
+    }
+
+    // Oscillator and regulators on, FIRST -- before any of the arming writes
+    // below. [REF] does this once at init time (rfalInitialize() ->
+    // st25r3916Initialize() -> st25r3916OscOn(), st25r3916.cpp:109-110), so by
+    // the time its rfalListenStart() runs, en has always been set for a long
+    // while and the PT memory it then writes is being written to a chip whose
+    // regulators are up. This driver's init() deliberately does NOT start the
+    // oscillator (field_on() does, for the reader path, and Listen Mode never
+    // calls field_on()), so the same step has to happen here -- and it has to
+    // happen before the PT-memory write, not after it, so that the arming
+    // writes land on a chip in the same powered state RFAL's do. It is also a
+    // precondition for reading a meaningful External Field Detector bit at
+    // all. Same osc_ok polling substitution field_on() already documents.
+    //
+    // Note what is NOT set: tx_en. A Listen Mode target answers by
+    // load-modulating the READER's carrier (the PTA engine does this itself),
+    // never by generating its own field, and [REF] rfalListenSetState()'s
+    // IDLE case (:2675) likewise sets only en|rx_en.
+    uint8_t op = 0;
+    if (!readRegisterRaw(kRegOpControl, &op)) {
+        return false;
+    }
+    if ((op & kOpControlEn) == 0U) {
+        if (!writeRegisterRaw(kRegOpControl, static_cast<uint8_t>(op | kOpControlEn))) {
+            return false;
+        }
+        bool osc_ok = false;
+        const uint32_t deadline = millis() + kOscStableTimeoutMs;
+        do {
+            uint8_t aux = 0;
+            if (readRegisterRaw(kRegAuxDisplay, &aux) && ((aux & kAuxDisplayOscOk) != 0U)) {
+                osc_ok = true;
+                break;
+            }
+        } while (static_cast<int32_t>(millis() - deadline) < 0);
+        if (!osc_ok) {
+            Serial.println("quarky-tab5: [st25r3916] Listen Mode arm failed: "
+                           "oscillator never reported osc_ok");
+            return false;
+        }
+    }
+
+    // External Field Detector -> automatic. [REF] rfalInitialize():110-112
+    // ("Enable External Field Detector as: Automatics"). Without this the
+    // detector stays at its post-Set-Default off state and AUX_DISPLAY.efd_o
+    // -- the one bit that tells this driver a reader is present -- is dead,
+    // which was half of the 2026-08-24 bug documented in this section's header.
+    // listen_stop() puts it back to off, so the reader path keeps running in
+    // exactly the configuration it was verified in.
+    if (!changeRegisterBits(kRegOpControl, kOpControlEnFdMask, kOpControlEnFdAutoEfd)) {
+        return false;
     }
 
     // AUX (0x0A): NFCID length select. [REF] rfalListenStart():2439/2443.
@@ -2842,6 +3161,18 @@ bool listen_start(const ListenConfig &cfg) {
                                      : static_cast<uint8_t>(cfg.sak | kSelResIncomplete);
     pt_mem[13] = static_cast<uint8_t>(cfg.sak & ~kSelResIncomplete);
     pt_mem[14] = static_cast<uint8_t>(cfg.sak & ~kSelResIncomplete);
+    // DIAG (2026-08-24, real-hardware Listen Mode debugging): the exact 15
+    // bytes about to be armed, before the write that puts them on the chip.
+    Serial.printf("quarky-tab5: [st25r3916] DIAG listen_start: uid_len=%u "
+                  "cfg.uid=%02X:%02X:%02X:%02X:%02X:%02X:%02X cfg.atqa=%02X%02X "
+                  "cfg.sak=%02X pt_mem=%02X %02X %02X %02X %02X %02X %02X %02X "
+                  "%02X %02X %02X %02X %02X %02X %02X\n",
+                  (unsigned)cfg.uid_len, cfg.uid[0], cfg.uid[1], cfg.uid[2],
+                  cfg.uid[3], cfg.uid[4], cfg.uid[5], cfg.uid[6], cfg.atqa[0],
+                  cfg.atqa[1], cfg.sak, pt_mem[0], pt_mem[1], pt_mem[2],
+                  pt_mem[3], pt_mem[4], pt_mem[5], pt_mem[6], pt_mem[7],
+                  pt_mem[8], pt_mem[9], pt_mem[10], pt_mem[11], pt_mem[12],
+                  pt_mem[13], pt_mem[14]);
     if (!writePtMemA(pt_mem)) {
         return false;
     }
@@ -2854,19 +3185,12 @@ bool listen_start(const ListenConfig &cfg) {
         return false;
     }
 
-    // MODE (0x03): target mode, listen-NFCA sub-mode, no auto-response
-    // chaining. [REF] rfalListenStart():2464-2467. Uses the full kModeOmMask
-    // (not just the om3|om0 bits this call happens to set), matching every
-    // other MODE-register write in this file -- the two om encodings this
-    // driver ever writes (reader's 0001b, listen's 1001b) both happen to
-    // have om1/om2 clear, so a narrower mask would be harmless today, but
-    // only the full-mask form is guaranteed not to leave a stray om1/om2 bit
-    // behind if that ever changes.
-    if (!changeRegisterBits(kRegMode,
-                            static_cast<uint8_t>(kModeTarg | kModeOmMask | kModeNfcArMask),
-                            static_cast<uint8_t>(kModeTarg | kModeOm3 | kModeOm0 | kModeNfcArOff))) {
-        return false;
-    }
+    // (The MODE register's target/listen-NFCA bits are NOT written here.
+    // [REF] rfalListenStart() only BUILDS that value at :2429/2464-2467 and
+    // leaves the actual register write to rfalListenSetState()'s
+    // RFAL_LM_STATE_POWER_OFF case (:2658-2660), i.e. after the analog config
+    // below and re-applied on every POWER_OFF entry. listenEnterPowerOff()
+    // does it, at the same point in the sequence.)
 
     // ISO14443A_NFC (0x05): normal parity handling, not FeliCa framing.
     // [REF] rfalListenStart():2494-2497.
@@ -2889,48 +3213,24 @@ bool listen_start(const ListenConfig &cfg) {
         return false;
     }
 
-    // Arm the PTA hardware state machine, then bring the oscillator/receiver
-    // up -- same osc_ok polling field_on() already does, but WITHOUT tx_en:
-    // a Listen Mode target answers by load-modulating the READER's carrier
-    // (driven entirely by the PTA engine once armed), not by generating its
-    // own field, so tx_en is deliberately never set here. [REF]
-    // rfalListenSetState()'s RFAL_LM_STATE_IDLE case (:2673-2695) sets only
-    // en|rx_en, never tx_en.
-    if (!executeCommandRaw(kCmdGotoSense) ||
-        !executeCommandRaw(kCmdClearFifo) ||
-        !executeCommandRaw(kCmdUnmaskReceiveData)) {
-        return false;
-    }
-
-    uint8_t op = 0;
-    if (!readRegisterRaw(kRegOpControl, &op)) {
-        return false;
-    }
-    if ((op & kOpControlEn) == 0U) {
-        if (!writeRegisterRaw(kRegOpControl, static_cast<uint8_t>(op | kOpControlEn))) {
-            return false;
-        }
-    }
-    bool osc_ok = false;
-    const uint32_t deadline = millis() + kOscStableTimeoutMs;
-    do {
-        uint8_t aux = 0;
-        if (readRegisterRaw(kRegAuxDisplay, &aux) && ((aux & kAuxDisplayOscOk) != 0U)) {
-            osc_ok = true;
-            break;
-        }
-    } while (static_cast<int32_t>(millis() - deadline) < 0);
-    if (!osc_ok) {
-        return false;
-    }
-    if (!changeRegisterBits(kRegOpControl, kOpControlRxEn, kOpControlRxEn)) {
+    // The real state entry, and the reason this function no longer stops at
+    // "the registers are armed": [REF] rfalListenStart()'s own last statement
+    // is "return rfalListenSetState(RFAL_LM_STATE_POWER_OFF)" (:2501).
+    // listenEnterPowerOff() also writes MODE and, if a reader's field is
+    // already present, runs straight on into the IDLE entry -- exactly as
+    // [REF] :2662-2664's reSetState loop does.
+    if (!listenEnterPowerOff()) {
         return false;
     }
 
     s_listen_armed = true;
     s_listen_state = ListenState::kIdle;
-    Serial.println("quarky-tab5: [st25r3916] Listen Mode armed "
-                   "(NFC-A, 106 kb/s, hardware PTA auto-anticollision)");
+    Serial.printf("quarky-tab5: [st25r3916] Listen Mode armed "
+                  "(NFC-A, 106 kb/s, hardware PTA auto-anticollision); "
+                  "external field %s\n",
+                  s_listen_field_on ? "already present -- entered IDLE"
+                                    : "not present yet -- parked in POWER_OFF, "
+                                      "listen_poll() will enter IDLE when it appears");
     return true;
 }
 
@@ -2949,14 +3249,74 @@ ListenState listen_poll() {
         s_listen_state = ListenState::kHardwareError;
         return s_listen_state;
     }
+    // The third and last register read of a tick: AUX_DISPLAY, for efd_o --
+    // [REF] rfalIsExtFieldOn()/st25r3916IsExtFieldOn() (st25r3916.h:154). This
+    // is what tells us a reader has arrived, since this unit has no IRQ pin to
+    // deliver [REF]'s EON interrupt.
+    uint8_t aux = 0;
+    if (!readRegisterRaw(kRegAuxDisplay, &aux)) {
+        s_listen_state = ListenState::kHardwareError;
+        return s_listen_state;
+    }
+    const bool field_on = ((aux & kAuxDisplayEfdO) != 0U);
 
-    if ((irqs & kIrqEof) != 0U) {
-        // The reader's field went away -- re-arm for the next reader. [REF]
-        // rfalRunListenModeWorker()'s own EOF handling (:2781-2782/2914-2915)
-        // drops back toward POWER_OFF/IDLE; this driver folds that into a
-        // single GOTO_SENSE re-issue rather than modelling POWER_OFF as its
-        // own separate wait state (this section's own SCOPE note above).
-        executeCommandRaw(kCmdGotoSense);
+    // DIAG (2026-08-24, real-hardware Listen Mode debugging): log the raw
+    // PASSIVE_TARGET_STATUS byte, the IRQ word and the external-field-detector
+    // bit only when one of them changes, so a real external reader's attempt is
+    // fully visible without flooding the log on every poll() tick while idle.
+    // pta_state<3:0> values: power_off=0, idle=1, ready_l1=2, ready_l2=3,
+    // active=5, halt=9, ready_l1_x=0xA, ready_l2_x=0xB, active_x=0xD (this
+    // file's own kPtaState* constants and [REF]-cited table above). A healthy
+    // reader presentation should now walk 0 -> 1 -> 2/3 -> 5, where before the
+    // 2026-08-24 fix it sat at 0 forever.
+    static uint8_t s_last_pts = 0xFFU;
+    static uint32_t s_last_irqs = 0xFFFFFFFFU;
+    static int8_t s_last_field = -1;
+    if (pts != s_last_pts || irqs != s_last_irqs ||
+        s_last_field != static_cast<int8_t>(field_on ? 1 : 0)) {
+        Serial.printf("quarky-tab5: [st25r3916] DIAG listen_poll: pts=0x%02X "
+                      "(pta_state=%u) irqs=0x%08lX aux=0x%02X (efd_o=%u) lm=%s\n",
+                      pts, (unsigned)(pts & kPtaStateMask), (unsigned long)irqs,
+                      aux, (unsigned)(field_on ? 1U : 0U),
+                      s_listen_field_on ? "IDLE+" : "POWER_OFF");
+        s_last_pts = pts;
+        s_last_irqs = irqs;
+        s_last_field = static_cast<int8_t>(field_on ? 1 : 0);
+    }
+
+    if (!s_listen_field_on) {
+        // POWER_OFF equivalent: nothing to do until a reader's field shows up,
+        // and then the whole IDLE entry has to run. [REF]
+        // rfalRunListenModeWorker()'s RFAL_LM_STATE_POWER_OFF case
+        // (:2747-2757) does exactly this, waking on the EON interrupt where
+        // this polls efd_o. Skipping this transition -- assuming the arming
+        // writes alone were enough -- was the other half of the 2026-08-24 bug.
+        if (!field_on) {
+            return s_listen_state; // still kIdle: "armed, waiting"
+        }
+        s_listen_field_on = true;
+        if (!listenEnterIdle()) {
+            s_listen_state = ListenState::kHardwareError;
+            return s_listen_state;
+        }
+        s_listen_state = ListenState::kIdle;
+        return s_listen_state;
+    }
+
+    if (!field_on || (irqs & kIrqEof) != 0U) {
+        // The reader's field went away -- back to POWER_OFF, which re-arms the
+        // PTA engine (clear d_106_ac_a + GOTO_SENSE) and, if the field is in
+        // fact already back, re-enters IDLE by itself. [REF]
+        // rfalRunListenModeWorker() drops to RFAL_LM_STATE_POWER_OFF on EOF
+        // from every one of its own states (:2781-2782, :2826-2827,
+        // :2857-2858). Both signals are checked: efd_o is a level (correct
+        // after the fact, even if the EOF edge was consumed by an earlier
+        // sampleIrqs() call), while EOF is the edge (correct even if the
+        // reader dipped its field entirely between two polling ticks).
+        if (!listenEnterPowerOff()) {
+            s_listen_state = ListenState::kHardwareError;
+            return s_listen_state;
+        }
         s_listen_state = ListenState::kIdle;
         return s_listen_state;
     }
@@ -2986,6 +3346,7 @@ void listen_stop() {
     }
     s_listen_armed = false;
     s_listen_state = ListenState::kNotArmed;
+    s_listen_field_on = false;
 
     executeCommandRaw(kCmdStop); // [DS] Table 13 C2h: stop all activities
 
@@ -3003,9 +3364,22 @@ void listen_stop() {
     // Same "leave the oscillator running, only clear rx_en" policy field_off()
     // already documents -- tx_en was never set for Listen Mode in the first
     // place, so only rx_en needs clearing here.
+    //
+    // The External Field Detector listen_start() switched to automatic goes
+    // back to off in the same write. [REF] never does this (rfalInitialize()
+    // enables auto EFD once and rfalListenStop() leaves it alone, so RFAL runs
+    // its READER path with the detector on too, which is proof the reader path
+    // tolerates it). This driver restores it anyway: the NFC-A reader path
+    // above -- nfca_detect()/iso14443_4_activate()/apdu_transceive() -- is
+    // real-hardware-verified against real payment cards in exactly the
+    // EFD-off configuration, and a tag-emulation session must not quietly
+    // change the register state the next reader session starts from.
     uint8_t op = 0;
     if (readRegisterRaw(kRegOpControl, &op)) {
-        writeRegisterRaw(kRegOpControl, static_cast<uint8_t>(op & ~kOpControlRxEn));
+        writeRegisterRaw(kRegOpControl,
+                         static_cast<uint8_t>((op & ~kOpControlRxEn &
+                                               ~kOpControlEnFdMask) |
+                                              kOpControlEnFdOff));
     }
 }
 
