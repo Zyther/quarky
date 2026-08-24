@@ -593,10 +593,12 @@ Task 24's own Opus-for-research-then-Sonnet-for-implementation split.
 
 **Context:** Read-only card-data extraction (PAN, expiry, etc. where unencrypted) — no payment/transaction logic, per the spec. Port Bruce's `emv_reader.hpp`/`apdu.cpp`/BER-TLV parsing logic.
 
-- [ ] **Step 1: Port the APDU command layer and BER-TLV parser**
-- [ ] **Step 2: Build the result-card screen**
-- [ ] **Step 3: PAUSE FOR HARDWARE, then verify against a real contactless payment card (your own)**
-- [ ] **Step 4: Commit**
+**IMPLEMENTED 2026-08-23.** Real scope finding before implementation: this project's ST25R3916 driver (`st25r3916_driver.h`/`.cpp`) only implemented ISO14443-3 (anticollision/SELECT) — `nfca_detect()` auto-HALTs the tag at the end of every successful pass, which EMV's need to keep a tag active for RATS+APDU exchange doesn't support. Unlike Task 12 (SRIX), this was a tractable gap, not a hardware-absent one: the driver already exposed a generic `transceive()` primitive usable for RATS/I-block framing, and ST's own RFAL reference source was available locally (`~/src/wilson-elechouse/ST25R3916/NFC-RFAL/src/rfal_isoDep.cpp`/`.h`) to cite for the ISO14443-4 layer, so the task proceeded as scoped rather than being deferred.
+
+- [x] **Step 1: Port the APDU command layer and BER-TLV parser** — `nfca_detect(Iso14443aTag*, bool keep_active = false)` (default preserves the original auto-HALT behavior; `nfc_read.cpp`, the only other caller, is unaffected), plus new `iso14443_4_activate()`/`apdu_transceive()` in `st25r3916_driver.h`/`.cpp` implementing RATS + I-block + bounded S(WTX) handling. New `nfc_emv_read.h`/`.cpp` ports Bruce's real APDU byte sequences (SELECT PPSE → SELECT AID → GPO no-PDOL → AFL walk/READ RECORD) and AID dictionary, plus a fresh BER-TLV walker (Bruce's own vendored parser is `std::vector`-based and not a fit for this read-only single-buffer lookup). Visa's PDOL-based GPO path is a disclosed, deliberately unimplemented gap — the no-PDOL baseline is the required path per this task's own scope.
+- [x] **Step 2: Build the result-card screen** — `NfcEmvRead` screen (vendor/PAN/expiry/effective-date), single-poll()-tick synchronous read (same disclosed-budget-exception pattern as `nfc_read.cpp`), registered under `Category::NFC`.
+- [ ] **Step 3: PAUSE FOR HARDWARE, then verify against a real contactless payment card (your own)** — NOT YET DONE. Ready for flashing.
+- [x] **Step 4: Commit** — two commits: initial implementation, then two real review findings fixed (a BER-TLV long-form-length integer overflow that bypassed a bounds check via size_t wraparound, and a missing I-block block-number-match check per the same RFAL source this code cites) after an independent review pass caught them.
 
 **Model:** Sonnet.
 
