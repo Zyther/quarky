@@ -4214,7 +4214,27 @@ bool listen_start(const ListenConfig &cfg) {
     return true;
 }
 
-ListenState listen_poll() {
+// Real bug found & fixed via real-hardware testing (2026-08-24): every
+// internal failure path below (three top-level register reads plus
+// listenEnterIdle()/listenEnterPowerOff()/listenServiceActive()) latches
+// ListenState::kHardwareError PERMANENTLY on the very first failed I2C
+// exchange, forcing the user to leave and re-enter the whole Emulate screen.
+// Real evidence this is too strict: a real Amiibo/NTAG215 emulation session
+// answered two real GET_VERSION requests across a real HALT/WUPA_X wake
+// cycle, then failed this way every single time re-tested -- the SAME class
+// of transient real I2C/RF hiccup this project already found and fixed
+// (with a bounded retry, not a permanent latch) for t2t_read_pages()'s own
+// capture loop earlier the same day. listen_poll() runs on every loop()
+// tick (many times per second), so a genuinely isolated one-tick glitch
+// self-heals on the very next tick if given the chance -- it never was given
+// that chance before this fix. kListenPollMaxConsecutiveErrors bounds how
+// many CONSECUTIVE ticks may fail before this driver accepts the fault is
+// real (unit disconnected, etc.) and finally latches for real; any single
+// tick that succeeds resets the counter to 0.
+constexpr uint8_t kListenPollMaxConsecutiveErrors = 5U;
+uint8_t s_listen_poll_consecutive_errors = 0U;
+
+ListenState listenPollOnce() {
     if (!s_listen_armed) {
         return ListenState::kNotArmed;
     }
@@ -4338,6 +4358,34 @@ ListenState listen_poll() {
         }
     }
     return s_listen_state;
+}
+
+// The real public entry point -- see kListenPollMaxConsecutiveErrors's own
+// declaration comment above for why this wrapper exists. listenPollOnce()
+// mutates s_listen_state directly on every path, including its own error
+// ones; this wrapper decides whether an error result is allowed to STICK.
+ListenState listen_poll() {
+    const ListenState prev_state = s_listen_state;
+    const ListenState result = listenPollOnce();
+    if (result != ListenState::kHardwareError) {
+        s_listen_poll_consecutive_errors = 0U;
+        return result;
+    }
+    s_listen_poll_consecutive_errors++;
+    if (s_listen_poll_consecutive_errors >= kListenPollMaxConsecutiveErrors) {
+        // A real, sustained fault -- let the permanent latch stand
+        // (s_listen_state is already ListenState::kHardwareError).
+        return result;
+    }
+    // Transient -- undo listenPollOnce()'s own mutation and report the same
+    // state the caller already saw last tick. The next tick tries again on
+    // its own, no explicit retry loop needed here.
+    Serial.printf("quarky-tab5: [st25r3916] Listen Mode: transient I2C error "
+                  "on listen_poll() tick (%u/%u consecutive) -- retrying, not "
+                  "latching\n", (unsigned)s_listen_poll_consecutive_errors,
+                  (unsigned)kListenPollMaxConsecutiveErrors);
+    s_listen_state = prev_state;
+    return prev_state;
 }
 
 ListenState listen_get_state() {
