@@ -19,4 +19,5 @@ public:
                    bool *out_read_failed = nullptr) override;
     int list_dirs(const char *dir, char names_out[][64], int max_names,
                   bool *out_read_failed = nullptr) override;
+    bool remove_file(const char *path) override;
 };

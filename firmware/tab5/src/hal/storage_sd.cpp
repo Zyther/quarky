@@ -382,3 +382,17 @@ int StorageSD::list_dirs(const char *dir, char names_out[][64], int max_names,
     }
     return scan_dir(dir, /*want_dirs=*/true, /*ext_filter=*/nullptr, names_out, max_names);
 }
+
+bool StorageSD::remove_file(const char *path) {
+    // SD_MMC.exists()/remove() are the real Arduino fs::FS methods this
+    // whole file's SD_MMC object already provides -- no new library
+    // dependency. Idempotent per this method's own IStorage contract: a
+    // path that doesn't exist is treated as already-successfully-removed,
+    // matching POSIX unlink()'s own real convention, rather than SD_MMC's
+    // own remove() (which returns false for a missing file the same way it
+    // would for a genuine failure -- indistinguishable without this check).
+    if (!SD_MMC.exists(path)) {
+        return true;
+    }
+    return SD_MMC.remove(path);
+}

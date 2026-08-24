@@ -64,6 +64,15 @@ int list(IStorage &storage, char names_out[][64], int max_names);
 // mismatch means it isn't one of this module's own fixed-layout records).
 bool load(IStorage &storage, const char *name, NfcCommon::TagInfo *out);
 
+// Deletes the tag record named `name` (as returned by list()) from
+// /quarky/captures/nfc/. Added 2026-08-24, project owner's own explicit
+// request -- until now this module could save and load but never remove.
+// Idempotent, matching IStorage::remove_file()'s own contract: a name that
+// doesn't exist (already removed, or never existed) is treated as success,
+// not failure. Returns false only for a real removal failure (a locked/busy
+// file, or a genuine SD I/O error) or a null name.
+bool remove(IStorage &storage, const char *name);
+
 // Registers the "NFC: Tag Library" browse-screen launcher tile (list +
 // tap-to-view saved tags). No register_module() call yet wires a "Save"
 // action from a live scan into this library -- see nfc_tag_library_ui.cpp's

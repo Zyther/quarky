@@ -47,6 +47,7 @@ public:
         return 0;
     }
     int list_dirs(const char *, char[][64], int, bool * = nullptr) override { return 0; }
+    bool remove_file(const char *) override { return true; } // unused by these tests
 
     const char *path() const { return path_; }
     const char *text() const { return reinterpret_cast<const char *>(buf_); }

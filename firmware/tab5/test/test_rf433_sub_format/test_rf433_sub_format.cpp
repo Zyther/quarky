@@ -49,6 +49,7 @@ public:
     }
     int list_files(const char *, const char *, char[][64], int, bool * = nullptr) override { return 0; }
     int list_dirs(const char *, char[][64], int, bool * = nullptr) override { return 0; } // unused by these tests
+    bool remove_file(const char *) override { return true; } // unused by these tests
 
 private:
     char path_[128] = {};

@@ -82,4 +82,16 @@ public:
     // citation.
     virtual int list_dirs(const char *dir, char names_out[][64], int max_names,
                           bool *out_read_failed = nullptr) = 0;
+
+    // Deletes the file at path. Returns true if the file no longer exists
+    // afterward -- including when it never existed in the first place
+    // (idempotent delete, matching POSIX unlink()'s own real-world
+    // forgiving-on-missing-file convention that most callers actually want
+    // rather than having to check-then-delete). Returns false only on a
+    // real failure to remove a file that DOES exist (e.g. a locked/busy
+    // file, or a genuine SD I/O error). Added for nfc_tag_library_ui.cpp's
+    // "Remove" action (2026-08-24, project owner's own explicit request) --
+    // no prior caller needed to delete anything from SD, only ever write,
+    // append, or read.
+    virtual bool remove_file(const char *path) = 0;
 };

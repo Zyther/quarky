@@ -115,4 +115,13 @@ bool load(IStorage &storage, const char *name, NfcCommon::TagInfo *out) {
     return true;
 }
 
+bool remove(IStorage &storage, const char *name) {
+    if (name == nullptr) {
+        return false;
+    }
+    char path[96];
+    std::snprintf(path, sizeof(path), "%s/%s", kLibraryDir, name);
+    return storage.remove_file(path);
+}
+
 } // namespace NfcTagLibrary

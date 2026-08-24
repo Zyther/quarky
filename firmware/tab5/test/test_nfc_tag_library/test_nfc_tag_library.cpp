@@ -87,6 +87,13 @@ public:
 
     int list_dirs(const char *, char[][64], int, bool * = nullptr) override { return 0; } // unused by these tests
 
+    bool remove_file(const char *path) override {
+        int slot = find_slot(path);
+        if (slot < 0) return true; // idempotent, matches the real IStorage contract
+        entries_[slot].used = false;
+        return true;
+    }
+
 private:
     struct Entry {
         bool used = false;
@@ -143,6 +150,30 @@ void test_save_then_load_round_trip() {
     TEST_ASSERT_EQUAL_UINT8(tag.uid_len, loaded.uid_len);
     TEST_ASSERT_EQUAL_UINT8_ARRAY(tag.uid, loaded.uid, tag.uid_len);
     TEST_ASSERT_EQUAL_STRING(tag.type_name, loaded.type_name);
+}
+
+void test_remove_deletes_saved_tag() {
+    FakeStorage storage;
+    const uint8_t uid[] = {0x04, 0xA3, 0xF1, 0xD2};
+    NfcCommon::TagInfo tag;
+    build_tag(&tag, uid, sizeof(uid), "MIFARE Classic 1K");
+    TEST_ASSERT_TRUE(NfcTagLibrary::save(storage, tag));
+
+    char names[8][64];
+    TEST_ASSERT_EQUAL_INT(1, NfcTagLibrary::list(storage, names, 8));
+
+    TEST_ASSERT_TRUE(NfcTagLibrary::remove(storage, names[0]));
+    TEST_ASSERT_EQUAL_INT(0, NfcTagLibrary::list(storage, names, 8));
+
+    NfcCommon::TagInfo loaded{};
+    TEST_ASSERT_FALSE(NfcTagLibrary::load(storage, names[0], &loaded));
+}
+
+void test_remove_is_idempotent_for_missing_file() {
+    FakeStorage storage;
+    // Real IStorage::remove_file() contract: a path that doesn't exist is
+    // treated as already-successfully-removed, not a failure.
+    TEST_ASSERT_TRUE(NfcTagLibrary::remove(storage, "does_not_exist.tag"));
 }
 
 void test_load_returns_false_for_missing_file() {
@@ -378,6 +409,8 @@ void test_load_clamps_out_of_range_page_count() {
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_save_then_load_round_trip);
+    RUN_TEST(test_remove_deletes_saved_tag);
+    RUN_TEST(test_remove_is_idempotent_for_missing_file);
     RUN_TEST(test_load_returns_false_for_missing_file);
     RUN_TEST(test_save_rejects_zero_length_uid);
     RUN_TEST(test_resaving_same_uid_overwrites_rather_than_duplicates);
