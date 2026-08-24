@@ -1722,6 +1722,52 @@ constexpr uint8_t kT2tCmdGetVersion = 0x60U;
 // header-less run of raw page bytes for [start_page, end_page] inclusive,
 // the same real data plain READ already serves 4 pages at a time.
 constexpr uint8_t kT2tCmdFastRead = 0x3AU;
+// Real NTAG21x command byte for PWD_AUTH (password authentication) -- same
+// disclosure class as kT2tCmdGetVersion/kT2tCmdFastRead above (a real,
+// well-established NXP command, not present in this project's own vendored
+// RFAL/donor sources). Real hardware evidence (2026-08-24): a real
+// Amiibo-programmed NTAG215, faithfully emulated with byte-for-byte captured
+// page content AND real GET_VERSION AND real FAST_READ support, was STILL
+// rejected by two separate real Amiibo-reading apps -- because a genuine
+// Amiibo tag's own read flow includes an ACTIVE liveness challenge
+// (PWD_AUTH) that plain passive data replay can never satisfy on its own,
+// confirmed via external research (not this project's own donor sources;
+// see kT2tPwdAuthUidByteIdx*'s own declaration comment for the real,
+// independently-cross-verified citations): a reader supplies a 4-byte
+// password it expects the tag to already know, and the tag answers with a
+// 2-byte PACK value if it matches.
+constexpr uint8_t kT2tCmdPwdAuth = 0x1BU;
+
+// Real, published Amiibo/NTAG215 UID-derived password formula, cited from
+// TWO INDEPENDENT external sources cross-checked against each other on
+// 2026-08-24 (this project's own vendored donor sources have no Amiibo
+// PWD_AUTH content at all -- grepped, confirmed empty): Kevin Brewster's
+// "Reverse Engineering Nintendo Amiibo" writeup and a second, independent
+// web search whose top results (nfc.toys, the PyAmiibo project
+// documentation, and a GitHub gist referencing Marcos Del Sol Vives' own
+// `amiitool` -- the foundational, widely-cited piece of real Amiibo
+// reverse-engineering work) all state the identical formula:
+//   pw[0] = 0xAA ^ uid[1] ^ uid[3]
+//   pw[1] = 0x55 ^ uid[2] ^ uid[4]
+//   pw[2] = 0xAA ^ uid[3] ^ uid[5]
+//   pw[3] = 0x55 ^ uid[4] ^ uid[6]
+// (uid[0], always the real NXP manufacturer byte 0x04 for a genuine NTAG21x
+// tag, is deliberately never used -- both cited sources note this explains
+// why the formula skips it: it carries no per-tag entropy to XOR with).
+// This is a real, PUBLIC algorithm -- not Nintendo's own secret signature
+// key material (a separate, different real thing: the "retail key" used to
+// compute/validate the HMAC-SHA256 signature over an amiibo's *character
+// data*, needed only when CREATING or RE-SIGNING amiibo data for a NEW UID,
+// which this read-only, same-UID emulation never does). Requires a real
+// 7-byte UID (uid[6] is the highest index referenced) -- the real, standard
+// NTAG215 UID length every genuine Amiibo tag has; a 4-byte-UID tag is not
+// an Amiibo-shaped tag and PWD_AUTH does not apply to it regardless.
+void compute_amiibo_password(const uint8_t *uid, uint8_t (&pwd)[4]) {
+    pwd[0] = static_cast<uint8_t>(0xAAU ^ uid[1] ^ uid[3]);
+    pwd[1] = static_cast<uint8_t>(0x55U ^ uid[2] ^ uid[4]);
+    pwd[2] = static_cast<uint8_t>(0xAAU ^ uid[3] ^ uid[5]);
+    pwd[3] = static_cast<uint8_t>(0x55U ^ uid[4] ^ uid[6]);
+}
 // [REF-T2T] rfal_t2t.h:63 RFAL_T2T_BLOCK_LEN.
 constexpr uint8_t kT2tPageLen = 4U;
 static_assert(kT2tPageLen == kListenPageLen,
@@ -3353,6 +3399,14 @@ uint8_t s_lm_page_count = 0;
 // discipline as s_lm_pages above. 0 = not captured, answer 0x60 with a NAK.
 uint8_t s_lm_get_version[kListenMaxGetVersionLen];
 uint8_t s_lm_get_version_len = 0;
+// The armed UID, same copy-in-listen_start() lifetime discipline as
+// s_lm_pages above -- added 2026-08-24 for real amiibo PWD_AUTH support
+// (see kT2tCmdPwdAuth's own declaration comment): unlike the PT-memory
+// write, which only ever needed cfg.uid transiently, computing the real
+// UID-derived password on every PWD_AUTH request needs it kept around for
+// the whole armed session.
+uint8_t s_lm_uid[10];
+uint8_t s_lm_uid_len = 0;
 // Mirrors RFAL's gRFAL.Lm.state == RFAL_LM_STATE_ACTIVE_A/_Ax: true once the
 // ACTIVE state ENTRY (listenEnterActive()) has run for the current selection,
 // so it runs exactly once per selection rather than on every tick.
@@ -3880,6 +3934,44 @@ LmFrame listenServiceFrame(uint32_t irqs) {
         return LmFrame::kServiced;
     }
 
+    // --- PWD_AUTH (0x1B + 4-byte password), real Amiibo liveness check ------
+    // Added 2026-08-24, real-hardware-driven: see kT2tCmdPwdAuth's own
+    // declaration comment for the full real evidence and citations. Real
+    // NTAG21x page-133/page-134 convention: PACK is the first 2 bytes of its
+    // own page, the remaining 2 bytes RFUI -- a real, standard NXP
+    // chip-level layout, independent of Amiibo's own additional layer.
+    if (len == 5U && buf[0] == kT2tCmdPwdAuth) {
+        uint8_t expected[4] = {0};
+        if (s_lm_uid_len == 7U) {
+            compute_amiibo_password(s_lm_uid, expected);
+        }
+        const bool matches = (s_lm_uid_len == 7U) &&
+                             (std::memcmp(&buf[1], expected, 4U) == 0);
+        // page 134 (0-indexed), the real, standard PACK location -- only
+        // trustworthy if this driver's own captured content actually reaches
+        // that far (a shorter capture, or a non-Amiibo tag, has nothing real
+        // to answer with here regardless of whether the password matched).
+        constexpr uint16_t kPackPage = 134U;
+        if (!matches || s_lm_page_count <= kPackPage) {
+            // A real, honest NAK: either the supplied password was wrong (a
+            // genuine auth failure, the real NTAG21x response), or this
+            // driver has no real PACK bytes to answer with even though the
+            // password matched -- refusing is still more honest than
+            // fabricating a plausible-looking PACK.
+            (void)listenSendNak();
+            return LmFrame::kServiced;
+        }
+        uint8_t pack[2];
+        std::memcpy(pack, s_lm_pages[kPackPage], 2U);
+        if (!listenTransmit(pack, 2U * 8U, /*with_crc=*/true)) {
+            return LmFrame::kIoError;
+        }
+        Serial.println("quarky-tab5: [st25r3916] Listen Mode: answered real "
+                       "amiibo PWD_AUTH with real captured PACK -- password "
+                       "matched");
+        return LmFrame::kServiced;
+    }
+
     // --- GET_VERSION (0x60), real captured reply only -----------------------
     // Added 2026-08-24, real-hardware-driven: a real Amiibo-specific reader
     // app gates on this command before trusting anything else, and page
@@ -3932,6 +4024,9 @@ LmFrame listenServiceFrame(uint32_t irqs) {
     // then is what a real plain MIFARE Ultralight genuinely does. FAST_READ
     // likewise reaches here only for a genuinely out-of-range or oversized
     // request (its own real branch above handles every real, servable case).
+    // PWD_AUTH likewise reaches here only for a genuine password mismatch, a
+    // non-7-byte-UID tag, or a capture too short to have real PACK bytes --
+    // a real NAK is the correct answer in every one of those cases too.
     // RATS (0xE0) likewise: ISO14443-4 card emulation is out of scope.
     //
     // All of them get a NAK, and the emulated tag deliberately stays ACTIVE
@@ -4118,6 +4213,12 @@ bool listen_start(const ListenConfig &cfg) {
                                    : cfg.get_version_len;
         std::memcpy(s_lm_get_version, cfg.get_version, s_lm_get_version_len);
     }
+
+    // The armed UID, kept for real amiibo PWD_AUTH support -- see
+    // s_lm_uid's own declaration comment.
+    s_lm_uid_len = cfg.uid_len;
+    std::memset(s_lm_uid, 0, sizeof(s_lm_uid));
+    std::memcpy(s_lm_uid, cfg.uid, cfg.uid_len);
 
     // Build and write the 15-byte PT_A memory block. [REF] rfalListenStart():
     // 2435-2460 -- NFCID triple, then SENS_RES, then 3x SEL_RES with the
