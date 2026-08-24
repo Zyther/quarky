@@ -2030,10 +2030,33 @@ constexpr uint8_t kMaxWtxRounds = 2U;
 // own overall budget before every top-level APDU.
 constexpr uint32_t kMaxApduCallMs = (1U + kMaxWtxRounds) * kMaxSingleExchangeMs;
 
+// Practical floor under the raw FWT calculation below, real-hardware-driven
+// (2026-08-24), NOT spec-derived -- disclosed honestly as empirical rather
+// than cited, unlike the rest of this file. A real physical Visa card
+// (FWI=7, whose raw FWT computes to 39ms) gave a genuine, reproducible
+// (3x in a row, fresh activation each time) zero-byte hardware timeout on
+// GET PROCESSING OPTIONS specifically -- not SELECT PPSE, not SELECT AID,
+// both of which this exact card answered promptly moments earlier -- and
+// not because the command was too large for its declared FSC (FSC=256,
+// comfortably larger than the 61-byte command; PCD->PICC chaining correctly
+// determined no fragmentation was needed and still saw no response at all,
+// not even a WTX request). GPO is the one EMV command that can involve real
+// internal application processing before a card answers, which is exactly
+// why S(WTX) handling exists at all here -- but a card cannot ask for more
+// time if the reader's own hardware no-response timer fires before the card
+// manages to get even a WTX byte onto the RF link. The raw ISO14443-4 FWT
+// formula is a real, spec-derived MINIMUM a compliant card must be given,
+// not a promise that ordinary consumer cards need no more than that in
+// practice for their slower commands -- kMinFwtMs is a pragmatic margin
+// against exactly that gap, still tiny next to kMaxSingleExchangeMs's own
+// 500ms safety clamp and nfc_emv_read.cpp's 2.5s overall read budget.
+constexpr uint32_t kMinFwtMs = 100U;
+
 // [REF] rfal_isoDep.cpp:805-807: "FWT = (256 x 16/fC) x 2^FWI => 2^(FWI+12)",
-// fc = 13.56 MHz. Returns milliseconds, rounded up by one, then clamped to
-// kMaxSingleExchangeMs -- see that constant's own comment for why the clamp
-// exists and why it is safe for the read-only EMV command set this drives.
+// fc = 13.56 MHz. Returns milliseconds, rounded up by one, floored at
+// kMinFwtMs (see its own comment), then clamped to kMaxSingleExchangeMs --
+// see that constant's own comment for why the clamp exists and why it is
+// safe for the read-only EMV command set this drives.
 uint32_t fwiToFwtMs(uint8_t fwi) {
     // 14 = [REF]'s own ISODEP_FWI_MAX. An out-of-range value in a real ATS
     // would itself be non-compliant; fall back to the default rather than
@@ -2041,6 +2064,9 @@ uint32_t fwiToFwtMs(uint8_t fwi) {
     const uint8_t clamped_fwi = (fwi > 14U) ? kFwiDefault : fwi;
     const uint64_t fc_cycles = static_cast<uint64_t>(1U) << (clamped_fwi + 12U);
     uint32_t ms = static_cast<uint32_t>((fc_cycles / 13560U) + 1U); // fc in kHz
+    if (ms < kMinFwtMs) {
+        ms = kMinFwtMs;
+    }
     if (ms > kMaxSingleExchangeMs) {
         ms = kMaxSingleExchangeMs;
     }
