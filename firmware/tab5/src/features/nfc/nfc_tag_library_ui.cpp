@@ -62,9 +62,19 @@ int s_entry_count = 0;
 // own explicit request): NfcTagLibrary::remove() takes a filename, not a
 // TagInfo, so this is tracked alongside s_current_tag rather than derived
 // from it.
+//
+// s_has_current_name is DELIBERATELY separate from s_has_current_tag -- real
+// finding (2026-08-24, project owner's own testing): a record that fails
+// load() (a stale pre-page-content .tag file, or any other corrupt/wrong-
+// size record) used to leave s_has_current_tag false, which "Remove" also
+// gated on -- meaning the one case Remove exists FOR (a broken record
+// clogging the library with no other way to clear it) was exactly the case
+// it could never act on. The row's own name is known the moment it's
+// tapped, independent of whether load() can make sense of what's inside.
 NfcCommon::TagInfo s_current_tag{};
 char s_current_name[64] = "";
 bool s_has_current_tag = false;
+bool s_has_current_name = false;
 
 void clear_detail() {
     if (s_detail_label != nullptr) {
@@ -72,16 +82,26 @@ void clear_detail() {
     }
     s_current_name[0] = '\0';
     s_has_current_tag = false;
+    s_has_current_name = false;
 }
 
 void show_tag(int idx) {
     if (idx < 0 || idx >= kMaxEntries) {
         return;
     }
+    // Named the moment it's tapped -- Remove can act on this even if load()
+    // below fails. See s_has_current_name's own declaration comment.
+    std::strncpy(s_current_name, s_names[idx], sizeof(s_current_name) - 1);
+    s_current_name[sizeof(s_current_name) - 1] = '\0';
+    s_has_current_name = true;
+
     NfcCommon::TagInfo tag{};
     if (!load(storage, s_names[idx], &tag)) {
         if (s_detail_label != nullptr) {
-            lv_label_set_text(s_detail_label, "Failed to load tag record.");
+            lv_label_set_text(s_detail_label,
+                              "Failed to load tag record.\n"
+                              "(A stale record from before a format change --\n"
+                              "Remove is still available below.)");
         }
         s_has_current_tag = false;
         return;
@@ -105,9 +125,7 @@ void show_tag(int idx) {
         lv_label_set_text(s_detail_label, buf);
     }
     s_current_tag = tag;
-    std::strncpy(s_current_name, s_names[idx], sizeof(s_current_name) - 1);
-    s_current_name[sizeof(s_current_name) - 1] = '\0';
-    s_has_current_tag = true;
+    s_has_current_tag = true; // s_current_name/s_has_current_name already set above
 }
 
 // Repopulates s_list from a fresh NfcTagLibrary::list() call. Used both for
@@ -176,7 +194,10 @@ lv_obj_t *build_screen() {
     lv_obj_t *remove_lbl = lv_label_create(s_remove_btn);
     lv_label_set_text(remove_lbl, "Remove");
     lv_obj_add_event_cb(s_remove_btn, [](lv_event_t *) {
-        if (!s_has_current_tag) {
+        // Deliberately gated on s_has_current_name, NOT s_has_current_tag --
+        // see s_has_current_name's own declaration comment for the real
+        // reason: a record that fails to load() must still be removable.
+        if (!s_has_current_name) {
             if (s_detail_label != nullptr) {
                 lv_label_set_text(s_detail_label, "Tap a saved tag first.");
             }
@@ -202,6 +223,7 @@ lv_obj_t *build_screen() {
         s_emulate_btn = nullptr;
         s_remove_btn = nullptr;
         s_has_current_tag = false;
+        s_has_current_name = false;
     }, LV_EVENT_DELETE, nullptr);
 
     return screen;
