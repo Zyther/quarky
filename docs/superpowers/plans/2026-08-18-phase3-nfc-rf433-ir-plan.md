@@ -556,9 +556,18 @@ Net: this is real, comparable-scope protocol research to Task 24's Listen
 Mode work, not a quick port -- and there is no real SRIX tag on hand to
 verify against regardless. Project owner's explicit direction: note this as
 a real, disclosed Phase 3 deficiency (not a fabricated pass, not silently
-dropped) and revisit after every other phase is complete, likely bundled
-with Task 24's own 14443-B/protocol-mode research since both need the same
-real foundational work.
+dropped) and revisit after every other phase is complete.
+
+**CORRECTED 2026-08-23 (after Task 24 completed):** this note previously
+said the eventual SRIX work would likely be "bundled with Task 24's own
+14443-B/protocol-mode research," on the assumption Task 24 would itself
+touch general protocol-mode plumbing this task could share. Task 24, as
+actually implemented, is NFC-A Listen Mode only (`st25r3916_driver.cpp`'s
+`listen_start()`/`listen_poll()`/`listen_stop()`) and has no 14443-B
+content at all -- there is nothing from Task 24 for a future SRIX attempt
+to reuse. When SRIX is picked back up, it needs its own from-scratch
+14443-B PHY research (see the real ST25R3916 RFAL 14443-B examples cited
+above), independent of Task 24.
 
 **Files (unchanged from the original plan, not yet created):**
 - Create: `firmware/tab5/src/features/nfc/nfc_srix.h`
@@ -997,9 +1006,11 @@ decode logic.
 
 **Context:** Per `CLAUDE.md`'s standing process ("every phase ends with documentation, not just a Definition-of-Done check") — this task is both the spec's Section 5 Definition-of-Done walkthrough (every item, pass/fail + notes, against real hardware results already gathered across Tasks 1-19) AND the durable phase-documentation distillation, matching `docs/phases/phase-1-foundation.md`'s established depth and shape (architecture decisions and why, real-hardware findings with root causes, known limitations/deferred work — e.g. if Task 14's 125kHz row was dropped, if any IR feature had to be scoped down based on Task 15's real chip capabilities, if the RF433R pin hypothesis from Task 1 was confirmed or led to a stop-and-report).
 
-- [ ] **Step 1: Walk every Definition-of-Done item from the spec (Section 5, as corrected 2026-08-18) against this plan's actual task results, pass/fail + notes**
-- [ ] **Step 2: Write `docs/phases/phase-3-nfc-rf433-ir.md`** covering: the NFC/RFID2 chip-split architecture decision and why (Task 2/3's findings), the RF433R pin resolution (Task 1), the IR unit's actual identity and any scope changes that resulted (Task 15), known limitations/deferred work, build/flash/use instructions for what this phase delivered.
-- [ ] **Step 3: Commit**
+**DONE 2026-08-23.** Written directly from the full SDD ledger (read sequentially, not sampled) plus every task section of this plan doc. One real inconsistency found and corrected while closing this task: this file's own Task 12 DEFERRED note previously said the eventual SRIX work would likely be "bundled with Task 24's own 14443-B/protocol-mode research" — Task 24, now complete, turned out to be NFC-A Listen Mode only with no 14443-B content, so that cross-reference was stale and has been corrected above (see Task 12's own section).
+
+- [x] **Step 1: Walk every Definition-of-Done item from the spec (Section 5, as corrected 2026-08-18) against this plan's actual task results, pass/fail + notes** — see `docs/phases/phase-3-nfc-rf433-ir.md`'s own "Verification: Definition of Done walkthrough" section. 4 of 6 items fully PASS; item 4 (RF433) partially passes (bruteforce's own real-hardware checkpoint was never run — confirmed directly in this ledger, not assumed); item 6 (IR) passes with one disclosed scope narrowing (raw capture only, no protocol-level decode).
+- [x] **Step 2: Write `docs/phases/phase-3-nfc-rf433-ir.md`** — covers the NFC/RFID2 chip-split architecture, RFAL's real IRQ-pin incompatibility, the GPIO53/54 three-way arbiter, RF433's unified transmit path, IR's real plain-GPIO identity, the WiFi-C2-lazy-init decision and its real DMA-exhaustion root cause, every real hardware bug found and fixed across the phase (cited with real register values/measurements, not vague summaries), and honest, specific status for Tasks 12/13/24 (deferred / code-complete-pending-hardware / code-complete-pending-hardware respectively). Also removed `docs/phases/phase-3-progress-handoff.md` (a stale Tasks-1-3-only snapshot from before most of this phase was built), now fully superseded by this document.
+- [x] **Step 3: Commit**
 
 **Model:** Direct (documentation task, no implementer dispatch needed — matches Phase 1's Task 21 precedent, "controller had full context from the ledger").
 
