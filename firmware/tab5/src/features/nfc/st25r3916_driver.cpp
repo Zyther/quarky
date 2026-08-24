@@ -2012,22 +2012,37 @@ constexpr uint32_t kMaxSingleExchangeMs = 500U;
 
 // A card requesting more time than it was just granted (another S(WTX) right
 // after this driver's ack) is retried up to this many times before this
-// driver gives up on the whole APDU. Bounds worst-case time for ONE
-// apdu_transceive() call to roughly (kMaxWtxRounds + 1) * kMaxSingleExchangeMs
-// even against a card that does nothing but ask for extensions.
-constexpr uint8_t kMaxWtxRounds = 2U;
+// driver gives up on the whole APDU. Raised 2->5 (2026-08-24), real-hardware-
+// driven: a real physical Visa card's PDOL-based GPO asked for 3 consecutive
+// WTX extensions (confirmed via this function's own DIAG logging: three
+// "F2 01" S(WTX) responses in a row) before it was ready to answer -- with
+// the old cap of 2, this driver gave up right as the card was still working,
+// on the exact same exchange the kMinFwtMs floor above had already fixed the
+// OTHER half of (the card getting no chance to even ASK for more time). 5
+// leaves real margin over the 3 actually observed. Bounds worst-case time
+// for ONE apdu_transceive() call to roughly (kMaxWtxRounds + 1) *
+// kMaxSingleExchangeMs even against a card that does nothing but ask for
+// extensions.
+constexpr uint8_t kMaxWtxRounds = 5U;
 
 // Whole-call wall-clock envelope for ONE apdu_transceive(), shared by the
 // S(WTX) rounds and the PICC->PCD chaining rounds rather than being added to
-// them. Deliberately EQUAL to the worst case the WTX path alone already had
-// before chaining existed ((1 + kMaxWtxRounds) * kMaxSingleExchangeMs =
-// 1500 ms), so adding chaining does NOT widen this driver's already-reasoned
-// worst-case contribution to nfc_emv_read.cpp's kOverallReadBudgetMs or to
-// the ~5 s ESP32 task-watchdog margin (hal/ir_unit.h's and
-// hal/storage_sd.cpp's own header comments record the two real crashes that
-// discipline comes from). Checked before every additional exchange (WTX ack
-// or chaining R(ACK)), the same way nfc_emv_read.cpp's apdu_step() checks its
-// own overall budget before every top-level APDU.
+// them. This is the theoretical worst case ((1 + kMaxWtxRounds) *
+// kMaxSingleExchangeMs = 3000 ms as of the kMaxWtxRounds raise above) for a
+// card that is BOTH high-FWI (needing the full 500ms per exchange) AND needs
+// every one of the 5 WTX rounds -- no real card seen on this hardware
+// combines both (every one so far is FWI=7, whose 100ms-floored per-exchange
+// cost makes 5 real rounds cost roughly 500ms total, not 3000ms). 3000ms
+// alone already exceeds nfc_emv_read.cpp's own 2.5s kOverallReadBudgetMs
+// "aspirational" ceiling for a single step in that genuinely pathological
+// case -- disclosed honestly rather than hidden -- but stays safely under
+// the ~5s ESP32 task-watchdog hard limit that actually matters for crash
+// prevention (hal/ir_unit.h's and hal/storage_sd.cpp's own header comments
+// record the two real crashes that discipline comes from), with real margin
+// (3000ms vs 5000ms) even if a future card manages to hit that worst case.
+// Checked before every additional exchange (WTX ack or chaining R(ACK)), the
+// same way nfc_emv_read.cpp's apdu_step() checks its own overall budget
+// before every top-level APDU.
 constexpr uint32_t kMaxApduCallMs = (1U + kMaxWtxRounds) * kMaxSingleExchangeMs;
 
 // Practical floor under the raw FWT calculation below, real-hardware-driven
