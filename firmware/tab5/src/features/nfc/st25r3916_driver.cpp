@@ -1703,6 +1703,12 @@ namespace {
 
 // [REF-T2T] rfal_t2t.cpp:74, "T2T 1.0 5.1".
 constexpr uint8_t kT2tCmdRead = 0x30U;
+// Real, well-established NXP NTAG21x/MIFARE Ultralight EV1 command byte --
+// NOT present in this project's own vendored RFAL/donor sources (see
+// t2t_get_version()'s own header comment in st25r3916_driver.h for why the
+// response bytes are still captured rather than assumed, even though this
+// command byte itself is confidently real).
+constexpr uint8_t kT2tCmdGetVersion = 0x60U;
 // [REF-T2T] rfal_t2t.h:63 RFAL_T2T_BLOCK_LEN.
 constexpr uint8_t kT2tPageLen = 4U;
 static_assert(kT2tPageLen == kListenPageLen,
@@ -1757,6 +1763,44 @@ void nfca_halt() {
     (void)transceive(/*short_cmd=*/0U, kSlpReq, sizeof(kSlpReq), /*crc_tx=*/true,
                      /*antcl=*/false, /*crc_rx=*/true,
                      slp_rx, sizeof(slp_rx), &slp_len, millis() + 2U);
+}
+
+bool t2t_get_version(uint8_t *out, size_t cap_bytes, uint8_t *len_out) {
+    if (len_out != nullptr) {
+        *len_out = 0;
+    }
+    if (out == nullptr || cap_bytes == 0U || !s_nfca_ready) {
+        return false;
+    }
+    // Same real per-exchange NRT as READ (kT2tReadNrtSteps64fc, [REF-T2T]
+    // rfal_t2t.cpp:53's real 5ms RFAL_FDT_POLL_READ_MAX): GET_VERSION is not
+    // itself covered by that citation (it is not one of the three commands
+    // rfal_t2t.cpp's own T2T layer knows about at all -- see this driver's
+    // own disclosed-gap comment on the Listen Mode side), but it is the same
+    // class of simple, no-computation T2T-family command as READ, so reusing
+    // the real spec figure for READ is a reasoned, disclosed choice, not a
+    // separate real citation.
+    const uint32_t deadline = millis() + kDetectBudgetMs;
+    const uint8_t req[1] = {kT2tCmdGetVersion};
+    uint8_t rx[kT2tRxBufLen] = {0};
+    uint8_t rx_len = 0;
+    const Xfer x = transceive(/*short_cmd=*/0U, req, sizeof(req), /*crc_tx=*/true,
+                              /*antcl=*/false, /*crc_rx=*/true,
+                              rx, sizeof(rx), &rx_len, deadline,
+                              kT2tReadNrtSteps64fc);
+    if (x != Xfer::kOk || rx_len == 0U) {
+        // A real, expected outcome for a plain MIFARE Ultralight (MF0ICU1)
+        // that doesn't support GET_VERSION at all -- not logged as an error.
+        return false;
+    }
+    const size_t take = (static_cast<size_t>(rx_len) < cap_bytes) ? rx_len : cap_bytes;
+    std::memcpy(out, rx, take);
+    if (len_out != nullptr) {
+        *len_out = static_cast<uint8_t>(take);
+    }
+    Serial.printf("quarky-tab5: [st25r3916] t2t_get_version: captured %u real "
+                  "bytes\n", (unsigned)take);
+    return true;
 }
 
 bool t2t_read_pages(uint8_t *out, size_t cap_bytes, uint8_t *pages_out) {
@@ -3117,23 +3161,27 @@ bool apdu_transceive(const uint8_t *tx, size_t tx_len,
 //       block earlier in this file; the responder below answers exactly the
 //       commands that block describes reading.
 //
-// DISCLOSED GAP -- GET_VERSION IS NOT IMPLEMENTED, DELIBERATELY. Real
-// NTAG21x and Ultralight EV1 tags support a GET_VERSION command that returns
-// an 8-byte product identification, and real readers do send it. There is no
-// citable source for either its command byte or its response layout anywhere
-// in this project's vendored sources -- not in RFAL's own T2T layer
-// (rfal_t2t.cpp:73-77 lists exactly three commands: READ, WRITE, SECTOR
-// SELECT), not in the MFRC522_I2C library, not in the Bruce/Poseidon/UniGeek
-// donors (grepped, 2026-08-24). Inventing the byte and fabricating a
-// plausible-looking 8-byte answer is precisely what this file's SOURCES
-// discipline exists to prevent, so it is NOT done: an unrecognised command
-// gets a NAK, which is also genuinely what a real plain MIFARE Ultralight
-// (MF0ICU1, SAK 0x00 -- the exact family and the exact SAK this emulates)
-// does with GET_VERSION. A reader that gets a NAK there falls back to plain
-// READs, which is the path that actually carries the tag's content. If a real
-// reader is later observed to need it, the honest fix is to capture the real
-// tag's own GET_VERSION response during t2t_read_pages() and replay it, not
-// to synthesise one.
+// GET_VERSION: CAPTURED AND REPLAYED, NEVER FABRICATED. Real NTAG21x and
+// Ultralight EV1 tags support a GET_VERSION command that returns an 8-byte
+// product identification, and real readers do send it -- confirmed
+// necessary on real hardware (2026-08-24): a real Amiibo-specific reader app
+// rejected an emulated NTAG215 as "amiibo not found" even with all 135/135
+// real pages correctly captured and answered, because such tools gate on
+// GET_VERSION before trusting anything else. There is still no citable
+// source for its response LAYOUT anywhere in this project's vendored sources
+// -- not in RFAL's own T2T layer (rfal_t2t.cpp:73-77 lists exactly three
+// commands: READ, WRITE, SECTOR SELECT), not in the MFRC522_I2C library, not
+// in the Bruce/Poseidon/UniGeek donors (grepped, 2026-08-24) -- but the
+// command BYTE (0x60) is a real, well-established NXP NTAG21x/Ultralight EV1
+// value regardless of what this project happened to vendor. Consistent with
+// this file's own SOURCES discipline, the response bytes are never
+// fabricated: St25r3916::t2t_get_version() sends the real 0x60 command to
+// the real tag during capture (nfc_read.cpp) and stores WHATEVER the tag
+// genuinely answers; Listen Mode (below) replays those real bytes verbatim.
+// A record with no captured GET_VERSION (a plain MIFARE Ultralight that
+// genuinely doesn't support it, or a .tag file saved before this feature
+// existed) still gets a NAK here -- the real, correct answer for that real
+// case, not a regression.
 // ===========================================================================
 
 namespace {
@@ -3288,6 +3336,10 @@ bool s_listen_field_on = false;
 // nfc_common.h's own kMaxT2tPages comment (NTAG216's real capacity).
 uint8_t s_lm_pages[kListenMaxPages][kListenPageLen];
 uint8_t s_lm_page_count = 0;
+// Real captured GET_VERSION reply, same copy-in-listen_start() lifetime
+// discipline as s_lm_pages above. 0 = not captured, answer 0x60 with a NAK.
+uint8_t s_lm_get_version[kListenMaxGetVersionLen];
+uint8_t s_lm_get_version_len = 0;
 // Mirrors RFAL's gRFAL.Lm.state == RFAL_LM_STATE_ACTIVE_A/_Ax: true once the
 // ACTIVE state ENTRY (listenEnterActive()) has run for the current selection,
 // so it runs exactly once per selection rather than on every tick.
@@ -3747,6 +3799,32 @@ LmFrame listenServiceFrame(uint32_t irqs) {
         return LmFrame::kServiced;
     }
 
+    // --- GET_VERSION (0x60), real captured reply only -----------------------
+    // Added 2026-08-24, real-hardware-driven: a real Amiibo-specific reader
+    // app gates on this command before trusting anything else, and page
+    // content alone (the READ branch above) was not enough -- confirmed
+    // against a real NTAG215 with Amiibo data, all 135/135 real pages
+    // captured and correctly answered, still rejected as "amiibo not found"
+    // until this branch existed. Real command byte (kT2tCmdGetVersion, see
+    // its own declaration comment for why it's confidently real despite no
+    // vendored citation for it), but the REPLY is only ever the tag's own
+    // real captured bytes (s_lm_get_version, populated by listen_start() from
+    // St25r3916::t2t_get_version()'s real capture on the reader side) -- if
+    // none were captured (a plain MIFARE Ultralight genuinely doesn't
+    // support this command, or the saved record predates this feature), this
+    // falls through to the same generic NAK every other unsupported command
+    // gets below, which is exactly correct for that real case too.
+    if (len == 1U && buf[0] == kT2tCmdGetVersion && s_lm_get_version_len > 0U) {
+        if (!listenTransmit(s_lm_get_version,
+                            static_cast<uint16_t>(s_lm_get_version_len) * 8U,
+                            /*with_crc=*/true)) {
+            return LmFrame::kIoError;
+        }
+        Serial.println("quarky-tab5: [st25r3916] Listen Mode: answered "
+                       "GET_VERSION with real captured content");
+        return LmFrame::kServiced;
+    }
+
     // --- HLTA / SLP_REQ (0x50 0x00) ----------------------------------------
     // kSlpReq is this file's own already-cited constant ([EH] rfal_nfca.cpp:
     // 58-61, "Digital 1.1 6.9.1 & Table 20") -- the very bytes nfca_detect()
@@ -3768,11 +3846,10 @@ LmFrame listenServiceFrame(uint32_t irqs) {
     // T2T WRITE (0xA2) and SECTOR SELECT (0xC2) ([REF-T2T] rfal_t2t.cpp:75-76)
     // are deliberately unimplemented -- this is read-only emulation, matching
     // the read-only discipline this project's EMV reader already follows.
-    // GET_VERSION is unimplemented for the reason spelled out in full in this
-    // section's "DISCLOSED GAP" note (no citable source for its command byte
-    // or response layout in any vendored source, and NAKing it is what a real
-    // plain MIFARE Ultralight does anyway). RATS (0xE0) likewise: ISO14443-4
-    // card emulation is out of scope.
+    // GET_VERSION reaches here only when no real reply was captured (the
+    // branch above already handles the real, captured case) -- NAKing it
+    // then is what a real plain MIFARE Ultralight genuinely does. RATS
+    // (0xE0) likewise: ISO14443-4 card emulation is out of scope.
     //
     // All of them get a NAK, and the emulated tag deliberately stays ACTIVE
     // afterwards. A strict MIFARE Ultralight returns to IDLE after NAKing an
@@ -3946,6 +4023,17 @@ bool listen_start(const ListenConfig &cfg) {
                                                              : cfg.page_count;
         std::memcpy(s_lm_pages, cfg.pages,
                     static_cast<size_t>(s_lm_page_count) * kListenPageLen);
+    }
+
+    // Same real-captured-data discipline for GET_VERSION -- see
+    // ListenConfig::get_version's own header comment.
+    s_lm_get_version_len = 0;
+    std::memset(s_lm_get_version, 0, sizeof(s_lm_get_version));
+    if (cfg.get_version != nullptr && cfg.get_version_len > 0U) {
+        s_lm_get_version_len = (cfg.get_version_len > kListenMaxGetVersionLen)
+                                   ? kListenMaxGetVersionLen
+                                   : cfg.get_version_len;
+        std::memcpy(s_lm_get_version, cfg.get_version, s_lm_get_version_len);
     }
 
     // Build and write the 15-byte PT_A memory block. [REF] rfalListenStart():
@@ -4186,6 +4274,7 @@ void listen_stop() {
     s_listen_field_on = false;
     s_lm_active_entered = false;
     s_lm_page_count = 0;
+    s_lm_get_version_len = 0;
     // s_lm_read_count is deliberately NOT zeroed here: listen_start() zeroes
     // it, and leaving it alone lets a caller read the final count back after
     // tearing the session down.

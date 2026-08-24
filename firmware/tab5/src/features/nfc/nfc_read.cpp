@@ -308,25 +308,46 @@ static bool try_read_nfc_uid(NfcCommon::TagInfo *out) {
     // ...) skip this entirely and keep page_count == 0, i.e. exactly the
     // UID/SAK/ATQA-only record Task 10 originally scoped.
     out->page_count = 0;
+    out->get_version_len = 0;
     if (tag.sak == kSakMifareUltralight) {
+        // t2t_get_version() must run BEFORE t2t_read_pages(): it does not
+        // send its own HALT (see its own header comment), and
+        // t2t_read_pages() does, unconditionally, at its own end -- calling
+        // them in this order halts the tag exactly once, by whichever call
+        // runs last, matching the same post-condition every other branch
+        // here already leaves (see the keep_active=true note above).
+        uint8_t gv_len = 0;
+        const bool gv_ok = St25r3916::t2t_get_version(
+            &out->get_version[0], sizeof(out->get_version), &gv_len);
+        out->get_version_len = gv_len;
+
         uint8_t pages = 0;
         // t2t_read_pages() sends the trailing HALT itself, success or
         // failure -- see its header comment.
         const bool ok = St25r3916::t2t_read_pages(
             &out->pages[0][0], sizeof(out->pages), &pages);
         out->page_count = pages;
+        Serial.printf("quarky-tab5: [nfc-read] GET_VERSION: %s (%u bytes)\n",
+                      gv_ok ? "captured" : "not supported by this tag",
+                      (unsigned)gv_len);
         if (pages > 0) {
-            // Deliberately states the MEASURED page count rather than mapping
-            // it to a product name. nfc_amiibo.cpp's page_count_tag_name()
-            // does have a real, cited 45/135/231 -> NTAG213/215/216 mapping,
-            // but it also documents (from real hardware, 2026-08-21) that a
-            // genuine amiibo-programmed tag defeats the companion CC-byte
-            // detection -- so a bare measured count is the claim that is
-            // always true. If the read failed outright, the original
-            // "ISO14443A SAK 00" name is left alone rather than replaced with
-            // a misleading "0 pg".
-            std::snprintf(out->type_name, sizeof(out->type_name),
-                          "Ultralight/NTAG %u pg", (unsigned)pages);
+            // Real-hardware finding (2026-08-24): a bare "Ultralight/NTAG 135
+            // pg" label reads as a confusing near-miss of a real product
+            // name (e.g. mistaken for "NTAG135", which does not exist) --
+            // NfcCommon::t2t_page_count_tag_name() is the same real, cited
+            // 45/135/231 -> NTAG213/215/216 mapping nfc_amiibo.cpp already
+            // uses (moved to nfc_common.{h,cpp} so both files share it), and
+            // that file's own real-hardware finding (2026-08-21) already
+            // established page count is a MORE reliable signal than the CC
+            // byte for a genuine amiibo-programmed tag, not a less accurate
+            // one -- so using the real product name here is strictly more
+            // correct, not a riskier guess. Falls back to "Unknown
+            // Ultralight/NTAG21x" for a real but non-standard page count
+            // rather than fabricating a product name that isn't true. If the
+            // read failed outright, the original "ISO14443A SAK 00" name is
+            // left alone rather than replaced with a misleading "0 pg".
+            std::snprintf(out->type_name, sizeof(out->type_name), "%s",
+                          NfcCommon::t2t_page_count_tag_name(pages));
         }
         Serial.printf("quarky-tab5: [nfc-read] Type 2 tag (SAK 00): captured %u "
                       "pages (%u bytes)%s\n",

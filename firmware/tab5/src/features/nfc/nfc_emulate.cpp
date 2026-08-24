@@ -89,6 +89,11 @@ void run_arm() {
     cfg.pages = (s_tag.page_count > 0) ? &s_tag.pages[0][0] : nullptr;
     cfg.page_count = s_tag.page_count;
 
+    // Same real-captured-data plumbing for GET_VERSION -- see
+    // ListenConfig::get_version's own header comment.
+    cfg.get_version = (s_tag.get_version_len > 0) ? &s_tag.get_version[0] : nullptr;
+    cfg.get_version_len = s_tag.get_version_len;
+
     if (!St25r3916::listen_start(cfg)) {
         s_state = EmulateState::kFailed;
         s_unit_armed = false;

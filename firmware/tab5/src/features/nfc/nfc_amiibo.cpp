@@ -232,13 +232,12 @@ static const char *cc_tag_name(uint8_t cc) {
 // a fallback when the CC byte itself didn't match a known value -- the CC
 // byte is still tried first since it's the real, standard, documented way to
 // identify a genuinely NDEF-formatted (non-amiibo) NTAG21x tag.
+//
+// Moved to NfcCommon::t2t_page_count_tag_name() (2026-08-24) so
+// nfc_read.cpp's own T2T capture path can report the same real product name
+// -- this alias keeps every existing call site in this file unchanged.
 static const char *page_count_tag_name(int pages) {
-    switch (pages) {
-        case 45:  return "NTAG213";
-        case 135: return "NTAG215";
-        case 231: return "NTAG216";
-        default:  return "Unknown Ultralight/NTAG21x";
-    }
+    return NfcCommon::t2t_page_count_tag_name(pages);
 }
 
 static void render_read_result() {

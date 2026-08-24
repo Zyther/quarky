@@ -58,5 +58,14 @@ const char *format_uid(const uint8_t *uid,
     return out;
 }
 
+const char *t2t_page_count_tag_name(int page_count) {
+    switch (page_count) {
+        case 45:  return "NTAG213";
+        case 135: return "NTAG215";
+        case 231: return "NTAG216";
+        default:  return "Unknown Ultralight/NTAG21x";
+    }
+}
+
 } // namespace NfcCommon
 

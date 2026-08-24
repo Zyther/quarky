@@ -72,6 +72,27 @@ constexpr uint8_t kT2tPageLen  = 4;   // NFC Forum T2T block length (RFAL's own
                                       // RFAL_T2T_BLOCK_LEN, rfal_t2t.h)
 constexpr uint8_t kMaxT2tPages = 231; // NTAG216, see above
 
+// get_version/get_version_len added 2026-08-24, same real-hardware
+// motivation as page_count/pages above but for a DIFFERENT real gap:
+// capturing every page still wasn't enough for a real Amiibo-specific
+// reader app to accept the emulated tag ("amiibo not found" against a real
+// NTAG215 with 135/135 real pages genuinely captured and correctly
+// answered). Real root cause: an Amiibo app is NTAG215-specific tooling, and
+// real such tools gate on the tag's GET_VERSION (0x60) response before
+// trusting anything else -- confirmed in the real serial log ("NAKing
+// unsupported command 0x60") once a reader was actually watched closely.
+// st25r3916_driver.cpp's own disclosed-gap comment for GET_VERSION already
+// named the honest fix before this was needed: "capture the real tag's own
+// GET_VERSION response ... and replay it, not synthesise one" -- this field
+// is exactly that. 8 bytes is the real, standard NTAG21x/Ultralight EV1
+// GET_VERSION response length (a well-established real-world value, just
+// not present in any of this project's own vendored/donor sources -- see
+// that same driver comment for why the BYTES are still captured rather than
+// fabricated even though the command byte itself is confidently real).
+// get_version_len == 0 is "not captured" (real responses are always 8
+// bytes; a real tag that supports GET_VERSION never returns 0).
+constexpr uint8_t kMaxGetVersionLen = 8;
+
 struct TagInfo {
     uint8_t uid[10];
     uint8_t uid_len;
@@ -80,6 +101,8 @@ struct TagInfo {
     uint8_t atqa[2];  // SENS_RES, wire order (LSB first); {0,0} if not captured.
     uint8_t page_count;                        // 0 = no page content captured
     uint8_t pages[kMaxT2tPages][kT2tPageLen];  // real captured T2T page image
+    uint8_t get_version_len;                   // 0 = not captured
+    uint8_t get_version[kMaxGetVersionLen];    // real captured GET_VERSION reply
 };
 
 // Formats uid as "04:A3:F1:..." (matching the project’s hex-with-colons style).
@@ -88,6 +111,20 @@ const char *format_uid(const uint8_t *uid,
                         uint8_t len,
                         char *out,
                         size_t out_len);
+
+// Real NFC Forum Type 2 Tag page-count -> chip-family name, moved here
+// (2026-08-24) from nfc_amiibo.cpp's own page_count_tag_name() so
+// nfc_read.cpp's own T2T capture path (Task 24's real-hardware NTAG215/
+// Amiibo emulation work) can report the same real product name instead of a
+// bare page count. See nfc_amiibo.cpp's own real-hardware citation (2026-08-
+// 21) for why page count, not the Capability Container byte, is this
+// project's established reliable signal: a genuine Amiibo-programmed
+// NTAG215 defeats CC-byte detection (Nintendo's proprietary data overwrites
+// that page), but its real end-of-memory page count (135) is unaffected and
+// was confirmed correct on real hardware. Returns "Unknown Ultralight/
+// NTAG21x" for any page count that isn't one of the three real, standard
+// NTAG21x capacities (45/135/231).
+const char *t2t_page_count_tag_name(int page_count);
 
 } // namespace NfcCommon
 

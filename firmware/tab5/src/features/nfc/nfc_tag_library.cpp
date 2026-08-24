@@ -108,6 +108,10 @@ bool load(IStorage &storage, const char *name, NfcCommon::TagInfo *out) {
     if (out->page_count > NfcCommon::kMaxT2tPages) {
         out->page_count = NfcCommon::kMaxT2tPages;
     }
+    // Same clamp, same reasoning, for the 2026-08-24 GET_VERSION addition.
+    if (out->get_version_len > NfcCommon::kMaxGetVersionLen) {
+        out->get_version_len = NfcCommon::kMaxGetVersionLen;
+    }
     return true;
 }
 

@@ -287,6 +287,12 @@ void test_page_content_round_trips_byte_for_byte() {
             tag.pages[p][b] = static_cast<uint8_t>((p * 7u) + (b * 31u) + 1u);
         }
     }
+    // A real, standard-length GET_VERSION reply, real-hardware-driven
+    // (2026-08-24): captured alongside pages so Listen Mode can answer both.
+    tag.get_version_len = NfcCommon::kMaxGetVersionLen;
+    for (uint8_t i = 0; i < tag.get_version_len; i++) {
+        tag.get_version[i] = static_cast<uint8_t>(0xA0 + i);
+    }
 
     TEST_ASSERT_TRUE(NfcTagLibrary::save(storage, tag));
 
@@ -301,6 +307,28 @@ void test_page_content_round_trips_byte_for_byte() {
     TEST_ASSERT_EQUAL_UINT8(135, loaded.page_count);
     TEST_ASSERT_EQUAL_UINT8_ARRAY(&tag.pages[0][0], &loaded.pages[0][0],
                                   tag.page_count * NfcCommon::kT2tPageLen);
+    TEST_ASSERT_EQUAL_UINT8(NfcCommon::kMaxGetVersionLen, loaded.get_version_len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(tag.get_version, loaded.get_version,
+                                  loaded.get_version_len);
+}
+
+void test_tag_without_get_version_keeps_zero_sentinel() {
+    FakeStorage storage;
+    const uint8_t uid[] = {0x04, 0x11, 0x22, 0x33};
+    NfcCommon::TagInfo tag;
+    build_tag(&tag, uid, sizeof(uid), "Unknown Ultralight/NTAG21x");
+    tag.sak = 0x00;
+    tag.page_count = 4; // pages captured, but the tag didn't support 0x60
+    // get_version_len left at its zero-initialized default.
+
+    TEST_ASSERT_TRUE(NfcTagLibrary::save(storage, tag));
+
+    char names[8][64];
+    TEST_ASSERT_EQUAL_INT(1, NfcTagLibrary::list(storage, names, 8));
+
+    NfcCommon::TagInfo loaded{};
+    TEST_ASSERT_TRUE(NfcTagLibrary::load(storage, names[0], &loaded));
+    TEST_ASSERT_EQUAL_UINT8(0, loaded.get_version_len);
 }
 
 void test_tag_without_page_content_keeps_zero_sentinel() {
@@ -358,6 +386,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_list_respects_max_names_cap);
     RUN_TEST(test_page_content_round_trips_byte_for_byte);
     RUN_TEST(test_tag_without_page_content_keeps_zero_sentinel);
+    RUN_TEST(test_tag_without_get_version_keeps_zero_sentinel);
     RUN_TEST(test_load_clamps_out_of_range_page_count);
     return UNITY_END();
 }

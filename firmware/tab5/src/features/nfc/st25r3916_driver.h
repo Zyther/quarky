@@ -174,6 +174,29 @@ void nfca_halt();
 // nowhere near the ~5 s task-watchdog window.
 bool t2t_read_pages(uint8_t *out, size_t cap_bytes, uint8_t *pages_out);
 
+// Sends GET_VERSION (0x60) and returns the tag's real raw answer, WHATEVER
+// it is -- this driver never invents or assumes a response layout (see
+// st25r3916_driver.cpp's own disclosed-gap comment on the Listen Mode side
+// for why: 0x60 is a real, well-established NTAG21x/Ultralight EV1 command,
+// but its response layout is not present in any of this project's own
+// vendored/donor sources, so it is captured and replayed, never fabricated).
+// Added 2026-08-24, real-hardware-driven: capturing every page still was not
+// enough for a real Amiibo-specific reader app to accept an emulated tag,
+// because such tools gate on GET_VERSION before trusting anything else.
+//
+// Caller contract is the SAME as t2t_read_pages(): must be called with the
+// tag already active (nfca_detect(&tag, /*keep_active=*/true) just
+// returned kFound), and unlike t2t_read_pages() this function does NOT send
+// the trailing HALT itself -- call this BEFORE t2t_read_pages() (which
+// already halts unconditionally at its own end) so the tag is halted
+// exactly once, by whichever of the two calls runs last.
+//
+// Returns true and *len_out > 0 only on a real, clean answer; false (with
+// *len_out = 0) on any NAK/timeout/protocol error -- a plain MIFARE
+// Ultralight (MF0ICU1) that doesn't support GET_VERSION at all is a real,
+// expected false here, not a bug.
+bool t2t_get_version(uint8_t *out, size_t cap_bytes, uint8_t *len_out);
+
 // Stops the poller: field_off() plus a Stop-all-activities so no timer or
 // receive state is left running. Safe to call when begin() was never called.
 void nfca_poller_end();
@@ -316,6 +339,9 @@ bool apdu_transceive(const uint8_t *tx, size_t tx_len,
 //     the family this emulates) genuinely does.
 constexpr uint8_t kListenPageLen  = 4;   // T2T block length
 constexpr uint8_t kListenMaxPages = 231; // NTAG216; must match
+// Real NTAG21x/Ultralight EV1 GET_VERSION reply length -- must match
+// NfcCommon::kMaxGetVersionLen (nfc_common.h).
+constexpr uint8_t kListenMaxGetVersionLen = 8;
                                          // NfcCommon::kMaxT2tPages (a
                                          // static_assert in nfc_emulate.cpp,
                                          // the one translation unit that sees
@@ -337,6 +363,17 @@ struct ListenConfig {
     // that follows gets a NAK.
     const uint8_t *pages;
     uint8_t page_count;  // clamped to kListenMaxPages
+
+    // Real captured GET_VERSION (0x60) reply to answer with, added
+    // 2026-08-24 alongside the same real-hardware finding that motivated
+    // `pages` above -- a real Amiibo-specific reader app gates on this
+    // command before trusting anything else, and page content alone was not
+    // enough. nullptr / get_version_len == 0 means "not captured": the
+    // emulated tag NAKs 0x60 exactly as it always has (a real, expected
+    // answer for a plain MIFARE Ultralight, which genuinely doesn't support
+    // this command).
+    const uint8_t *get_version;
+    uint8_t get_version_len;  // clamped to kListenMaxGetVersionLen
 };
 
 enum class ListenState : uint8_t {
