@@ -1721,6 +1721,27 @@ constexpr uint16_t kT2tReadNrtSteps64fc = 1059U;
 // leaves in the FIFO) with margin.
 constexpr uint8_t kT2tRxBufLen = 24U;
 
+// Real bug found & fixed via real-hardware testing (2026-08-24): a real
+// NTAG215 (which has 135 real pages, per this project's own
+// nfc_amiibo.cpp citation of that exact figure from RFID2.cpp) capture
+// stopped at page 44 with `Xfer::kProtocol` -- 44 is not a real NTAG215
+// memory-boundary value at all, so this was very likely a genuine transient
+// RF/CRC error mid-sequence, not the tag's real end of memory. This
+// section's own "ONE HONEST IMPRECISION" note above already discloses that a
+// real NAK and a genuine protocol error are indistinguishable at this
+// shared transceive() call, but the fix for THAT ambiguity is not "trust the
+// very first non-clean answer," it is retrying before concluding either.
+// A real end-of-memory NAK
+// is a deterministic property of the tag and will reproduce identically on
+// immediate retry; a transient RF glitch over one of the 34 back-to-back
+// exchanges a full 135-page NTAG215 needs is exactly the kind of rare-per-
+// exchange, likely-somewhere-in-a-long-sequence error retrying is for. 2
+// retries (3 total attempts per page group) is a real, bounded, small
+// multiplier on this loop's own worst-case cost -- nowhere near the ~5s
+// task-watchdog window this project has already been bitten by twice
+// (hal/ir_unit.h's and hal/storage_sd.cpp's own header comments).
+constexpr uint8_t kT2tReadMaxRetries = 2U;
+
 } // namespace
 
 void nfca_halt() {
@@ -1765,13 +1786,6 @@ bool t2t_read_pages(uint8_t *out, size_t cap_bytes, uint8_t *pages_out) {
             break;
         }
 
-        // A fresh per-exchange deadline for every READ, for exactly the
-        // reason nfca_detect()'s own `deadline` variable documents at length:
-        // kDetectBudgetMs bounds ONE exchange, and reusing a single computed
-        // budget across a long sequence of them silently turns it into a
-        // shrinking shared one. A 231-page tag runs 58 of these.
-        const uint32_t deadline = millis() + kDetectBudgetMs;
-
         // [REF-T2T] rfal_t2t.cpp:80-84 + :123-124: the whole command is
         // {code, blNo}, sent with CRC (RFAL_TXRX_FLAGS_DEFAULT at :127).
         // Plain ISO14443-3 data exchange -- NOT wrapped in an ISO14443-4
@@ -1780,19 +1794,41 @@ bool t2t_read_pages(uint8_t *out, size_t cap_bytes, uint8_t *pages_out) {
         const uint8_t req[2] = {kT2tCmdRead, static_cast<uint8_t>(start)};
         uint8_t rx[kT2tRxBufLen] = {0};
         uint8_t rx_len = 0;
-        const Xfer x = transceive(/*short_cmd=*/0U, req, sizeof(req), /*crc_tx=*/true,
-                                  /*antcl=*/false, /*crc_rx=*/true,
-                                  rx, sizeof(rx), &rx_len, deadline,
-                                  kT2tReadNrtSteps64fc);
+        Xfer x = Xfer::kProtocol;
+        // Bounded retry (kT2tReadMaxRetries, see that constant's own
+        // real-hardware-bug comment above) before concluding end-of-memory --
+        // a fresh per-exchange deadline every attempt, for exactly the reason
+        // nfca_detect()'s own `deadline` variable documents at length:
+        // kDetectBudgetMs bounds ONE exchange, and reusing a single computed
+        // budget across a long sequence of them (retries included) silently
+        // turns it into a shrinking shared one.
+        for (uint8_t attempt = 0; attempt <= kT2tReadMaxRetries; attempt++) {
+            const uint32_t deadline = millis() + kDetectBudgetMs;
+            x = transceive(/*short_cmd=*/0U, req, sizeof(req), /*crc_tx=*/true,
+                           /*antcl=*/false, /*crc_rx=*/true,
+                           rx, sizeof(rx), &rx_len, deadline,
+                           kT2tReadNrtSteps64fc);
+            if (x == Xfer::kOk && rx_len == kT2tReadDataLen) {
+                break;
+            }
+            if (attempt < kT2tReadMaxRetries) {
+                Serial.printf("quarky-tab5: [st25r3916] t2t_read_pages: page %d "
+                              "attempt %u failed (xfer=%u len=%u) -- retrying\n",
+                              start, (unsigned)(attempt + 1), (unsigned)x,
+                              (unsigned)rx_len);
+            }
+        }
 
         if (x != Xfer::kOk || rx_len != kT2tReadDataLen) {
             // End of memory (the real NAK case, see this section's "ONE
-            // HONEST IMPRECISION" note), or a genuine failure. Either way the
-            // tag has no more to give.
+            // HONEST IMPRECISION" note), or a genuine failure that survived
+            // kT2tReadMaxRetries retries. Either way the tag has no more to
+            // give.
             Serial.printf("quarky-tab5: [st25r3916] t2t_read_pages: stopped at "
-                          "page %d (xfer=%u 0=kOk,1=kNoResponse,2=kCollision,"
-                          "3=kProtocol,4=kIo; len=%u) after %u pages\n",
-                          start, (unsigned)x, (unsigned)rx_len, (unsigned)pages);
+                          "page %d after %u retries (xfer=%u 0=kOk,1=kNoResponse,"
+                          "2=kCollision,3=kProtocol,4=kIo; len=%u) after %u pages\n",
+                          start, (unsigned)kT2tReadMaxRetries, (unsigned)x,
+                          (unsigned)rx_len, (unsigned)pages);
             trim = (pages > 0);
             break;
         }
