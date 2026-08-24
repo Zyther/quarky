@@ -37,6 +37,13 @@
 #include "features/nfc/nfc_emv_read.h" // Phase 3 Task 13: EMV/APDU contactless
                                        // payment-card read (PAN/expiry/vendor)
                                        // on the NFC unit
+#include "features/nfc/nfc_emulate.h" // Phase 3 Task 24: NFC tag emulation
+                                      // (Listen Mode, NFC unit only). No
+                                      // register_module()/launcher tile of its
+                                      // own -- reachable only via the
+                                      // "Emulate" button nfc_tag_library_ui.cpp
+                                      // wires into its saved-tag detail view
+                                      // (same pattern as rf433_replay.h below)
 #include "features/rf433/rf433_scan.h" // Phase 3 Task 5: RF433 scan/capture UI
 #include "features/rf433/rf433_replay.h" // Phase 3 Task 6: replay a captured
                                           // signal on TAB5_RF433T_PIN. No
@@ -693,6 +700,12 @@ void loop() {
                         // sequence directly (no worker task -- see
                         // nfc_emv_read.cpp's EXECUTION MODEL comment for why
                         // a single poll()-tick budget exception is safe here).
+    NfcEmulate::poll(); // Phase 3 Task 24: no-ops unless the Emulate screen
+                        // (reached from NfcTagLibrary's saved-tag detail view)
+                        // is open; each tick is a handful of bounded I2C
+                        // register reads (St25r3916::listen_poll()), never a
+                        // wait, so there is no watchdog-budget exception to
+                        // disclose here the way NfcEmvRead::poll() above has.
     Rf433Replay::poll(); // Phase 3 Task 6: no-ops unless a transmit task is in
                           // flight or has just finished; releases the GPIO53
                           // arbiter claim on completion (main-task-only, see

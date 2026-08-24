@@ -9,6 +9,7 @@
 // nfc_tag_library.h -- callers (main.cpp) see one namespace, unaware of the
 // physical split.
 #include "nfc_tag_library.h"
+#include "nfc_emulate.h" // Task 24: "Emulate" action on a saved tag's detail view
 
 #include "../../hal/storage_sd.h"
 #include "../../ui/screen_scaffold.h"
@@ -46,7 +47,16 @@ constexpr int kMaxEntries = 32; // generous for a browse list; bounded, not
 
 lv_obj_t *s_list = nullptr;
 lv_obj_t *s_detail_label = nullptr;
+lv_obj_t *s_emulate_btn = nullptr;
 char s_names[kMaxEntries][64];
+
+// The tag currently shown in the detail view (valid only while
+// s_has_current_tag is true), so the "Emulate" button below can act on
+// whatever was last tapped without re-reading from SD. Mirrors nfc_read.cpp's
+// s_last_found_tag/kFound-state pattern for the same reason: the click
+// handler that uses this runs on a LATER event than the one that set it.
+NfcCommon::TagInfo s_current_tag{};
+bool s_has_current_tag = false;
 
 void show_tag(int idx) {
     if (idx < 0 || idx >= kMaxEntries) {
@@ -57,6 +67,7 @@ void show_tag(int idx) {
         if (s_detail_label != nullptr) {
             lv_label_set_text(s_detail_label, "Failed to load tag record.");
         }
+        s_has_current_tag = false;
         return;
     }
     char uid_str[64];
@@ -67,6 +78,8 @@ void show_tag(int idx) {
     if (s_detail_label != nullptr) {
         lv_label_set_text(s_detail_label, buf);
     }
+    s_current_tag = tag;
+    s_has_current_tag = true;
 }
 
 lv_obj_t *build_screen() {
@@ -98,9 +111,31 @@ lv_obj_t *build_screen() {
     s_detail_label = lv_label_create(content);
     lv_label_set_text(s_detail_label, "Tap a saved tag to view its details.");
 
+    // "Emulate" (Task 24), next to the existing load/view action: presents
+    // the currently-shown saved tag's real UID/SAK/ATQA over Listen Mode.
+    // NFC-unit only (see nfc_emulate.h's own header comment on why RFID2
+    // cannot do this at all) -- but every tag in this library, regardless of
+    // which unit originally scanned it, is emulated the same way, since
+    // Listen Mode only needs the UID/SAK/ATQA already stored in TagInfo, not
+    // which unit produced them.
+    s_emulate_btn = lv_button_create(content);
+    lv_obj_t *emulate_lbl = lv_label_create(s_emulate_btn);
+    lv_label_set_text(emulate_lbl, "Emulate");
+    lv_obj_add_event_cb(s_emulate_btn, [](lv_event_t *) {
+        if (!s_has_current_tag) {
+            if (s_detail_label != nullptr) {
+                lv_label_set_text(s_detail_label, "Tap a saved tag first.");
+            }
+            return;
+        }
+        NfcEmulate::start(s_current_tag);
+    }, LV_EVENT_CLICKED, nullptr);
+
     lv_obj_add_event_cb(content, [](lv_event_t *) {
         s_list = nullptr;
         s_detail_label = nullptr;
+        s_emulate_btn = nullptr;
+        s_has_current_tag = false;
     }, LV_EVENT_DELETE, nullptr);
 
     return screen;

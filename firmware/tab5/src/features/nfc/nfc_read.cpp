@@ -194,6 +194,14 @@ static bool try_read_rfid2_uid(NfcCommon::TagInfo *out) {
     std::snprintf(out->type_name, sizeof(out->type_name), "%s",
                   reinterpret_cast<const char *>(s_mfrc.PICC_GetTypeName(picc_type)));
 
+    // Real SAK (Task 24 / nfc_common.h). ATQA is deliberately left at its
+    // {0,0} "not captured" sentinel -- MFRC522_I2C's Uid struct (see that
+    // library's header) never surfaces the ATQA bytes PICC_RequestA() saw,
+    // only UID/SAK survive past PICC_ReadCardSerial().
+    out->sak = s_mfrc.uid.sak;
+    out->atqa[0] = 0;
+    out->atqa[1] = 0;
+
     // Leave the tag halted and crypto state clean for the next scan.
     s_mfrc.PICC_HaltA();
     s_mfrc.PCD_StopCrypto1();
@@ -248,6 +256,11 @@ static bool try_read_nfc_uid(NfcCommon::TagInfo *out) {
                   (unsigned)tag.sak);
     Serial.printf("quarky-tab5: [nfc-read] ATQA=%02X%02X SAK=%02X UID len=%u\n",
                   tag.atqa[1], tag.atqa[0], tag.sak, (unsigned)tag.uid_len);
+    // Real SAK/ATQA (Task 24 / nfc_common.h) -- both already sitting in `tag`
+    // from St25r3916::nfca_detect(), unlike the RFID2 path above.
+    out->sak = tag.sak;
+    out->atqa[0] = tag.atqa[0];
+    out->atqa[1] = tag.atqa[1];
     return true;
 }
 

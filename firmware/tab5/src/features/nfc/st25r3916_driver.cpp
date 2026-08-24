@@ -1789,4 +1789,437 @@ bool apdu_transceive(const uint8_t *tx, size_t tx_len,
     return true;
 }
 
+// ===========================================================================
+// NFC-A Listen Mode / tag emulation (Phase 3 Task 24)
+//
+// SOURCES FOR THIS SECTION ONLY. Every register/bit/command below traces to
+// the same two documents already cited at the top of this file (DS12484
+// Rev 3 + the vendored RFAL reference driver), PLUS the vendored tree's
+// Listen Mode implementation specifically, not previously read by this
+// project before this task:
+//   ~/src/wilson-elechouse/ST25R3916/ST25R3916_ELECHOUSE/src/rfal_rfst25r3916.h
+//     - rfalLm struct (:79-91), rfalLmConfPA (NFC-RFAL/src/rfal_rf.h:485-491):
+//       the real, silicon-level "answer with an arbitrary UID/ATQA/SAK"
+//       configuration surface this task needed to confirm exists before any
+//       code was written -- it does.
+//   ~/src/wilson-elechouse/ST25R3916/ST25R3916_ELECHOUSE/src/rfal_rfst25r3916.cpp
+//     - rfalListenStart() (:2407-2502): the PT-memory build (NFCID triple +
+//       SENS_RES + 3x SEL_RES, with the INCOMPLETE bit set on non-final
+//       cascade levels for 7-byte UIDs -- ":2456-2458"), the AUX nfc_id
+//       length select (:2439/2443), the PASSIVE_TARGET autoResp bits
+//       (:2431-2433, then :2462 clearing d_106_ac_a specifically), the MODE
+//       register's target/listen-NFCA encoding (:2429/2464-2467), and the
+//       Guard Time register write (:2488-2492).
+//     - rfalRunListenModeWorker() (:2737-2935) and rfalListenSetState()
+//       (:2616-2734): confirms the chip's own "Passive Target Anticollision"
+//       (PTA) hardware state machine autonomously walks
+//       Idle->ReadyL1->ReadyL2->Active (i.e. REQA/WUPA, anticollision, and
+//       SELECT) on its own once armed -- firmware's whole job is polling
+//       PASSIVE_TARGET_STATUS (0x21) to see which state it reached, exactly
+//       the same "polled status register instead of an IRQ pin" substitution
+//       nfca_detect() above already makes for the reader path.
+//   ~/src/wilson-elechouse/ST25R3916/ST25R3916_ELECHOUSE/src/st25r3916_com.h
+//     - :107 REG_PASSIVE_TARGET=0x08 (RW), :143 REG_PASSIVE_TARGET_STATUS=
+//       0x21 (R); :392/393/395 the three "d_" (disable) bits d_ac_ap2p (bit
+//       3), d_212_424_1r (bit 2), d_106_ac_a (bit 0); :593-612 the
+//       pta_state<3:0> value table (idle=1, ready_l1=2, ready_l2=3, active=5,
+//       halt=9, ready_l1_x=0xA, ready_l2_x=0xB, active_x=0xD); :255-285 the
+//       MODE register's targ (bit7), om3 (bit6), om0 (bit3) and nfc_ar<1:0>
+//       bits; :433-438 AUX register nfc_id<1:0> length-select bits
+//       (bits 5:4); :454-478 the RX_CONF1 lp/hz and RX_CONF2 amd_sel bits used by the
+//       Listen-On analog config below; :540-552 TIMER_EMV_CONTROL's gptc
+//       and mrt_step bits.
+//   ~/src/wilson-elechouse/ST25R3916/ST25R3916_ELECHOUSE/src/st25r3916.h
+//     - :96/97 CMD_GOTO_SENSE=0xCD "Passive target logic to Sense/Idle
+//       state", CMD_GOTO_SLEEP=0xCE "...to Sleep/Halt state" -- both plain
+//       one-byte direct commands, same I2C framing execute_command() above
+//       already uses; :99/107 CMD_UNMASK_RECEIVE_DATA=0xD1,
+//       CMD_CLEAR_FIFO=0xDB. (RFAL detects field loss via its own
+//       st25r3916IsExtFieldOn() macro reading AUX_DISPLAY's efd_o bit; this
+//       driver instead reuses the IRQ status word sampleIrqs() already reads
+//       for the reader path and checks its EOF bit -- st25r3916_interrupt.h:
+//       80, "external field off interrupt" -- one fewer register read per
+//       tick and no new bus primitive.)
+//   ~/src/wilson-elechouse/ST25R3916/ST25R3916_ELECHOUSE/src/st25r3916_com.cpp
+//     - st25r3916WritePTMem() (:474-542): confirms a genuine I2C (not
+//       SPI-only) code path exists for loading PT memory -- one mode byte
+//       (PT_A_CONFIG_LOAD, :56, 0xA0) followed by a plain byte-at-a-time I2C
+//       burst write, the same shape write_register()/execute_command()
+//       already use, just a different mode byte and a multi-byte payload.
+//       :81 PTM_A_LEN=15 (10-byte NFCID triple + 2-byte SENS_RES + 3x 1-byte
+//       SEL_RES).
+//   ~/src/wilson-elechouse/ST25R3916/ST25R3916_ELECHOUSE/src/rfal_rfst25r3916_analogConfigTbl.h
+//     - :482-493 "Default Analog Configuration for Chip-Specific Listen On"
+//       (RFAL_ANALOG_CONFIG_TECH_CHIP|CHIP_LISTEN_ON): the exact 9 register
+//       writes apply_listen_config() below applies, ported the same
+//       "fold RFAL's analog-config table into a literal register list" way
+//       apply_nfca_config() (this file's reader-path analog config) already
+//       does for CHIP_INIT/CHIP_POLL_COMMON -- this is the Listen-mode
+//       counterpart of that exact table, not a new technique.
+//   ~/src/wilson-elechouse/ST25R3916/NFC-RFAL/src/rfal_rf.h
+//     - :106 RFAL_LM_MASK_NFCA; :111 RFAL_LM_SENS_RES_LEN=2; :118
+//       RFAL_NFCID1_TRIPLE_LEN=10; :272 RFAL_LM_NFCID_INCOMPLETE=0x04 (SEL_RES
+//       bit meaning "another cascade level follows"); :457/458
+//       RFAL_LM_NFCID_LEN_04/07; :92/95/96 RFAL_1FC_IN_512FC=512,
+//       RFAL_US_IN_MS=1000, RFAL_1MS_IN_1FC=13560 (fc=13.56 MHz) -- used
+//       below to compute the literal Guard Time register value the same way
+//       kNrtSteps64fc/kMrtSteps64fc above compute theirs from RFAL's own
+//       1/fc-unit constants; :281 RFAL_LM_GT = rfalConvUsTo1fc(100) = (100 *
+//       13560) / 1000 = 1356 (1/fc units), then rfalConv1fcTo512fc(1356) =
+//       1356 / 512 = 2 (512/fc units, integer division per RFAL's own macro)
+//       is the literal byte this section writes to MASK_RX_TIMER.
+//
+// CONFIRMED FEASIBLE BEFORE WRITING ANY CODE (this task's Step 1 gate,
+// matching Task 2/15/23's precedent): the chip's PTA engine answers
+// REQA/WUPA + the full anticollision/SELECT sequence autonomously, firmware
+// CAN program an arbitrary 4- or 7-byte UID (not just a factory-fixed one),
+// and every access needed (register writes, PT-memory writes, status-register
+// polling) is available over I2C without an IRQ pin -- so this is
+// implemented, not reported blocked.
+//
+// SCOPE, stated honestly, same policy as every other section in this file:
+//   * Single UID length per session (4 or 7 bytes) -- no 10-byte/triple-
+//     cascade support (RFAL's own rfalLmConfPA has none either).
+//   * No SLEEP_A / re-select-after-HALT handling (RFAL_LM_STATE_SLEEP_A and
+//     rfalListenSleepStart() are not ported) -- a reader that HALTs our
+//     emulated tag and later tries to WUPA it again gets whatever the PTA
+//     hardware does on its own; this driver does not actively re-arm for
+//     that specific case beyond the general EOF-triggered re-arm below.
+//   * No response to anything past SELECT (RATS, READ, etc.) -- the plan's
+//     own out-of-scope stretch goal (full memory-content emulation). This
+//     driver only reports that a reader reached the "active"/"active*" PTA
+//     state, i.e. that our UID/SAK were accepted.
+//   * The chip's own antenna/RF analog tuning (RFAL's separate LISTEN AP2P
+//     entries, and any board-specific antenna-matching values beyond the two
+//     literal ANT_TUNE_A/B bytes the cited table specifies) is not
+//     independently re-verified against a real reader in this task -- that
+//     is exactly what Step 4's PAUSE FOR HARDWARE is for.
+// ===========================================================================
+
+namespace {
+
+// --- Registers ---------------------------------------------------------
+constexpr uint8_t kRegPassiveTarget       = 0x08U; // RW Passive target definition
+constexpr uint8_t kRegPassiveTargetStatus = 0x21U; // R  Passive target state status
+
+// --- Direct commands -----------------------------------------------------
+constexpr uint8_t kCmdGotoSense          = 0xCDU; // PTA logic -> Sense/Idle
+constexpr uint8_t kCmdUnmaskReceiveData  = 0xD1U;
+constexpr uint8_t kCmdClearFifo          = 0xDBU;
+
+// --- PASSIVE_TARGET (0x08) bits: each is a DISABLE bit; clearing one
+// re-enables the corresponding autonomous hardware behaviour.
+constexpr uint8_t kPtDisableAp2p    = 1U << 3; // d_ac_ap2p
+constexpr uint8_t kPtDisable212424  = 1U << 2; // d_212_424_1r
+constexpr uint8_t kPtDisable106Ac   = 1U << 0; // d_106_ac_a -- 0 = chip auto-
+                                               // answers 106k anticollision
+constexpr uint8_t kPtAllDisabled =
+    static_cast<uint8_t>(kPtDisableAp2p | kPtDisable212424 | kPtDisable106Ac);
+// This driver only ever arms NFC-A at 106 kb/s, so 212/424 and AP2P stay
+// permanently disabled; only d_106_ac_a is cleared when armed.
+constexpr uint8_t kPtArmed =
+    static_cast<uint8_t>(kPtDisableAp2p | kPtDisable212424);
+
+// --- PASSIVE_TARGET_STATUS (0x21) pta_state<3:0> values.
+constexpr uint8_t kPtaStateMask   = 0x0FU;
+constexpr uint8_t kPtaStActive    = 0x05U;
+constexpr uint8_t kPtaStActiveX   = 0x0DU;
+
+// --- MODE (0x03) target-mode bits, distinct from the reader path's own
+// kModeOmIso14443a poller value above -- targ selects target(1)/initiator(0);
+// om3|om0 together select the "listen NFC-A" operating sub-mode (a different
+// om<3:0> encoding than the reader path's om<3:0>=0001b).
+constexpr uint8_t kModeTarg       = 1U << 7;
+constexpr uint8_t kModeOm3        = 1U << 6;
+constexpr uint8_t kModeOm0        = 1U << 3;
+constexpr uint8_t kModeNfcArMask  = 3U << 0;
+constexpr uint8_t kModeNfcArOff   = 0U << 0;
+
+// --- AUX (0x0A) NFCID length select (bits 5:4).
+constexpr uint8_t kAuxNfcIdMask    = 3U << 4;
+constexpr uint8_t kAuxNfcId4Bytes  = 0U << 4;
+constexpr uint8_t kAuxNfcId7Bytes  = 1U << 4;
+
+// --- Listen-On analog config (RX_CONF1/RX_CONF2 bits not already defined
+// for the reader path).
+constexpr uint8_t kRxConf1LpMask       = 7U << 3;
+constexpr uint8_t kRxConf1Lp1200khz    = 0U << 3;
+constexpr uint8_t kRxConf1HzMask       = 0x0FU << 0;
+constexpr uint8_t kRxConf1Hz12_200khz  = 1U << 0;
+constexpr uint8_t kRxConf2AmdSelMask   = 1U << 6;
+constexpr uint8_t kRxConf2AmdSelMixer  = 1U << 6;
+
+// --- TIMER_EMV_CONTROL (0x12) bits not already defined for the reader path.
+constexpr uint8_t kTimerEmvGptcMask       = 7U << 5;
+constexpr uint8_t kTimerEmvGptcNoTrigger  = 0U << 5;
+constexpr uint8_t kTimerEmvMrtStep512     = 1U << 3; // vs. the reader path's
+                                                     // own kTimerEmvMrtStep=64
+
+// --- IRQ status bits (same 32-bit-word-from-regs-1Ah..1Dh packing this file
+// already uses for kIrqRxe etc.).
+constexpr uint32_t kIrqEof = 0x00000800U; // 1Bh bit 3: external field off
+
+// --- PT memory (PT_A_CONFIG_LOAD, 0xA0) ------------------------------------
+constexpr uint8_t kPtAConfigLoad  = 0xA0U;
+constexpr uint8_t kPtMemALen      = 15U;  // NFCID triple(10) + SENS_RES(2) + 3x SEL_RES
+constexpr uint8_t kNfcidTripleLen = 10U;
+constexpr uint8_t kSelResIncomplete = 0x04U; // RFAL_LM_NFCID_INCOMPLETE
+
+// I2C burst write of the whole PT_A memory block: one mode byte, then
+// kPtMemALen data bytes, matching [REF] st25r3916WritePTMem()'s i2c_enabled
+// branch (st25r3916_com.cpp:518-538) with the digitalRead()-gated interrupt
+// bookkeeping removed, same policy readRegistersRaw()/writeFifoRaw() already
+// apply to their own [REF] counterparts.
+bool writePtMemA(const uint8_t (&buf)[kPtMemALen]) {
+    Wire1.beginTransmission(kI2cAddr);
+    bool queued = (Wire1.write(kPtAConfigLoad) == 1);
+    for (uint8_t i = 0; i < kPtMemALen && queued; i++) {
+        queued = (Wire1.write(buf[i]) == 1);
+    }
+    return queued && (Wire1.endTransmission(true) == 0);
+}
+
+// The Listen-On analog config programme, folded from
+// rfal_rfst25r3916_analogConfigTbl.h's "Chip-Specific Listen On" entry (see
+// this section's SOURCES block) -- same RegWrite/loop shape
+// apply_nfca_config() above already uses for its own analog config table.
+bool apply_listen_config() {
+    struct RegWrite { bool space_b; uint8_t reg; uint8_t mask; uint8_t value; };
+    static const RegWrite kProgramme[] = {
+        {false, kRegAntTuneA,     0xFFU,             0x00U},
+        {false, kRegAntTuneB,     0xFFU,             0xE0U},
+        {false, kRegRxConf1,      kRxConf1LpMask,    kRxConf1Lp1200khz},
+        {false, kRegRxConf1,      kRxConf1HzMask,    kRxConf1Hz12_200khz},
+        {false, kRegRxConf2,      kRxConf2AmdSelMask, kRxConf2AmdSelMixer},
+        {true,  kRegBOvershoot1,  0xFFU,             0x00U},
+        {true,  kRegBOvershoot2,  0xFFU,             0x00U},
+        {true,  kRegBUndershoot1, 0xFFU,             0x00U},
+        {true,  kRegBUndershoot2, 0xFFU,             0x00U},
+    };
+    for (const RegWrite &w : kProgramme) {
+        const bool ok = (w.mask == 0xFFU)
+                            ? (w.space_b ? writeRegisterBRaw(w.reg, w.value)
+                                         : writeRegisterRaw(w.reg, w.value))
+                            : (w.space_b ? changeRegisterBitsB(w.reg, w.mask, w.value)
+                                         : changeRegisterBits(w.reg, w.mask, w.value));
+        if (!ok) {
+            Serial.printf("quarky-tab5: [st25r3916] Listen config write failed at "
+                          "%s register 0x%02X\n",
+                          w.space_b ? "space-B" : "space-A", w.reg);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool s_listen_armed = false;
+ListenState s_listen_state = ListenState::kNotArmed;
+
+} // namespace
+
+bool listen_start(const ListenConfig &cfg) {
+    if (cfg.uid_len != 4U && cfg.uid_len != 7U) {
+        return false; // PT memory has no 10-byte/triple-cascade encoding
+    }
+    if (!init()) {
+        return false;
+    }
+
+    // Listen Mode and the reader path share REG_MODE/REG_PASSIVE_TARGET and
+    // cannot run concurrently -- end whichever was open first, same
+    // "tear down before arming" discipline nfca_poller_begin() itself follows
+    // by calling field_on()/init() unconditionally at its own start.
+    listen_stop();
+    if (s_nfca_ready) {
+        nfca_poller_end();
+    }
+
+    // AUX (0x0A): NFCID length select. [REF] rfalListenStart():2439/2443.
+    if (!changeRegisterBits(kRegAux, kAuxNfcIdMask,
+                            (cfg.uid_len == 4U) ? kAuxNfcId4Bytes : kAuxNfcId7Bytes)) {
+        return false;
+    }
+
+    // Build and write the 15-byte PT_A memory block. [REF] rfalListenStart():
+    // 2435-2460 -- NFCID triple, then SENS_RES, then 3x SEL_RES with the
+    // INCOMPLETE bit (0x04) set on byte 0 only when uid_len==7 (signalling
+    // "another cascade level follows" during CL1 anticollision; the final
+    // SELECT response, bytes 1/2, never carries it).
+    uint8_t pt_mem[kPtMemALen] = {0};
+    for (uint8_t i = 0; i < kNfcidTripleLen; i++) {
+        pt_mem[i] = (i < cfg.uid_len) ? cfg.uid[i] : 0U;
+    }
+    pt_mem[10] = cfg.atqa[0];
+    pt_mem[11] = cfg.atqa[1];
+    pt_mem[12] = (cfg.uid_len == 4U) ? static_cast<uint8_t>(cfg.sak & ~kSelResIncomplete)
+                                     : static_cast<uint8_t>(cfg.sak | kSelResIncomplete);
+    pt_mem[13] = static_cast<uint8_t>(cfg.sak & ~kSelResIncomplete);
+    pt_mem[14] = static_cast<uint8_t>(cfg.sak & ~kSelResIncomplete);
+    if (!writePtMemA(pt_mem)) {
+        return false;
+    }
+
+    // PASSIVE_TARGET (0x08): arm 106 kb/s autonomous anticollision, leave
+    // 212/424 and AP2P disabled (this driver is NFC-A 106 kb/s only, matching
+    // the reader path's own single-bitrate scope). [REF] rfalListenStart():
+    // 2431-2433/2462-2467/2482-2486.
+    if (!writeRegisterRaw(kRegPassiveTarget, kPtArmed)) {
+        return false;
+    }
+
+    // MODE (0x03): target mode, listen-NFCA sub-mode, no auto-response
+    // chaining. [REF] rfalListenStart():2464-2467. Uses the full kModeOmMask
+    // (not just the om3|om0 bits this call happens to set), matching every
+    // other MODE-register write in this file -- the two om encodings this
+    // driver ever writes (reader's 0001b, listen's 1001b) both happen to
+    // have om1/om2 clear, so a narrower mask would be harmless today, but
+    // only the full-mask form is guaranteed not to leave a stray om1/om2 bit
+    // behind if that ever changes.
+    if (!changeRegisterBits(kRegMode,
+                            static_cast<uint8_t>(kModeTarg | kModeOmMask | kModeNfcArMask),
+                            static_cast<uint8_t>(kModeTarg | kModeOm3 | kModeOm0 | kModeNfcArOff))) {
+        return false;
+    }
+
+    // ISO14443A_NFC (0x05): normal parity handling, not FeliCa framing.
+    // [REF] rfalListenStart():2494-2497.
+    if (!changeRegisterBits(kRegIso14443aNfc,
+                            static_cast<uint8_t>(kIso14443aNoTxPar | kIso14443aNoRxPar | kIso14443aNfcF0),
+                            0U)) {
+        return false;
+    }
+
+    // TIMER_EMV_CONTROL / MASK_RX_TIMER: Guard Time, per this section's
+    // SOURCES block arithmetic (RFAL_LM_GT=1356 1/fc -> 2 in 512/fc steps).
+    // [REF] rfalListenStart():2488-2492.
+    if (!changeRegisterBits(kRegTimerEmvCtrl, kTimerEmvGptcMask, kTimerEmvGptcNoTrigger) ||
+        !changeRegisterBits(kRegTimerEmvCtrl, kTimerEmvMrtStep512, kTimerEmvMrtStep512) ||
+        !writeRegisterRaw(kRegMaskRxTimer, 2U)) {
+        return false;
+    }
+
+    if (!apply_listen_config()) {
+        return false;
+    }
+
+    // Arm the PTA hardware state machine, then bring the oscillator/receiver
+    // up -- same osc_ok polling field_on() already does, but WITHOUT tx_en:
+    // a Listen Mode target answers by load-modulating the READER's carrier
+    // (driven entirely by the PTA engine once armed), not by generating its
+    // own field, so tx_en is deliberately never set here. [REF]
+    // rfalListenSetState()'s RFAL_LM_STATE_IDLE case (:2673-2695) sets only
+    // en|rx_en, never tx_en.
+    if (!executeCommandRaw(kCmdGotoSense) ||
+        !executeCommandRaw(kCmdClearFifo) ||
+        !executeCommandRaw(kCmdUnmaskReceiveData)) {
+        return false;
+    }
+
+    uint8_t op = 0;
+    if (!readRegisterRaw(kRegOpControl, &op)) {
+        return false;
+    }
+    if ((op & kOpControlEn) == 0U) {
+        if (!writeRegisterRaw(kRegOpControl, static_cast<uint8_t>(op | kOpControlEn))) {
+            return false;
+        }
+    }
+    bool osc_ok = false;
+    const uint32_t deadline = millis() + kOscStableTimeoutMs;
+    do {
+        uint8_t aux = 0;
+        if (readRegisterRaw(kRegAuxDisplay, &aux) && ((aux & kAuxDisplayOscOk) != 0U)) {
+            osc_ok = true;
+            break;
+        }
+    } while (static_cast<int32_t>(millis() - deadline) < 0);
+    if (!osc_ok) {
+        return false;
+    }
+    if (!changeRegisterBits(kRegOpControl, kOpControlRxEn, kOpControlRxEn)) {
+        return false;
+    }
+
+    s_listen_armed = true;
+    s_listen_state = ListenState::kIdle;
+    Serial.println("quarky-tab5: [st25r3916] Listen Mode armed "
+                   "(NFC-A, 106 kb/s, hardware PTA auto-anticollision)");
+    return true;
+}
+
+ListenState listen_poll() {
+    if (!s_listen_armed) {
+        return ListenState::kNotArmed;
+    }
+
+    uint32_t irqs = 0;
+    if (!sampleIrqs(&irqs)) {
+        s_listen_state = ListenState::kHardwareError;
+        return s_listen_state;
+    }
+    uint8_t pts = 0;
+    if (!readRegisterRaw(kRegPassiveTargetStatus, &pts)) {
+        s_listen_state = ListenState::kHardwareError;
+        return s_listen_state;
+    }
+
+    if ((irqs & kIrqEof) != 0U) {
+        // The reader's field went away -- re-arm for the next reader. [REF]
+        // rfalRunListenModeWorker()'s own EOF handling (:2781-2782/2914-2915)
+        // drops back toward POWER_OFF/IDLE; this driver folds that into a
+        // single GOTO_SENSE re-issue rather than modelling POWER_OFF as its
+        // own separate wait state (this section's own SCOPE note above).
+        executeCommandRaw(kCmdGotoSense);
+        s_listen_state = ListenState::kIdle;
+        return s_listen_state;
+    }
+
+    const uint8_t state = static_cast<uint8_t>(pts & kPtaStateMask);
+    if (state == kPtaStActive || state == kPtaStActiveX) {
+        // Latched: once a reader has SELECTed us, keep reporting kSelected
+        // (rather than flipping back to kIdle on, e.g., a HALT the reader
+        // sends right after reading) until the field genuinely disappears
+        // (handled above). That is the one event this baseline promises to
+        // report, and it is real user-visible information worth keeping on
+        // screen.
+        s_listen_state = ListenState::kSelected;
+    } else if (s_listen_state != ListenState::kSelected) {
+        s_listen_state = ListenState::kIdle;
+    }
+    return s_listen_state;
+}
+
+ListenState listen_get_state() {
+    return s_listen_state;
+}
+
+void listen_stop() {
+    if (!s_listen_armed) {
+        return;
+    }
+    s_listen_armed = false;
+    s_listen_state = ListenState::kNotArmed;
+
+    executeCommandRaw(kCmdStop); // [DS] Table 13 C2h: stop all activities
+
+    // Restore REG_MODE's targ bit to 0 (initiator) and clear the om/ar bits
+    // Listen Mode set -- nfca_poller_begin()'s own apply_nfca_config() only
+    // ORs in its om bits via kModeOmMask and never touches targ, so leaving
+    // targ=1 here would silently leave the NEXT reader-path session running
+    // in target mode instead of initiator mode.
+    changeRegisterBits(kRegMode,
+                       static_cast<uint8_t>(kModeTarg | kModeOmMask | kModeNfcArMask), 0U);
+    // Restore PASSIVE_TARGET to fully disabled, matching [REF]
+    // rfalListenStop() (:2571-2574).
+    writeRegisterRaw(kRegPassiveTarget, kPtAllDisabled);
+
+    // Same "leave the oscillator running, only clear rx_en" policy field_off()
+    // already documents -- tx_en was never set for Listen Mode in the first
+    // place, so only rx_en needs clearing here.
+    uint8_t op = 0;
+    if (readRegisterRaw(kRegOpControl, &op)) {
+        writeRegisterRaw(kRegOpControl, static_cast<uint8_t>(op & ~kOpControlRxEn));
+    }
+}
+
 } // namespace St25r3916

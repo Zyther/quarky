@@ -179,4 +179,70 @@ bool iso14443_4_activate();
 bool apdu_transceive(const uint8_t *tx, size_t tx_len,
                      uint8_t *rx, size_t rx_cap, size_t *rx_len);
 
+// --- NFC-A Listen Mode (tag emulation) --------------------------------------
+// Added by Phase 3 Task 24. See st25r3916_driver.cpp's "NFC-A Listen Mode"
+// SOURCES section for the real register/command citations (ST's own RFAL
+// Listen Mode implementation, ~/src/wilson-elechouse/ST25R3916/
+// ST25R3916_ELECHOUSE/src/rfal_rfst25r3916.cpp's rfalListenStart()/
+// rfalRunListenModeWorker(), translated into this driver's own polled-status-
+// register style rather than ported as IRQ-driven code -- same reason and
+// same treatment as the reader path above).
+//
+// Real hardware confirmed (not assumed) to do all of the following before
+// this was implemented: the chip has a dedicated "Passive Target
+// Anticollision" (PTA) hardware state machine that autonomously answers
+// REQA/WUPA and walks the full anticollision/SELECT sequence on its own once
+// armed with a UID/ATQA/SAK triple loaded into its Passive Target Memory
+// (PT_A) -- firmware does not construct any of those responses itself. Both
+// the arming writes (register + PT-memory writes) and the resulting state
+// (Passive Target Status register, 0x21) are ordinary polled I2C access, so
+// this needs no IRQ pin, exactly like nfca_detect() above.
+//
+// SCOPE: read-only UID/SAK/ATQA emulation only -- once a reader completes
+// SELECT, this reports kSelected and stops there. Answering whatever the
+// reader sends next (RATS, READ, etc. -- full memory-content emulation) is
+// the plan's own explicitly out-of-scope stretch goal and is NOT
+// implemented; see the .cpp for exactly which RFAL Listen Mode states this
+// covers (IDLE/READY_A/ACTIVE_A only, no SLEEP_A/second-cascade support).
+struct ListenConfig {
+    uint8_t uid[10];  // Only the first uid_len bytes are used.
+    uint8_t uid_len;  // MUST be 4 or 7 -- Listen Mode's PT memory format (like
+                      // RFAL's own rfalLmConfPA) has no 10-byte/triple-cascade
+                      // representation. listen_start() rejects anything else.
+    uint8_t atqa[2];  // SENS_RES, wire order (LSB first).
+    uint8_t sak;      // SEL_RES.
+};
+
+enum class ListenState : uint8_t {
+    kNotArmed,       // listen_start() not yet called, or listen_stop() was.
+    kIdle,           // Armed; the chip's PTA engine is waiting for a reader.
+    kSelected,       // A reader completed anticollision+SELECT with our UID
+                     // (latched until the reader's field goes away).
+    kHardwareError,  // I2C failure while polling -- listen_stop() and retry.
+};
+
+// Arms Listen Mode with the given UID/ATQA/SAK. Ends any active reader-path
+// session first (nfca_poller_end(), if one was open) and any prior Listen
+// Mode session -- the two share REG_MODE/REG_PASSIVE_TARGET on this silicon
+// and cannot run concurrently. Returns false on a bad uid_len or any I2C
+// failure during the arming sequence, in which case Listen Mode is NOT armed.
+bool listen_start(const ListenConfig &cfg);
+
+// One non-blocking polling tick: reads the Passive Target Status register
+// plus the IRQ status registers ONCE and returns the updated state. Same
+// bounded-cost shape as nfca_detect() -- a few I2C register reads, no
+// waiting -- so it is safe to call every poll() tick, including when never
+// armed (returns kNotArmed immediately without touching the bus).
+ListenState listen_poll();
+
+// Last state computed by listen_poll(), without touching the bus.
+ListenState listen_get_state();
+
+// Tears Listen Mode down: stops chip activity, restores REG_MODE (targ bit
+// back to initiator/0) and REG_PASSIVE_TARGET (back to fully disabled) so a
+// later nfca_poller_begin() reader-path call is unaffected, then clears
+// rx_en (same "leave the oscillator running" policy as field_off()). Safe to
+// call when never armed.
+void listen_stop();
+
 } // namespace St25r3916
