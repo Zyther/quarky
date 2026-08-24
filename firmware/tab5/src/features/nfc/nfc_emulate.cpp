@@ -94,6 +94,33 @@ void run_arm() {
     cfg.get_version = (s_tag.get_version_len > 0) ? &s_tag.get_version[0] : nullptr;
     cfg.get_version_len = s_tag.get_version_len;
 
+    // DIAG (2026-08-24, real-hardware capture/replay fidelity check): the
+    // SAME checksum nfc_read.cpp's own capture-time DIAG log computes, over
+    // exactly what is about to be armed -- a mismatch against that earlier
+    // log line would prove real corruption somewhere in save/load; a match
+    // proves the capture->save->load->emulate pipeline is byte-for-byte
+    // faithful and any remaining real-reader mismatch is coming from
+    // somewhere else entirely.
+    {
+        uint32_t sum = 2166136261U; // FNV-1a offset basis
+        if (cfg.pages != nullptr) {
+            for (uint16_t i = 0; i < static_cast<uint16_t>(cfg.page_count) * St25r3916::kListenPageLen; i++) {
+                sum ^= cfg.pages[i];
+                sum *= 16777619U;
+            }
+        }
+        if (cfg.get_version != nullptr) {
+            for (uint8_t i = 0; i < cfg.get_version_len; i++) {
+                sum ^= cfg.get_version[i];
+                sum *= 16777619U;
+            }
+        }
+        Serial.printf("quarky-tab5: [nfc-emulate] DIAG arm checksum: 0x%08lX "
+                      "(pages=%u gv_len=%u)\n",
+                      (unsigned long)sum, (unsigned)cfg.page_count,
+                      (unsigned)cfg.get_version_len);
+    }
+
     if (!St25r3916::listen_start(cfg)) {
         s_state = EmulateState::kFailed;
         s_unit_armed = false;

@@ -1709,6 +1709,19 @@ constexpr uint8_t kT2tCmdRead = 0x30U;
 // response bytes are still captured rather than assumed, even though this
 // command byte itself is confidently real).
 constexpr uint8_t kT2tCmdGetVersion = 0x60U;
+// Real, well-established NFC Forum Type 2 Tag extension command (FAST_READ)
+// -- also NOT present in this project's own vendored RFAL/donor sources
+// (grepped alongside GET_VERSION, 2026-08-24; same disclosure class). Real
+// hardware confirmed BOTH the command byte and its real 3-byte request
+// framing directly: a real Amiibo-specific reader app sent exactly
+// {0x3A, start_page, end_page} (observed as "unsupported command 0x3A,
+// len=3") five times in a row and gave up every time, unable to get any
+// real page content this way even though plain READ (0x30) already worked --
+// this project's own captured page content was never the problem, this
+// command simply went unanswered. The response is real too: a contiguous,
+// header-less run of raw page bytes for [start_page, end_page] inclusive,
+// the same real data plain READ already serves 4 pages at a time.
+constexpr uint8_t kT2tCmdFastRead = 0x3AU;
 // [REF-T2T] rfal_t2t.h:63 RFAL_T2T_BLOCK_LEN.
 constexpr uint8_t kT2tPageLen = 4U;
 static_assert(kT2tPageLen == kListenPageLen,
@@ -3717,6 +3730,46 @@ bool buildT2tReadResponse(uint8_t block, uint8_t (&resp)[kT2tReadDataLen]) {
     return true;
 }
 
+// Real physical ceiling on one listenTransmit() call: its own `bits`
+// parameter converts to bytes and is rejected above 255 (see its own
+// definition). A FAST_READ response has no header, so this driver's usable
+// range tops out at 63 pages (252 bytes) per single request -- a real,
+// disclosed LIMITATION OF THIS DRIVER'S OWN TX PLUMBING, not a fabricated
+// protocol rule: a genuinely oversized request is NAKed rather than silently
+// truncated, the same "refuse rather than guess" policy kMaxPdolDataLen and
+// every other defensive cap in this project already follows.
+constexpr uint16_t kT2tFastReadMaxBytes = 252U; // 63 * kT2tPageLen
+
+// Builds the real answer to a T2T FAST_READ of [start_page, end_page]
+// inclusive -- a contiguous, header-less run of raw page bytes, [REF-T2T
+// via real hardware] see kT2tCmdFastRead's own declaration comment. Returns
+// the real byte count written, or 0 when the request must be NAKed instead
+// (start > end, end past this driver's real captured content, or a range
+// wider than kT2tFastReadMaxBytes can serve in one exchange).
+//
+// Deliberately NOT given the same end-of-memory WRAP buildT2tReadResponse()
+// above has: FAST_READ's own real semantics are an explicit, reader-chosen
+// range, not a fixed 4-page stride walking off the end of memory by
+// construction -- a reader that asks for pages past the tag's own real
+// capacity is asking for something invalid, and this driver treats that as
+// a real, honest NAK rather than repeating a page to pad it the way plain
+// READ's own real, cited, donor-confirmed behavior does at a genuine
+// end-of-memory boundary.
+uint16_t buildT2tFastReadResponse(uint8_t start_page, uint8_t end_page,
+                                  uint8_t *resp, uint16_t resp_cap) {
+    if (s_lm_page_count == 0U || start_page > end_page ||
+        end_page >= s_lm_page_count) {
+        return 0U;
+    }
+    const uint16_t page_count = static_cast<uint16_t>(end_page - start_page) + 1U;
+    const uint16_t byte_count = page_count * kT2tPageLen;
+    if (byte_count > kT2tFastReadMaxBytes || byte_count > resp_cap) {
+        return 0U;
+    }
+    std::memcpy(resp, s_lm_pages[start_page], byte_count);
+    return byte_count;
+}
+
 enum class LmFrame : uint8_t {
     kNone,      // nothing usable in the FIFO (discarded)
     kServiced,  // a command was interpreted and answered
@@ -3799,6 +3852,34 @@ LmFrame listenServiceFrame(uint32_t irqs) {
         return LmFrame::kServiced;
     }
 
+    // --- T2T FAST_READ (0x3A + start page + end page) -----------------------
+    // Added 2026-08-24, real-hardware-driven: see kT2tCmdFastRead's own
+    // declaration comment for the full real evidence -- a real Amiibo
+    // reader app sent exactly this 3-byte request five times in a row and
+    // was NAKed every time before this branch existed, even though plain
+    // READ already served the identical real page content correctly.
+    if (len == 3U && buf[0] == kT2tCmdFastRead) {
+        uint8_t resp[kT2tFastReadMaxBytes] = {0};
+        const uint16_t resp_len =
+            buildT2tFastReadResponse(buf[1], buf[2], resp, sizeof(resp));
+        if (resp_len == 0U) {
+            // Out of range, or a request wider than this driver's own real
+            // TX ceiling can serve in one exchange -- the real, honest
+            // answer is a NAK, same [REF-T2T] :130 citation as plain READ's
+            // own NAK case above (FAST_READ is the same command family).
+            (void)listenSendNak();
+            return LmFrame::kServiced;
+        }
+        if (!listenTransmit(resp, resp_len * 8U, /*with_crc=*/true)) {
+            return LmFrame::kIoError;
+        }
+        Serial.printf("quarky-tab5: [st25r3916] Listen Mode: answered a real "
+                      "T2T FAST_READ (pages %u-%u, %u bytes) with captured "
+                      "content\n", (unsigned)buf[1], (unsigned)buf[2],
+                      (unsigned)resp_len);
+        return LmFrame::kServiced;
+    }
+
     // --- GET_VERSION (0x60), real captured reply only -----------------------
     // Added 2026-08-24, real-hardware-driven: a real Amiibo-specific reader
     // app gates on this command before trusting anything else, and page
@@ -3848,8 +3929,10 @@ LmFrame listenServiceFrame(uint32_t irqs) {
     // the read-only discipline this project's EMV reader already follows.
     // GET_VERSION reaches here only when no real reply was captured (the
     // branch above already handles the real, captured case) -- NAKing it
-    // then is what a real plain MIFARE Ultralight genuinely does. RATS
-    // (0xE0) likewise: ISO14443-4 card emulation is out of scope.
+    // then is what a real plain MIFARE Ultralight genuinely does. FAST_READ
+    // likewise reaches here only for a genuinely out-of-range or oversized
+    // request (its own real branch above handles every real, servable case).
+    // RATS (0xE0) likewise: ISO14443-4 card emulation is out of scope.
     //
     // All of them get a NAK, and the emulated tag deliberately stays ACTIVE
     // afterwards. A strict MIFARE Ultralight returns to IDLE after NAKing an

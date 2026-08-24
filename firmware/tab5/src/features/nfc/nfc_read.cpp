@@ -330,6 +330,26 @@ static bool try_read_nfc_uid(NfcCommon::TagInfo *out) {
         Serial.printf("quarky-tab5: [nfc-read] GET_VERSION: %s (%u bytes)\n",
                       gv_ok ? "captured" : "not supported by this tag",
                       (unsigned)gv_len);
+        // DIAG (2026-08-24, real-hardware capture/replay fidelity check): a
+        // cheap running checksum over exactly what got captured, so it can
+        // be compared byte-for-byte against the same checksum computed again
+        // in nfc_emulate.cpp right before listen_start() -- if they match,
+        // the capture->save->load->emulate pipeline is provably NOT where a
+        // real content mismatch (if one exists) is coming from.
+        {
+            uint32_t sum = 2166136261U; // FNV-1a offset basis
+            for (uint16_t i = 0; i < static_cast<uint16_t>(pages) * NfcCommon::kT2tPageLen; i++) {
+                sum ^= (&out->pages[0][0])[i];
+                sum *= 16777619U;
+            }
+            for (uint8_t i = 0; i < gv_len; i++) {
+                sum ^= out->get_version[i];
+                sum *= 16777619U;
+            }
+            Serial.printf("quarky-tab5: [nfc-read] DIAG capture checksum: "
+                          "0x%08lX (pages=%u gv_len=%u)\n",
+                          (unsigned long)sum, (unsigned)pages, (unsigned)gv_len);
+        }
         if (pages > 0) {
             // Real-hardware finding (2026-08-24): a bare "Ultralight/NTAG 135
             // pg" label reads as a confusing near-miss of a real product
