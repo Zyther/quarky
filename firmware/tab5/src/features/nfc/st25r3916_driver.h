@@ -157,8 +157,12 @@ void nfca_poller_end();
 // Sends RATS (Request for Answer To Select, 0xE0) and validates the ATS
 // response well enough to confirm the tag entered ISO14443-4 (T=CL) protocol
 // mode -- NOT a full TA/TB/TC parse (this task's brief explicitly does not
-// require one), beyond extracting FWI from TB (if present) to size the
-// per-APDU timeout apdu_transceive() uses. Requires nfca_poller_begin() to
+// require one), beyond extracting two real fields it cannot work without:
+// FWI from TB (if present), which sizes the per-APDU timeout apdu_transceive()
+// uses, and FSCI from T0's low nibble (if present), which is the CARD's own
+// declared maximum receivable frame size and therefore decides whether an
+// outgoing C-APDU has to be chained -- see iso14443_4_get_card_fsc() and
+// apdu_transceive() below. Requires nfca_poller_begin() to
 // have already run and a tag to already be ACTIVE (i.e. the most recent
 // nfca_detect() call used keep_active=true and returned kFound). Returns
 // false on any protocol/timeout/I2C failure, in which case no APDU exchange
@@ -173,6 +177,20 @@ bool iso14443_4_activate();
 // real T0/TA(1)/TB(1)/TC(1)/T1...Tk interface bytes; activate() itself
 // consumes only TB's FWI nibble, so without this the ATS is discarded.
 size_t iso14443_4_get_ats(uint8_t *out, size_t cap);
+
+// The card's FSC (Frame Size for proximity Card) in BYTES, as decoded from the
+// FSCI nibble of the ATS's T0 by the most recent iso14443_4_activate(): the
+// largest frame, INCLUDING the PCB byte and the two CRC bytes, that this card
+// said it can receive. Always in [16, 256] -- the ISO14443-4 table's own range,
+// clamped at the top exactly as ST's RFAL clamps it (a card declaring the
+// ISO14443-3-Amd2 512..4096 codes, or an RFU one, is treated as 256), which is
+// also the largest this driver could ever transmit given its 255-byte frame
+// buffer. Returns the ISO14443-A 5.2.3 default of 32 when no activation has
+// happened yet or the card's ATS carried no T0 byte at all -- i.e. it is never
+// 0 and never needs a "did this succeed" check. Exposed mainly for diagnostics
+// and for the Flipper ".nfc" export path; apdu_transceive() consults the same
+// value internally and callers do not have to.
+uint16_t iso14443_4_get_card_fsc();
 
 // Sends one C-APDU wrapped in an ISO14443-4 I-block and returns the unwrapped
 // R-APDU in `rx`. Transparently answers S(WTX) waiting-time-extension
@@ -190,8 +208,26 @@ size_t iso14443_4_get_ats(uint8_t *out, size_t cap);
 // S(WTX) path already had -- see the .cpp's kMaxChainingRounds /
 // kMaxReassembledLen / kMaxApduCallMs.
 //
-// PCD->PICC chaining is still NOT implemented: every C-APDU this project
-// sends is well under 32 bytes and fits one frame by construction.
+// PCD->PICC I-block chaining IS handled too (added 2026-08-24). The comment
+// that used to sit here -- "every C-APDU this project sends is well under 32
+// bytes and fits one frame by construction" -- was made false the day before
+// by the PDOL-based GET PROCESSING OPTIONS path (nfc_emv_read.cpp's
+// build_pdol_gpo()): a real Visa card's own PDOL was 27 bytes, producing a
+// 62-byte I-block, and real PDOLs can be larger still. That frame was sent
+// without ever being compared against the card's own declared FSC (which the
+// driver did not even extract), and the card answered nothing at all -- a
+// genuine hardware NRT timeout, reproduced against both a Visa and an older
+// Mastercard card, and the standard behavior for a frame that overruns a
+// card's declared frame size. So a C-APDU whose frame would exceed
+// iso14443_4_get_card_fsc() is now
+// split across as many chained I-blocks as it needs, each one acknowledged by
+// the card with an R(ACK) before the next is sent, and the caller still passes
+// exactly ONE C-APDU regardless. Both directions compose: a single call may
+// send a chained command AND receive a chained response. Bounded in fragment
+// count and sharing -- not extending -- the same per-call time envelope the
+// S(WTX) and receive-chaining paths already use (see the .cpp's
+// kMaxTxChainFragments / kMaxApduCallMs). `tx_len` still tops out at 254
+// bytes, which is a buffer limit of this driver, not a frame-size one.
 //
 // `rx_cap` may be up to kMaxReassembledLen (512) -- larger than one frame,
 // precisely so a reassembled response fits. Requires iso14443_4_activate() to

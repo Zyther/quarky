@@ -1651,17 +1651,49 @@ NfcaResult nfca_detect(Iso14443aTag *out, bool keep_active) {
 //       2^FWI => 2^(FWI+12)" -- this driver computes the same power-of-two in
 //       fc-cycles and divides by fc=13.56 MHz for a millisecond timeout,
 //       exactly as commented at fwiToFwtMs()'s definition below.
-//     - rfal_isoDep.cpp:815-829 rfalIsoDepFSxI2FSx(): the FSDI->FSD (max
-//       frame size) table. FSDI=7 -> FSD=128 (case RFAL_ISODEP_FSXI_128 ->
-//       RFAL_ISODEP_FSX_128 in that switch). This driver declares FSDI=7 in
-//       RATS (kRatsParam below), not the NFC-Forum-max FSDI=8/FSD=256: this
-//       file's own transceive()'s rx_cap parameter is a uint8_t (max 255), so
-//       FSD=256 could never actually be honoured if a compliant card ever
-//       sent a full-size frame -- FSD=128 is the largest declared value that
-//       cannot itself cause a real overflow, and is generously larger than
-//       every real APDU response this project's EMV feature module sends or
-//       expects to receive (SELECT/GPO/READ RECORD responses; see
-//       nfc_emv_read.cpp).
+//     - rfal_isoDep.cpp:815-838 rfalIsoDepFSxI2FSx(): the ONE FSxI->FSx (max
+//       frame size) table RFAL uses for BOTH directions -- the reader's own
+//       FSDI->FSD and the card's FSCI->FSC are the same function with the same
+//       table, called with a different integer. Its real values come from
+//       rfal_isoDep.h:152-165 (rfalIsoDepFSxI enum, FSXI_16=0 ... FSXI_4096=12)
+//       and rfal_isoDep.h:168-182 (rfalIsoDepFSx enum, FSX_16=16, FSX_24=24,
+//       FSX_32=32, FSX_40=40, FSX_48=48, FSX_64=64, FSX_96=96, FSX_128=128,
+//       FSX_256=256, then 512/1024/2048/4096 from ISO14443-3 Amd2 2012).
+//       rfal_isoDep.cpp:821 additionally CLAMPS the incoming integer before the
+//       switch -- `MIN(FSxI, RFAL_ISODEP_FSDI_MAX_NFC)` with
+//       RFAL_ISODEP_FSDI_MAX_NFC = 8 (:178, "Digital 2.0 14.6.1.9 & B7 & B8")
+//       in the default/NFC compliance mode -- so a card declaring FSCI 9..15
+//       (the ISO14443-3-Amd2 / RFU range) is treated as FSCI=8/FSC=256, not as
+//       an error. fsciToFsc() below is that exact table plus that exact clamp;
+//       see its own comment for why the clamp is also what this driver's
+//       255-byte transmit path can actually honour.
+//       * TRANSMIT direction (this driver's own declared FSD): this driver
+//         declares FSDI=7 in RATS (kRatsParam below), not the NFC-Forum-max
+//         FSDI=8/FSD=256, because this file's own transceive()'s rx_cap
+//         parameter is a uint8_t (max 255), so FSD=256 could never actually be
+//         honoured if a compliant card ever sent a full-size frame -- FSD=128
+//         is the largest declared value that cannot itself cause a real
+//         overflow, and is generously larger than every real APDU response
+//         this project's EMV feature module sends or expects to receive
+//         (SELECT/GPO/READ RECORD responses; see nfc_emv_read.cpp).
+//       * RECEIVE direction (the CARD's own declared FSC): rfal_isoDep.cpp:1074
+//         seeds `isoDepDev->info.FSxI = RFAL_ISODEP_FSXI_32` with the literal
+//         comment "FSC default value is 32 bytes ISO14443-A 5.2.3", and :1081-
+//         1083 overwrites it from the real ATS -- `isoDepDev->info.FSxI =
+//         (ATS.T0 & RFAL_ISODEP_ATS_T0_FSCI_MASK)` (mask 0x0F, rfal_isoDep.h:138)
+//         -- but ONLY inside the `if (ATS.TL > RFAL_ISODEP_ATS_MIN_LEN)` guard
+//         at :1080, i.e. only when a T0 byte is actually present. This driver's
+//         iso14443_4_activate() applies exactly that: default 32, overwritten
+//         from T0's low nibble when ats_len >= 2.
+//     - rfal_isoDep.cpp:844-853 rfalIsoDepGetMaxInfLen(): the real per-I-block
+//       INF budget, `gIsoDep.fsx - gIsoDep.hdrLen - ISODEP_CRC_LEN`, where
+//       hdrLen is RFAL_ISODEP_PCB_LEN=1 for a no-DID/no-NAD session (:466,
+//       :511) and ISODEP_CRC_LEN=RFAL_CRC_LEN=2 (:56). i.e. FSC counts the PCB
+//       AND the two CRC bytes, so usable INF per frame is FSC-3. The same
+//       arithmetic appears as an outright transmit reject at :362,
+//       `if (txBufLen > (gIsoDep.fsx - ISODEP_CRC_LEN)) return ERR_NOTSUPP;`
+//       where txBufLen already includes the PCB. This is the exact bound
+//       apdu_transceive()'s new PCD->PICC fragmenter uses.
 //     - rfal_isoDep.cpp:66-89 I-block PCB encoding: `ISODEP_PCB_IBLOCK=0x00`,
 //       `ISODEP_PCB_B2_BIT=0x02` (a MUST-be-1 bit on every I-block per
 //       ISO14443-4), `isoDep_PCBIBlock(bn) = IBLOCK | B2_BIT | (bn & 0x01)`
@@ -1689,6 +1721,51 @@ NfcaResult nfca_detect(Iso14443aTag *out, bool keep_active) {
 //       :107) -- i.e. 0xA2|bn, built from the ALREADY-TOGGLED block number.
 //       R-blocks carry no INF (:95 ISODEP_RBLOCK_INF_LEN = 0).
 //
+//     - PCD->PICC (reader-to-card) I-block chaining, added 2026-08-24. Two
+//       real RFAL layers, ported together because this driver has no state
+//       machine to split them across:
+//       * rfal_isoDep.cpp:1446-1470 rfalIsoDepApdu2IBLockParam(): the
+//         FRAGMENTER. `if ((apduParam.txBufLen - txPos) > rfalIsoDepGetMaxInfLen())
+//         { isTxChaining = true; txBufLen = rfalIsoDepGetMaxInfLen(); } else
+//         { isTxChaining = false; txBufLen = (apduParam.txBufLen - txPos); }`
+//         -- i.e. every fragment but the last is exactly one full max-INF
+//         block, the last carries the remainder, and the chaining FLAG is
+//         simply "is there more after this one". :1505-1519
+//         rfalIsoDepGetApduTransceiveStatus() is the loop around it: on each
+//         completed block, `gIsoDep.APDUTxPos += gIsoDep.txBufLen` then
+//         re-derive the next fragment and transmit again.
+//       * rfal_isoDep.cpp:342-344 isoDepTx(): the chaining BIT itself --
+//         `if ((gIsoDep.isTxChaining) && (isoDep_PCBisIBlock(computedPcb)))
+//         { computedPcb |= ISODEP_PCB_CHAINING_BIT; }`. Same 0x10 bit (:86)
+//         the PICC uses in the other direction; :251
+//         isoDep_PCBIBlockChaining(bn) is the composed form.
+//       * rfal_isoDep.cpp:651-664 the R(ACK) HANDSHAKE the card answers each
+//         non-final fragment with, inside rfalIsoDepGetTransceiveStatus()'s
+//         R-block branch: `if (isoDep_PCBisRACK(rxPCB))` -> `if (isoDep_GetBN(rxPCB)
+//         == gIsoDep.blockNumber)` (:652 -- the card echoes the SAME block
+//         number the fragment carried, NOT a toggled one) -> "Rule B - ACK
+//         with expected bn -> Increment block number" `gIsoDep.blockNumber =
+//         isoDep_PCBNextBN(...)` (:654) -> "R-ACK only allowed when PCD
+//         chaining" `if (!gIsoDep.isTxChaining) return ERR_PROTO;` (:656-658)
+//         -> "Rule 7 - Chaining transaction done, continue chaining"
+//         (:661-663). This is the mirror image of the PICC->PCD case above,
+//         and the toggle ORDERING is deliberately the other way round: for a
+//         PICC-chained I-block this driver toggles BEFORE building its own
+//         R(ACK); for a PCD-chained fragment it validates the card's R(ACK)
+//         against the UN-toggled number first and toggles only after.
+//       * rfal_isoDep.cpp:226-227 / :73-77 / :236 the R(ACK) VALIDITY test
+//         applied to that answer: `isoDep_PCBisRBlock(pcb)` is
+//         `(pcb & (0xC0|0x20|0x04|0x02)) == (0x80|0x20|0x02)` (xBLOCK_MASK |
+//         RB_VALID_MASK vs RBLOCK | RB_VALID_VAL -- B6 and B2 must be 1, B3
+//         must be 0), and `isoDep_PCBisACK(pcb)` is
+//         `(pcb & ISODEP_PCB_Rx_MASK(0x10)) == ISODEP_PCB_ACK(0x00)`.
+//       NOT ported from this path: RFAL's ":659-666 Rule 6 - R-ACK with wrong
+//       block number retransmit" (it re-enters ISODEP_ST_PCD_TX to resend the
+//       same fragment, up to maxRetriesI). This driver has no retransmission
+//       in either direction (see the R-block scope bullet below); a wrong-bn
+//       R(ACK) is reported as a failure instead, consistently with how a
+//       wrong-bn I-block is already treated on the receive side.
+//
 // SCOPE, stated honestly, same policy as nfca_detect()'s own header comment:
 //   * PICC->PCD I-block chaining IS handled, bounded in rounds
 //     (kMaxChainingRounds), in reassembled size (kMaxReassembledLen) and in
@@ -1700,11 +1777,30 @@ NfcaResult nfca_detect(Iso14443aTag *out, bool keep_active) {
 //     which the previous code silently accepted as if it were complete
 //     (the truncated TLV was then correctly refused by nfc_emv_read.cpp's
 //     own BER-TLV length-overflow guard, which is how the bug surfaced).
-//   * PCD->PICC chaining is still NOT implemented. Every C-APDU this
+//   * PCD->PICC I-block chaining IS handled too, as of 2026-08-24. It was
+//     NOT before, and the comment that used to sit here ("every C-APDU this
 //     project's EMV module sends is under 32 bytes and fits one frame by
-//     construction, so this direction has no real trigger; a command that
-//     needed it would simply be rejected by the tx_len bound rather than
-//     silently split.
+//     construction") stopped being true the moment the PDOL-based GET
+//     PROCESSING OPTIONS path landed the day before: a real Visa card's own
+//     PDOL was 27 bytes, producing a 62-byte I-block frame, and real PDOLs
+//     can legitimately be larger. Worse, the old code did not even reject
+//     such a frame -- it happily transmitted it in ONE I-block regardless of
+//     the card's own declared FSC, and a real Visa card and a real older
+//     Mastercard both answered with nothing at all (Xfer::kNoResponse, a
+//     genuine NRT timeout, reproduced three times in a row) -- which is what
+//     a compliant card does with a frame that violates the frame size it
+//     declared in its ATS. Hedged honestly: those two cards' actual FSCI
+//     values were never observed, BECAUSE the code discarded that nibble;
+//     what is certain is that the frame was sent without any size check at
+//     all. The root cause was that the card's FSC was never read:
+//     iso14443_4_activate() parsed T0 only for the TA/TB presence bits and
+//     discarded the FSCI nibble that carries it. Both halves are fixed
+//     together -- fsciToFsc() + s_card_fsc capture the real declared size,
+//     and apdu_transceive() fragments anything larger across chained
+//     I-blocks, consuming the card's R(ACK) between fragments. Bounded in
+//     fragment count (kMaxTxChainFragments) and sharing -- not extending --
+//     the same kMaxApduCallMs envelope the WTX and PICC-chaining paths
+//     already use.
 //   * No R-block RECEIVE handling, and no retransmission. This driver never
 //     resends an I-block after a NAK; a NAK-shaped or unrecognised PCB in the
 //     response is treated as failure, and RFAL's own "Rule 5 - PICC chaining
@@ -1747,6 +1843,75 @@ constexpr uint8_t kAtsT0TaPresent = 0x10U; // [REF] rfal_isoDep.h:135
 constexpr uint8_t kAtsT0TbPresent = 0x20U; // [REF] rfal_isoDep.h:136
 constexpr uint8_t kFwiDefault = 4U; // [REF] RFAL_ISODEP_FWI_DEFAULT
 
+// --- The CARD's own maximum receivable frame size (FSC) --------------------
+// [REF] rfal_isoDep.h:138 RFAL_ISODEP_ATS_T0_FSCI_MASK = 0x0F -- the low
+// nibble of the ATS's T0 byte is FSCI, the card's own declared max frame size
+// index. This project's SOURCES block above cited this exact field from day
+// one but never extracted it; not doing so is the real root cause of the
+// 2026-08-24 "62-byte GPO gets no answer at all" bug (see the scope bullet).
+constexpr uint8_t kAtsT0FsciMask = 0x0FU;
+// [REF] rfal_isoDep.cpp:1074 -- "FSC default value is 32 bytes ISO14443-A
+// 5.2.3", used when the ATS has no T0 byte at all (TL == 1).
+constexpr uint16_t kCardFscDefault = 32U;
+// [REF] rfal_isoDep.cpp:178 RFAL_ISODEP_FSDI_MAX_NFC = 8, applied at :821 as
+// `MIN(FSxI, RFAL_ISODEP_FSDI_MAX_NFC)` BEFORE the FSxI->FSx switch in the
+// default (non-EMVCo) compliance mode. So FSCI 9..15 -- the ISO14443-3 Amd2
+// 512/1024/2048/4096 range plus the genuinely-RFU codes 13..15 -- collapse to
+// FSCI=8/FSC=256 rather than being an error. This driver keeps that behavior
+// AND independently benefits from it: 256 is the largest FSC it could honour
+// anyway, since transceive()'s own tx_len parameter is a uint8_t and this
+// function's frame buffer is 255 bytes -- an FSC=256 frame is at most 256-2
+// (CRC) = 254 transmitted bytes, which fits exactly; anything larger could
+// not be transmitted at all.
+constexpr uint8_t kFsciMaxNfc = 8U;
+constexpr uint16_t kCardFscMax = 256U;
+
+// [REF] rfal_isoDep.cpp:815-838 rfalIsoDepFSxI2FSx() -- the same real table
+// RFAL uses for the reader's FSDI->FSD and the card's FSCI->FSC alike, with
+// its values from rfal_isoDep.h:152-165 (FSXI enum) and :168-182 (FSX enum).
+// Only the 0..8 rows are spelled out here because :821's clamp above means
+// nothing above 8 can ever reach the switch.
+uint16_t fsciToFsc(uint8_t fsci) {
+    const uint8_t fsi = (fsci > kFsciMaxNfc) ? kFsciMaxNfc : fsci;
+    switch (fsi) {
+        case 0U: return 16U;   // [REF] RFAL_ISODEP_FSXI_16   -> FSX_16
+        case 1U: return 24U;   // [REF] RFAL_ISODEP_FSXI_24   -> FSX_24
+        case 2U: return 32U;   // [REF] RFAL_ISODEP_FSXI_32   -> FSX_32
+        case 3U: return 40U;   // [REF] RFAL_ISODEP_FSXI_40   -> FSX_40
+        case 4U: return 48U;   // [REF] RFAL_ISODEP_FSXI_48   -> FSX_48
+        case 5U: return 64U;   // [REF] RFAL_ISODEP_FSXI_64   -> FSX_64
+        case 6U: return 96U;   // [REF] RFAL_ISODEP_FSXI_96   -> FSX_96
+        case 7U: return 128U;  // [REF] RFAL_ISODEP_FSXI_128  -> FSX_128
+        default: return kCardFscMax; // fsi == 8, [REF] FSXI_256 -> FSX_256
+    }
+}
+
+// [REF] rfal_isoDep.cpp:844-853 rfalIsoDepGetMaxInfLen(): usable INF per
+// I-block is `fsx - hdrLen - ISODEP_CRC_LEN`, with hdrLen = RFAL_ISODEP_PCB_LEN
+// = 1 for this driver's no-DID/no-NAD session (:466, :511) and CRC_LEN = 2
+// (:56). i.e. FSC counts the PCB byte AND the two CRC bytes the chip appends
+// in hardware, so only FSC-3 bytes of C-APDU fit in one frame. The smallest
+// legal FSC (16) therefore still leaves 13 usable bytes, so this never
+// underflows.
+constexpr uint16_t kIBlockOverhead = 1U /*PCB*/ + 2U /*CRC*/;
+
+// A SECOND, non-protocol ceiling on one transmitted frame, found while adding
+// PCD->PICC chaining (2026-08-24) and real for this build specifically:
+// writeFifoRaw() above pushes the whole frame in ONE Wire1 transaction, and
+// Arduino-ESP32's TwoWire::write() refuses a byte once its buffer is full --
+// `if (txLength >= bufferSize) { return 0; }`
+// (~/.platformio/packages/framework-arduinoespressif32/libraries/Wire/src/
+// Wire.cpp:558-560), with bufferSize defaulting to I2C_BUFFER_LENGTH = 128
+// (Wire.h:48-49; nothing in this firmware calls Wire1.setBufferSize()). One of
+// those 128 bytes is the FIFO-load command byte writeFifoRaw() sends first, so
+// at most 127 frame bytes (PCB + INF) can be queued -- 126 bytes of INF.
+// Without this cap the new fragmenter would happily build a 254-byte fragment
+// for a card that declares FSC=256 and writeFifoRaw() would fail the frame
+// outright (Xfer::kIo), which is a worse outcome than simply chaining one
+// extra time. Applied as MIN(FSC-3, 126); note it never binds for FSC <= 128,
+// i.e. for every card whose ATS this project has actually seen.
+constexpr size_t kMaxTxInfPerI2cFrame = 126U;
+
 constexpr uint8_t kPcbTypeMask   = 0xC0U;
 constexpr uint8_t kPcbIBlockType = 0x00U;
 constexpr uint8_t kPcbSBlockType = 0xC0U;
@@ -1770,6 +1935,40 @@ constexpr uint8_t kPcbChainingBit = 0x10U;
 // subtype is the ZERO value of the 0x10 R-block type bit ([REF] :106-108,
 // ISODEP_PCB_Rx_MASK=0x10, ACK=0x00, NAK=0x10), so nothing is OR'd in for it.
 constexpr uint8_t kPcbRBlockAckBase = 0xA2U;
+
+// --- PCD->PICC I-block chaining (added 2026-08-24, real-hardware driven) ---
+// Validity test for an R(ACK) RECEIVED from the card between transmit
+// fragments. [REF] rfal_isoDep.cpp:227 isoDep_PCBisRBlock(pcb) is
+// `(pcb & (ISODEP_PCB_xBLOCK_MASK|ISODEP_PCB_RB_VALID_MASK)) ==
+//  (ISODEP_PCB_RBLOCK|ISODEP_PCB_RB_VALID_VAL)`, which with :66-77's values
+// (xBLOCK_MASK=0xC0, RB_VALID_MASK=B6|B3|B2=0x26, RBLOCK=0x80,
+// RB_VALID_VAL=B6|B2=0x22) is exactly `(pcb & 0xE6) == 0xA2`; and :236
+// isoDep_PCBisACK(pcb) is `(pcb & ISODEP_PCB_Rx_MASK) == ISODEP_PCB_ACK`
+// with Rx_MASK=0x10 (:106) and ACK=0x00 (:107). Note 0x10 is numerically the
+// same bit as kPcbChainingBit above but a different field -- chaining on an
+// I-block, ACK/NAK on an R-block -- so it gets its own name rather than
+// reusing that one.
+constexpr uint8_t kPcbRBlockValidMask = 0xE6U;
+constexpr uint8_t kPcbRBlockValidVal  = 0xA2U;
+constexpr uint8_t kPcbRTypeMask       = 0x10U; // 0 = ACK, 0x10 = NAK
+constexpr uint8_t kPcbRAck             = 0x00U;
+
+// Bound on how many I-block fragments ONE outgoing C-APDU may be split into.
+// Derived, not picked: this function already refuses any tx_len above 254
+// (transceive()'s tx_len parameter is a uint8_t and one PCB byte precedes the
+// APDU), and the smallest FSC any ISO14443-4 card may declare is 16, leaving
+// 16-3 = 13 usable INF bytes per frame -- so ceil(254/13) = 20 is the largest
+// fragment count the driver's OWN existing bounds can ever produce. Setting
+// the cap there means it never refuses a command the tx_len bound already
+// admitted (a lower, arbitrary-looking number would), while still being a
+// hard, finite loop bound. The real wall-clock protection is the shared
+// call_deadline below, which is checked before every additional fragment
+// exactly as it already is before every WTX ack and every receive-chaining
+// R(ACK) -- so 20 fragments cannot cost 20 full per-exchange timeouts. Real
+// traffic is nowhere near this: the largest command nfc_emv_read.cpp can
+// build is a 128-byte PDOL GPO (kMaxPdolDataLen=120), which is 5 fragments
+// against a typical FSC=32 card and 1 against an FSC=128+ one.
+constexpr uint8_t kMaxTxChainFragments = 20U;
 
 // Bound 1 of 2 on chaining reassembly: how many R(ACK)/fragment rounds this
 // driver will run for ONE apdu_transceive() call. 8 is chosen against the
@@ -1872,6 +2071,15 @@ uint16_t msToNrtSteps64fc(uint32_t ms) {
 }
 
 uint8_t s_pcb_block_number = 0U;
+// The CARD's own declared max receivable frame size, from its ATS T0's FSCI
+// nibble via fsciToFsc(). Already clamped to [16, kCardFscMax] by that
+// function's own table + :821 clamp, so apdu_transceive() can subtract
+// kIBlockOverhead from it without underflow and the result always fits its
+// 255-byte frame buffer (a separate, smaller per-transaction I2C ceiling also
+// applies -- see kMaxTxInfPerI2cFrame). Reset to the ISO14443-A 5.2.3 default
+// (32) at the start of every activation so a previous card's larger FSC can
+// never be applied to a new one.
+uint16_t s_card_fsc = kCardFscDefault;
 uint32_t s_apdu_timeout_ms = 0U;
 uint16_t s_apdu_nrt_steps = 0U; // set alongside s_apdu_timeout_ms, both
                                 // derived from the same FWI value
@@ -1881,7 +2089,8 @@ uint16_t s_apdu_nrt_steps = 0U; // set alongside s_apdu_timeout_ms, both
 // module can export the card's real ISO14443-4 interface bytes -- Phase 3
 // Task 13's Flipper ".nfc" exporter writes T0/TA(1)/TB(1)/TC(1)/T1...Tk
 // straight out of this, and there is nowhere else in this driver those bytes
-// survive (activate() parses only TB's FWI nibble and discards the rest).
+// survive (activate() itself keeps only T0's FSCI nibble and TB's FWI nibble,
+// as s_card_fsc and s_apdu_timeout_ms, and discards the rest).
 // Cleared at the start of every activation so a stale ATS from a previous
 // card can never be exported against a new one.
 uint8_t s_ats[kAtsMaxLen] = {0};
@@ -1895,6 +2104,7 @@ bool iso14443_4_activate() {
     }
     s_pcb_block_number = 0U;
     s_ats_len = 0U; // never export a previous card's ATS -- see s_ats above
+    s_card_fsc = kCardFscDefault; // refined below from the real ATS's T0/FSCI
     s_apdu_timeout_ms = fwiToFwtMs(kFwiDefault); // refined below once the
                                                  // real ATS is read, if it
                                                  // says otherwise
@@ -1942,8 +2152,30 @@ bool iso14443_4_activate() {
     s_ats_len = ats_len;
 
     uint8_t fwi = kFwiDefault;
+    uint8_t fsci = 0U;
+    bool has_t0 = false;
     if (ats_len >= 2U) {
         const uint8_t t0 = ats[1];
+        // [REF] rfal_isoDep.cpp:1080-1083: FSCI is read from T0's low nibble,
+        // and ONLY when a T0 is actually present (RFAL guards the whole
+        // optional-field block on `ATS.TL > RFAL_ISODEP_ATS_MIN_LEN`, which is
+        // exactly this `ats_len >= 2` -- TL counts itself). Without a T0 the
+        // ISO14443-A 5.2.3 default of 32 set above stands.
+        //
+        // This is the field the 2026-08-24 no-response bug hinged on. Stated
+        // honestly: the failing Visa card's actual FSCI has never been read
+        // back -- the pre-fix code discarded this nibble, which is precisely
+        // why nobody could see it, and the log line at the end of this
+        // function is what will finally show it. What IS certain is that the
+        // code sent a 62-byte single-frame GPO without ever comparing it to
+        // any declared limit, and that a frame exceeding the card's declared
+        // FSC being silently dropped (no answer at all, exactly the observed
+        // Xfer::kNoResponse) is the standard-compliant behavior for a card in
+        // that situation. Any FSCI of 4 or below (FSC <= 48) makes that the
+        // literal explanation.
+        fsci = static_cast<uint8_t>(t0 & kAtsT0FsciMask);
+        has_t0 = true;
+        s_card_fsc = fsciToFsc(fsci);
         size_t idx = 2U;
         if ((t0 & kAtsT0TaPresent) != 0U) {
             idx++; // TA present, skip it -- not needed for this task
@@ -1963,9 +2195,17 @@ bool iso14443_4_activate() {
     s_apdu_nrt_steps = msToNrtSteps64fc(s_apdu_timeout_ms);
 
     Serial.printf("quarky-tab5: [st25r3916] ISO14443-4 activated: ATS len=%u "
-                  "FWI=%u -> per-exchange timeout %u ms\n",
-                  (unsigned)ats_len, (unsigned)fwi, (unsigned)s_apdu_timeout_ms);
+                  "FWI=%u -> per-exchange timeout %u ms; FSCI=%s%u -> card FSC=%u "
+                  "(FSC alone allows %u C-APDU bytes per I-block)\n",
+                  (unsigned)ats_len, (unsigned)fwi, (unsigned)s_apdu_timeout_ms,
+                  has_t0 ? "" : "absent/default ", (unsigned)fsci,
+                  (unsigned)s_card_fsc,
+                  (unsigned)(s_card_fsc - kIBlockOverhead));
     return true;
+}
+
+uint16_t iso14443_4_get_card_fsc() {
+    return s_card_fsc;
 }
 
 size_t iso14443_4_get_ats(uint8_t *out, size_t cap) {
@@ -1986,63 +2226,58 @@ bool apdu_transceive(const uint8_t *tx, size_t tx_len,
         return false;
     }
     // One PCB byte precedes the APDU; transceive()'s own tx_len parameter is
-    // a uint8_t, so this driver's usable APDU size tops out at 254 bytes --
-    // far more than any command nfc_emv_read.cpp sends (all under 32 bytes).
-    // rx_cap is NOT capped at 255 any more (it was, before PICC->PCD chaining
-    // existed, because one frame was one response): a reassembled R-APDU can
-    // legitimately be longer than a single frame. It is capped at
-    // kMaxReassembledLen instead -- see that constant's own comment.
+    // a uint8_t, so this driver's usable APDU size tops out at 254 bytes.
+    // That is now a real ceiling on a real feature rather than a theoretical
+    // one: since the PDOL-based GPO path landed (2026-08-23) a C-APDU can be
+    // ~130 bytes (nfc_emv_read.cpp's kMaxPdolDataLen=120 plus header/Lc/Le),
+    // which is why PCD->PICC chaining below now exists. rx_cap is NOT capped
+    // at 255 (it was, before PICC->PCD chaining existed, because one frame was
+    // one response): a reassembled R-APDU can legitimately be longer than a
+    // single frame. It is capped at kMaxReassembledLen instead -- see that
+    // constant's own comment.
     if (tx_len > 254U || rx_cap > kMaxReassembledLen) {
         return false;
     }
 
-    // Whole-call envelope shared by the WTX and chaining rounds below; see
-    // kMaxApduCallMs for why this is equal to (not added to) the worst case
-    // the WTX path alone already had.
+    // Whole-call envelope shared by the WTX rounds and BOTH chaining
+    // directions below; see kMaxApduCallMs for why this is equal to (not
+    // added to) the worst case the WTX path alone already had. The new
+    // PCD->PICC transmit-chaining path deliberately does NOT get a budget of
+    // its own -- it checks this same deadline before every additional
+    // fragment, exactly as the receive path already does before every R(ACK).
     const uint32_t call_deadline = millis() + kMaxApduCallMs;
 
     uint8_t frame[255];
-    frame[0] = static_cast<uint8_t>(kPcbB2Bit | (s_pcb_block_number & 0x01U));
-    memcpy(&frame[1], tx, tx_len);
-    const uint8_t frame_len = static_cast<uint8_t>(tx_len + 1U);
-
     uint8_t resp[255];
     uint8_t resp_len = 0;
-    // nrt_steps=s_apdu_nrt_steps: real bug found & fixed via real-hardware
-    // testing (2026-08-23) -- this call used to omit the nrt_steps argument
-    // entirely, silently defaulting to the anticollision-tuned ~165us NRT
-    // regardless of s_apdu_timeout_ms already being computed for exactly
-    // this purpose. See s_apdu_nrt_steps's own declaration comment.
-    Xfer xr = transceive(/*short_cmd=*/0U, frame, frame_len, /*crc_tx=*/true,
-                         /*antcl=*/false, /*crc_rx=*/true,
-                         resp, sizeof(resp), &resp_len,
-                         millis() + s_apdu_timeout_ms, s_apdu_nrt_steps);
-    Serial.printf("quarky-tab5: [st25r3916] DIAG apdu_transceive: sent frame_len=%u "
-                  "pcb=0x%02X tx[0..4]=%02X %02X %02X %02X -- xfer=%u resp_len=%u\n",
-                  (unsigned)frame_len, frame[0], tx_len > 0 ? tx[0] : 0,
-                  tx_len > 1 ? tx[1] : 0, tx_len > 2 ? tx[2] : 0, tx_len > 3 ? tx[3] : 0,
-                  (unsigned)xr, (unsigned)resp_len);
-    if (resp_len > 0) {
-        char hexbuf[3 * 32 + 1] = {0};
-        const uint8_t dump_len = resp_len < 32U ? resp_len : 32U;
-        for (uint8_t i = 0; i < dump_len; i++) {
-            snprintf(&hexbuf[i * 3], 4, "%02X ", resp[i]);
+    Xfer xr = Xfer::kNoResponse;
+
+    // Extended DIAG instrumentation (2026-08-23's real-hardware debugging aid,
+    // still in active use) -- now called after EVERY exchange, including the
+    // new transmit-chaining ones, not only the first.
+    auto diag_dump_resp = [&]() {
+        if (resp_len > 0) {
+            char hexbuf[3 * 32 + 1] = {0};
+            const uint8_t dump_len = resp_len < 32U ? resp_len : 32U;
+            for (uint8_t i = 0; i < dump_len; i++) {
+                snprintf(&hexbuf[i * 3], 4, "%02X ", resp[i]);
+            }
+            Serial.printf("quarky-tab5: [st25r3916] DIAG apdu_transceive: resp bytes: %s\n",
+                          hexbuf);
         }
-        Serial.printf("quarky-tab5: [st25r3916] DIAG apdu_transceive: resp bytes: %s\n",
-                      hexbuf);
-    }
+    };
 
-    // Reassembly cursor. Every accepted fragment's INF field (the frame minus
-    // its own PCB byte) is appended here; for the overwhelmingly common
-    // single-frame case the loop below runs exactly once and this behaves
-    // identically to the pre-chaining code.
-    size_t assembled = 0;
-
-    for (uint8_t chain_round = 0; ; chain_round++) {
-        // --- S(WTX) sub-loop, unchanged in behavior, now also bounded by the
-        // whole-call deadline. A card may request a waiting-time extension
-        // before ANY fragment, not just the first, so this lives inside the
-        // chaining loop.
+    // S(WTX) handling, extracted verbatim from the receive loop it used to be
+    // inlined in so BOTH directions can use it. A card may ask for a
+    // waiting-time extension at ANY point in an exchange -- [REF]
+    // rfal_isoDep.cpp:618-624 handles S(WTX) generically, ahead of the R-block
+    // and I-block branches alike -- so it can arrive while this driver is
+    // waiting for a transmit-chaining R(ACK) just as it can before a response
+    // I-block. Returns false when the card's answer is unusable or the WTX/
+    // whole-call bounds are exhausted; true when `resp` holds a non-S(WTX)
+    // block for the caller to interpret. Bounds are unchanged from before the
+    // extraction: kMaxWtxRounds per wait, plus the shared call_deadline.
+    auto consume_wtx = [&]() -> bool {
         for (uint8_t wtx_round = 0; ; wtx_round++) {
             if (xr != Xfer::kOk || resp_len == 0) {
                 Serial.println("quarky-tab5: [st25r3916] DIAG apdu_transceive: giving up -- "
@@ -2053,7 +2288,7 @@ bool apdu_transceive(const uint8_t *tx, size_t tx_len,
             const bool is_s_wtx = ((p & kPcbTypeMask) == kPcbSBlockType) &&
                                   ((p & kPcbSTypeMask) == kPcbWtxType);
             if (!is_s_wtx) {
-                break;
+                return true;
             }
             // [REF] rfal_isoDep.cpp:415-421: the WTX ack echoes the SAME PCB
             // and the SAME one-byte power-multiplier INF field the request
@@ -2070,6 +2305,143 @@ bool apdu_transceive(const uint8_t *tx, size_t tx_len,
                             /*antcl=*/false, /*crc_rx=*/true,
                             resp, sizeof(resp), &resp_len,
                             millis() + s_apdu_timeout_ms, s_apdu_nrt_steps);
+            diag_dump_resp();
+        }
+    };
+
+    // --- PCD->PICC transmit, fragmented across chained I-blocks if the card's
+    // own declared FSC demands it (added 2026-08-24; see this section's
+    // SOURCES block for the RFAL citations). [REF] rfal_isoDep.cpp:844-853
+    // rfalIsoDepGetMaxInfLen(): FSC counts the PCB byte and the 2 CRC bytes,
+    // so a single I-block can carry only FSC-3 bytes of C-APDU. Every real
+    // command sent before 2026-08-23 was small enough that this never
+    // mattered; a PDOL-based GPO is not.
+    const size_t fsc_inf = static_cast<size_t>(s_card_fsc) - kIBlockOverhead;
+    // ...and, independently, whatever one Wire1 transaction can actually carry
+    // -- see kMaxTxInfPerI2cFrame. Both are hard limits, so the smaller wins.
+    const size_t max_inf = (fsc_inf < kMaxTxInfPerI2cFrame) ? fsc_inf
+                                                            : kMaxTxInfPerI2cFrame;
+    const size_t total_frags = (tx_len + max_inf - 1U) / max_inf;
+    if (total_frags > kMaxTxChainFragments) {
+        Serial.printf("quarky-tab5: [st25r3916] apdu_transceive: C-APDU of %u bytes "
+                      "would need %u I-block fragments at card FSC=%u -- over the "
+                      "%u-fragment bound, refusing\n",
+                      (unsigned)tx_len, (unsigned)total_frags, (unsigned)s_card_fsc,
+                      (unsigned)kMaxTxChainFragments);
+        return false;
+    }
+    if (total_frags > 1U) {
+        Serial.printf("quarky-tab5: [st25r3916] DIAG apdu_transceive: C-APDU is %u bytes "
+                      "but card FSC=%u (and this bus) allow only %u per I-block -- "
+                      "PCD->PICC chaining across %u fragments\n",
+                      (unsigned)tx_len, (unsigned)s_card_fsc, (unsigned)max_inf,
+                      (unsigned)total_frags);
+    }
+
+    size_t tx_pos = 0;
+    for (uint8_t frag = 0; frag < static_cast<uint8_t>(total_frags); frag++) {
+        const bool is_last = (static_cast<size_t>(frag) + 1U == total_frags);
+        const size_t inf_n = is_last ? (tx_len - tx_pos) : max_inf;
+
+        // [REF] rfal_isoDep.cpp:342-344 isoDepTx(): the chaining bit is OR'd
+        // into the I-block PCB for every fragment that is not the last, and
+        // only for I-blocks. :251 isoDep_PCBIBlockChaining(bn) is this exact
+        // composition. The block number is NOT toggled per fragment here --
+        // it is toggled only once the card's R(ACK) for that fragment has been
+        // validated, below ([REF] :652-654's ordering).
+        frame[0] = static_cast<uint8_t>(kPcbB2Bit | (s_pcb_block_number & 0x01U) |
+                                        (is_last ? 0U : kPcbChainingBit));
+        memcpy(&frame[1], &tx[tx_pos], inf_n);
+        const uint8_t frame_len = static_cast<uint8_t>(inf_n + 1U);
+
+        // nrt_steps=s_apdu_nrt_steps: real bug found & fixed via real-hardware
+        // testing (2026-08-23) -- this call used to omit the nrt_steps argument
+        // entirely, silently defaulting to the anticollision-tuned ~165us NRT
+        // regardless of s_apdu_timeout_ms already being computed for exactly
+        // this purpose. See s_apdu_nrt_steps's own declaration comment.
+        xr = transceive(/*short_cmd=*/0U, frame, frame_len, /*crc_tx=*/true,
+                        /*antcl=*/false, /*crc_rx=*/true,
+                        resp, sizeof(resp), &resp_len,
+                        millis() + s_apdu_timeout_ms, s_apdu_nrt_steps);
+        Serial.printf("quarky-tab5: [st25r3916] DIAG apdu_transceive: sent frame_len=%u "
+                      "pcb=0x%02X frag=%u/%u inf=%u tx[0..4]=%02X %02X %02X %02X "
+                      "-- xfer=%u resp_len=%u\n",
+                      (unsigned)frame_len, frame[0], (unsigned)(frag + 1),
+                      (unsigned)total_frags, (unsigned)inf_n,
+                      inf_n > 0 ? tx[tx_pos] : 0,
+                      inf_n > 1 ? tx[tx_pos + 1] : 0,
+                      inf_n > 2 ? tx[tx_pos + 2] : 0,
+                      inf_n > 3 ? tx[tx_pos + 3] : 0,
+                      (unsigned)xr, (unsigned)resp_len);
+        diag_dump_resp();
+
+        if (is_last) {
+            // The card's answer to the FINAL fragment is the R-APDU itself --
+            // fall through to the receive/reassembly loop below with `xr`,
+            // `resp` and `resp_len` exactly as the pre-chaining code left
+            // them, so the (real-hardware-verified) PICC->PCD path is
+            // unchanged and composes with this one: a single call may now
+            // both send a chained command AND receive a chained response.
+            break;
+        }
+        tx_pos += inf_n;
+
+        // A non-final fragment is answered with an R(ACK), not with data
+        // ([REF] rfal_isoDep.cpp:651-663 "Rule 7 - Chaining transaction done,
+        // continue chaining"). S(WTX) may legally arrive first.
+        if (!consume_wtx()) {
+            return false;
+        }
+        const uint8_t ack_pcb = resp[0];
+        // [REF] rfal_isoDep.cpp:227 isoDep_PCBisRBlock + :236 isoDep_PCBisACK,
+        // expanded into kPcbRBlockValidMask/Val and kPcbRTypeMask/kPcbRAck --
+        // see their declarations. A NAK, an I-block, or any other block here
+        // is a protocol failure this driver does not try to recover from.
+        const bool is_r_ack = ((ack_pcb & kPcbRBlockValidMask) == kPcbRBlockValidVal) &&
+                              ((ack_pcb & kPcbRTypeMask) == kPcbRAck);
+        // [REF] rfal_isoDep.cpp:652: the R(ACK) echoes the block number the
+        // fragment carried -- compared BEFORE the toggle, unlike the
+        // PICC->PCD case which toggles first and then builds its own R(ACK).
+        const bool ack_bn_matches = (ack_pcb & 0x01U) == (s_pcb_block_number & 0x01U);
+        if (!is_r_ack || !ack_bn_matches) {
+            Serial.printf("quarky-tab5: [st25r3916] apdu_transceive: PCD chaining -- "
+                          "fragment %u/%u was not acknowledged with a valid R(ACK) "
+                          "(pcb=0x%02X is_r_ack=%u bn_matches=%u expected_bn=%u)\n",
+                          (unsigned)(frag + 1), (unsigned)total_frags, ack_pcb,
+                          (unsigned)is_r_ack, (unsigned)ack_bn_matches,
+                          (unsigned)(s_pcb_block_number & 0x01U));
+            return false;
+        }
+        // [REF] rfal_isoDep.cpp:654 "Rule B - ACK with expected bn -> Increment
+        // block number".
+        s_pcb_block_number ^= 1U;
+        Serial.printf("quarky-tab5: [st25r3916] DIAG apdu_transceive: PCD chaining -- "
+                      "fragment %u/%u acknowledged (R(ACK)=0x%02X), next bn=%u\n",
+                      (unsigned)(frag + 1), (unsigned)total_frags, ack_pcb,
+                      (unsigned)s_pcb_block_number);
+
+        if (static_cast<int32_t>(millis() - call_deadline) >= 0) {
+            Serial.printf("quarky-tab5: [st25r3916] apdu_transceive: PCD chaining "
+                          "exhausted the call budget after fragment %u/%u -- giving up\n",
+                          (unsigned)(frag + 1), (unsigned)total_frags);
+            return false;
+        }
+    }
+
+    // Reassembly cursor. Every accepted fragment's INF field (the frame minus
+    // its own PCB byte) is appended here; for the overwhelmingly common
+    // single-frame case the loop below runs exactly once and this behaves
+    // identically to the pre-chaining code.
+    size_t assembled = 0;
+
+    for (uint8_t chain_round = 0; ; chain_round++) {
+        // --- S(WTX) sub-handling, unchanged in behavior and bounds, now
+        // living in the consume_wtx() helper above so the transmit-chaining
+        // path can share it. A card may request a waiting-time extension
+        // before ANY fragment, not just the first, so this stays inside the
+        // chaining loop.
+        if (!consume_wtx()) {
+            return false;
         }
 
         const uint8_t pcb = resp[0];
@@ -2154,6 +2526,7 @@ bool apdu_transceive(const uint8_t *tx, size_t tx_len,
                         /*antcl=*/false, /*crc_rx=*/true,
                         resp, sizeof(resp), &resp_len,
                         millis() + s_apdu_timeout_ms, s_apdu_nrt_steps);
+        diag_dump_resp();
     }
 
     if (rx_len != nullptr) {

@@ -406,6 +406,17 @@ constexpr size_t kPdolDefaultCount = sizeof(kPdolDefaults) / sizeof(kPdolDefault
 // Both bounds are defensive caps against a malformed or hostile 9F38, not
 // limits any real card approaches -- same discipline as the AFL cap below and
 // as st25r3916_driver.cpp's own chaining bounds.
+//
+// Re-confirmed unchanged on 2026-08-24, when the driver gained PCD->PICC
+// I-block chaining and a command larger than one frame became transmittable
+// for the first time. These two numbers were never transmission limits, so
+// they do not move: 120 data bytes is a 128-byte command, comfortably under
+// St25r3916::apdu_transceive()'s own 254-byte tx_len ceiling (which is a
+// buffer limit, not a frame limit), and the driver now fragments whatever it
+// is handed across as many chained I-blocks as the card's declared FSC needs
+// -- e.g. 5 fragments against a typical FSC=32 card, 1 against an FSC=128 one.
+// What the caps still do is exactly what they always did: refuse a 9F38 whose
+// requested lengths are absurd before any of it reaches the card.
 constexpr size_t kMaxPdolEntries = 24;
 constexpr size_t kMaxPdolDataLen = 120; // keeps Lc (= data + 2) < 128, so the
                                         // tag-83 length stays single-byte
