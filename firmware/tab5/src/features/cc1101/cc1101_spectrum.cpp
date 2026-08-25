@@ -42,9 +42,15 @@ static lv_obj_t *build_screen() {
     lv_obj_t *screen = build_sub_screen("CC1101 Spectrum", &content);
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
 
+    // %d, not %f: this project's lv_conf.h has LV_USE_FLOAT=0, so LVGL's own
+    // lightweight lv_snprintf() does not implement float conversion at all --
+    // a %f here silently prints the literal letter "f" instead of a number
+    // (real finding, project owner caught it on real hardware 2026-08-25).
+    // Every frequency value on this screen is a whole MHz, so integer
+    // formatting loses nothing.
     lv_obj_t *hdr = lv_label_create(content);
-    lv_label_set_text_fmt(hdr, "%.0f - %.0f MHz (module's full documented range)",
-                           (double)kFreqStartMhz, (double)kFreqEndMhz);
+    lv_label_set_text_fmt(hdr, "%d - %d MHz (module's full documented range)",
+                           (int)kFreqStartMhz, (int)kFreqEndMhz);
 
     s_chart = lv_chart_create(content);
     lv_obj_set_size(s_chart, LV_PCT(98), LV_PCT(85));
@@ -74,11 +80,11 @@ static lv_obj_t *build_screen() {
     lv_obj_set_style_bg_opa(freq_row, LV_OPA_TRANSP, 0);
 
     lv_obj_t *lbl_start = lv_label_create(freq_row);
-    lv_label_set_text_fmt(lbl_start, "%.0f", (double)kFreqStartMhz);
+    lv_label_set_text_fmt(lbl_start, "%d", (int)kFreqStartMhz);
     lv_obj_t *lbl_mid = lv_label_create(freq_row);
-    lv_label_set_text_fmt(lbl_mid, "%.0f", (double)((kFreqStartMhz + kFreqEndMhz) / 2.0f));
+    lv_label_set_text_fmt(lbl_mid, "%d", (int)((kFreqStartMhz + kFreqEndMhz) / 2.0f));
     lv_obj_t *lbl_end = lv_label_create(freq_row);
-    lv_label_set_text_fmt(lbl_end, "%.0f", (double)kFreqEndMhz);
+    lv_label_set_text_fmt(lbl_end, "%d", (int)kFreqEndMhz);
 
     lv_obj_add_event_cb(s_chart, [](lv_event_t *) {
         s_active = false;
