@@ -18,12 +18,14 @@ static const struct { Category cat; const char *label; } kCategoryTiles[] = {
     {Category::NFC, "NFC"},
     {Category::RF433, "RF433"},
     {Category::IR, "IR"},
-    // Sub-GHz / NRF24 / LoRa tiles are deliberately absent: those categories
-    // belong to Phases 5 and 6 (Cardputer-ADV CC1101/nRF24, GNSS/SX1262) and
-    // no module registers under them yet. They were added here by Phase 3
-    // Task 4 and removed in its fix round as out-of-scope. Add each one back
-    // in the phase that ships its first module, so the launcher never shows a
-    // category the firmware cannot do anything with.
+    // Phase 10 (2026-08-25): Sub-GHz now has real modules (Tab5-native
+    // CC1101 via M-Bus -- Scan, Spectrum, Bruteforce, Jammer, KeeLoq all
+    // register under Category::SUBGHZ), so it comes off the "deliberately
+    // absent" list below. NRF24 / LoRa remain absent -- those still belong
+    // to Phases 5/6 (Cardputer-ADV/GNSS) and no module registers under them
+    // yet; add each back in the phase that ships its first module, so the
+    // launcher never shows a category the firmware cannot do anything with.
+    {Category::SUBGHZ, "Sub-GHz"},
 };
 
 // The category screen's menu-bar title. Same table as the launcher tiles, so
