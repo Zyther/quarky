@@ -55,6 +55,31 @@ static lv_obj_t *build_screen() {
     s_series = lv_chart_add_series(s_chart, lv_palette_main(LV_PALETTE_RED), LV_CHART_AXIS_PRIMARY_Y);
     for (int i = 0; i < kNumBins; i++) lv_chart_set_next_value(s_chart, s_series, -100);
 
+    // Start/mid/end frequency labels under the chart, project owner's own
+    // request (2026-08-25) -- the header text above already states the
+    // full range as one sentence, but a reader scanning the chart itself
+    // has no way to tell which bar is which frequency without these.
+    // Plain 3-way flex row (space-between), not pixel-precise x-axis tick
+    // labels aligned to individual bars -- this chart has no built-in LVGL
+    // tick-label feature for LV_CHART_TYPE_BAR, and 71 real per-bin labels
+    // would be illegible at this width regardless; three anchor points
+    // (start/mid/end) is what was actually asked for.
+    lv_obj_t *freq_row = lv_obj_create(content);
+    lv_obj_set_width(freq_row, LV_PCT(98));
+    lv_obj_set_height(freq_row, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(freq_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(freq_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(freq_row, 0, 0);
+    lv_obj_set_style_border_width(freq_row, 0, 0);
+    lv_obj_set_style_bg_opa(freq_row, LV_OPA_TRANSP, 0);
+
+    lv_obj_t *lbl_start = lv_label_create(freq_row);
+    lv_label_set_text_fmt(lbl_start, "%.0f", (double)kFreqStartMhz);
+    lv_obj_t *lbl_mid = lv_label_create(freq_row);
+    lv_label_set_text_fmt(lbl_mid, "%.0f", (double)((kFreqStartMhz + kFreqEndMhz) / 2.0f));
+    lv_obj_t *lbl_end = lv_label_create(freq_row);
+    lv_label_set_text_fmt(lbl_end, "%.0f", (double)kFreqEndMhz);
+
     lv_obj_add_event_cb(s_chart, [](lv_event_t *) {
         s_active = false;
         s_chart = nullptr;
