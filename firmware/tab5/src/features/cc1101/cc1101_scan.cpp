@@ -134,7 +134,17 @@ static bool s_hotcold_active = false; // hot/cold RSSI mode running (mutually
 // subghz_scan.cpp:54-58), trimmed to the module's documented 855-925MHz
 // range (spec Section 5 -- do not hard-code the owner's narrower intended
 // 868-925MHz tuning as a hard limit).
-static const float kCommonFreqsMhz[] = {868.00f, 868.35f, 915.00f, 925.00f};
+// 315/433.92 added 2026-08-25 (project owner request) -- both are real,
+// valid CC1101 sub-bands per RadioLib's own CC1101::setFrequency() range
+// check (300-348MHz and 387-464MHz respectively, straight from the TI
+// datasheet's valid VCO/PLL configurations -- confirmed by reading
+// RadioLib/src/modules/CC1101/CC1101.cpp directly, not assumed). 433.92MHz
+// specifically matches this project's own already-established RF433 center
+// frequency (Rf433SubFormat::kFrequencyHz). Real hardware caveat, not this
+// list's concern to enforce: the M5Stack module's own antenna/PA matching
+// network is built for 855-925MHz -- 315/433.92 will tune and transmit,
+// but with degraded range/sensitivity versus the module's intended band.
+static const float kCommonFreqsMhz[] = {315.00f, 433.92f, 868.00f, 868.35f, 915.00f, 925.00f};
 constexpr int kCommonFreqCount = sizeof(kCommonFreqsMhz) / sizeof(kCommonFreqsMhz[0]);
 static int s_freq_idx = 0;
 

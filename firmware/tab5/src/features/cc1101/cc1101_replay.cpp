@@ -45,17 +45,42 @@ void set_failure(const char *reason) {
     s_state = State::kFailed;
 }
 
+// Real crash found on real hardware, 2026-08-25: replaying a truncated
+// (kMaxEdgesPerSignal = 8192) capture triggered a task_wdt abort --
+// "IDLE0 (CPU 0)" did not reset in time while "cc1101_tx" was the only task
+// running on that core. Root cause: unlike rf433_replay.cpp's own real
+// measured worst case (~509ms for 512 edges, comfortably under the 5s
+// watchdog window), this loop never yields at all across up to 8192 edges,
+// and delayMicroseconds() busy-waits rather than yielding -- a long enough
+// truncated signal keeps this task's pinned core continuously busy for
+// several real seconds, starving that core's IDLE task (which IS
+// watchdog-subscribed by default, unlike this task itself) past its
+// timeout. Fixed with a periodic vTaskDelay(1) paced by ELAPSED TIME, not
+// edge count, so it fires the same way regardless of a given signal's real
+// inter-edge gap distribution: one ~1-2ms scheduler-tick pause inserted
+// between two pulse transitions every kYieldIntervalUs, letting IDLE0 run
+// and feed the watchdog. This does introduce a real, one-time timing
+// anomaly at each yield point -- accepted as a real, bounded, rare cost
+// against an unconditional crash on any long replay.
+constexpr uint32_t kYieldIntervalUs = 500000; // 500ms -- 10x margin under a
+                                               // typical 5s task_wdt timeout
+
 void transmit_task(void *arg) {
     TransmitArgs *args = static_cast<TransmitArgs *>(arg);
     int gdo0 = Cc1101Hw::gdo0_pin();
 
     if (args->edge_count > 0) {
         digitalWrite(gdo0, args->edges[0].level ? HIGH : LOW);
+        uint32_t last_yield_us = micros();
         for (size_t i = 1; i < args->edge_count; i++) {
             uint32_t delta = args->edges[i].timestamp_us - args->edges[i - 1].timestamp_us;
             if (delta > kMaxSingleDelayUs) delta = kMaxSingleDelayUs;
             delayMicroseconds(delta);
             digitalWrite(gdo0, args->edges[i].level ? HIGH : LOW);
+            if (micros() - last_yield_us > kYieldIntervalUs) {
+                vTaskDelay(1);
+                last_yield_us = micros();
+            }
         }
     }
     digitalWrite(gdo0, LOW);
