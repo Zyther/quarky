@@ -7,14 +7,34 @@ namespace Cc1101Record {
 const char kPresetName[] = "FuriHalSubGhzPresetOok270Async";
 
 namespace {
-// Same sizing/allocation reasoning as rf433_sub_format.cpp's
-// kMaxEncodedTextBytes/build_signed_durations() lazy `new` buffers: plain
-// `new` on first call routes to PSRAM automatically on real hardware
+// RAISED 2026-08-25 (real bug found on a real 209,356-byte Flipper SubGhz-DB
+// capture, "Vehicles/Honda/Lock_Honda.sub", 53,249 real edges): this
+// constant was left at 131072 BYTES after Cc1101Scan::kMaxEdgesPerSignal was
+// separately raised to 131072 EDGES (a coincidental same-number, different-
+// unit collision this comment used to encourage by citing the OLD 8192-edge
+// cap without updating when that cap changed). 131072 bytes of RAW_Data text
+// cannot hold anywhere near 131072 edges' worth of encoded durations (each
+// duration is ~4-11 text bytes plus a separator) -- load() silently read only
+// the file's first 131072 bytes (StorageSD::read_file()'s own documented
+// behavior for a file larger than the buffer), truncating this real capture
+// to 33,391 of its real 53,249 edges before SubghzProto::decode_sub() ever
+// saw the rest. (out->truncated does get set correctly in that case -- this
+// was a real silent-truncation bug, not a crash or a hard failure -- but a
+// user loading a real, unremarkable-sized capture should not need the
+// literal maximum edge count to trigger it.)
+//
+// Same real per-value sizing rationale as rf433_sub_format.cpp's own
+// kMaxEncodedTextBytes (~13 bytes/value worst case + header + per-512-values
+// line-prefix overhead), scaled by the SAME ratio rf433_sub_format.cpp
+// itself used when it was sized for RF433's own 8192-edge cap (131072 bytes
+// / 8192 edges = 16 bytes/edge) -- applied here to this module's real
+// 131072-edge cap: 131072 * 16 = 2,097,152 bytes (2MB). Plain `new` on first
+// call routes to PSRAM automatically on real hardware
 // (CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096, already verified in this
-// project) and is equally fine on the native host test target. Sized for
-// Cc1101Scan::kMaxEdgesPerSignal (8192, same as RF433's own cap) worst case:
-// ~13 bytes/value + header + per-512-values line overhead.
-constexpr size_t kMaxEncodedTextBytes = 131072;
+// project) -- save() and load() each hold their own 2MB buffer (4MB total),
+// trivial against this hardware's real 32MB PSRAM budget alongside
+// cc1101_scan.cpp's own ~16MB of capture storage.
+constexpr size_t kMaxEncodedTextBytes = 2097152;
 } // namespace
 
 bool save(IStorage &storage, const char *path, const Cc1101Scan::CapturedSignal &sig) {
