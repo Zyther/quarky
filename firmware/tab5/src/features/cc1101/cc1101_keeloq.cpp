@@ -318,13 +318,26 @@ void set_failure(const char *reason) {
     s_state = ReplayState::kFailed;
 }
 
+// Same real fix, same reason as cc1101_replay.cpp's own transmit_task():
+// a tight delayMicroseconds() loop with no yield can starve this task's
+// pinned core's IDLE task past the task_wdt timeout on a long enough
+// signal. KeeLoq frames are normally short, but this costs nothing to
+// apply defensively rather than wait for a real crash to prove it's needed
+// here too.
+constexpr uint32_t kYieldIntervalUs = 500000;
+
 void replay_task(void *arg) {
     ReplayArgs *args = static_cast<ReplayArgs *>(arg);
     int pin = Cc1101Hw::gdo0_pin();
+    uint32_t last_yield_us = micros();
     for (size_t i = 0; i < args->count; i++) {
         int32_t d = args->durations[i];
         digitalWrite(pin, d > 0 ? HIGH : LOW);
         delayMicroseconds((uint32_t)(d > 0 ? d : -d));
+        if (micros() - last_yield_us > kYieldIntervalUs) {
+            vTaskDelay(1);
+            last_yield_us = micros();
+        }
     }
     digitalWrite(pin, LOW);
     Cc1101Hw::idle();

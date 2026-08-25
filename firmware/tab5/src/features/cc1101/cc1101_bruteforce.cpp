@@ -63,6 +63,12 @@ inline void send_pulse(int pin, int duration) {
     }
 }
 
+// Same real crash class/fix as cc1101_replay.cpp and cc1101_jammer.cpp
+// (2026-08-25, see cc1101_replay.cpp's own header comment for the full
+// account): a full code-space sweep (up to 4096 codes * repeats * ~12 bits)
+// runs comfortably past the task_wdt window with zero yields otherwise.
+constexpr uint32_t kYieldIntervalUs = 500000;
+
 void bruteforce_task(void *arg) {
     TaskArgs *args = static_cast<TaskArgs *>(arg);
     const ProtocolDef &proto = def_for(args->proto);
@@ -73,7 +79,12 @@ void bruteforce_task(void *arg) {
     s_total = total;
     s_code = 0;
 
+    uint32_t last_yield_us = micros();
     for (uint32_t code = 0; code < total && !s_stop_requested; code++) {
+        if (micros() - last_yield_us > kYieldIntervalUs) {
+            vTaskDelay(1);
+            last_yield_us = micros();
+        }
         for (int r = 0; r < args->repeats; r++) {
             if (proto.pilot.high || proto.pilot.low) {
                 send_pulse(pin, proto.pilot.high);

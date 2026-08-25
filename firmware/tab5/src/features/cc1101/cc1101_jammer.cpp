@@ -22,6 +22,18 @@ namespace {
 constexpr uint32_t kMaxSequence = 50;  // rf_jammer.cpp MAX_SEQUENCE
 constexpr uint32_t kDurationCycles = 3; // rf_jammer.cpp DURATION_CYCLES
 
+// Real crash class found on real hardware in cc1101_replay.cpp (2026-08-25,
+// see that file's own header comment): a tight delayMicroseconds() loop
+// with no yield starves this task's pinned core's IDLE task past the
+// task_wdt timeout. Jammer is WORSE than that case, not just similarly
+// exposed -- both run_full_jammer()/run_itmt_jammer() below are `while
+// (!s_stop_requested)` loops with no upper bound at all (jamming is
+// designed to run until the user stops it), so without a periodic yield
+// this crashes within the watchdog window on every single run, 100%
+// reproducible, not just on a long signal. Same fix: a vTaskDelay(1) paced
+// by elapsed time, checked once per outer-loop pass.
+constexpr uint32_t kYieldIntervalUs = 500000;
+
 struct TaskArgs {
     JamMode mode;
     float freq_mhz;
@@ -71,7 +83,12 @@ void send_random_pattern(int pin, int numPulses) {
 void run_full_jammer(int pin) {
     uint32_t startTime = millis();
     uint8_t phase = 0;
+    uint32_t last_yield_us = micros();
     while (!s_stop_requested) {
+        if (micros() - last_yield_us > kYieldIntervalUs) {
+            vTaskDelay(1);
+            last_yield_us = micros();
+        }
         uint32_t elapsed = millis() - startTime;
         phase = (elapsed / 100) % 3;
         switch (phase) {
@@ -118,7 +135,12 @@ void run_itmt_jammer(int pin) {
     uint32_t sequenceValues[kMaxSequence];
     for (uint32_t i = 0; i < kMaxSequence; i++) sequenceValues[i] = 10 * (i + 1);
 
+    uint32_t last_yield_us = micros();
     while (!s_stop_requested) {
+        if (micros() - last_yield_us > kYieldIntervalUs) {
+            vTaskDelay(1);
+            last_yield_us = micros();
+        }
         for (uint32_t sequence = 0; sequence < kMaxSequence && !s_stop_requested; sequence++) {
             for (uint32_t d = 0; d < kDurationCycles && !s_stop_requested; d++) {
                 send_optimized_pulse(pin, (int)sequenceValues[sequence]);

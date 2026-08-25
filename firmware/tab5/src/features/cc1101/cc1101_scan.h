@@ -44,13 +44,28 @@ struct EdgeSample {
                 // Rf433Common::EdgeSample / SubghzProto::EdgeSample.
 };
 
-// Same real-hardware-derived sizing as Rf433Scan::kMaxEdgesPerSignal
-// (rf433_scan.h) -- same class of signal (OOK burst from a fixed-code or
-// rolling-code remote), same PSRAM-headroom reasoning (kMaxCapturedSignals *
-// sizeof(CapturedSignal) is heap-allocated in PSRAM below, not a static
-// array, for the identical internal-DRAM-exhaustion reason rf433_scan.cpp's
-// s_signals allocation comment documents in full).
-constexpr size_t kMaxEdgesPerSignal = 8192;
+// RAISED 2026-08-25 (project owner, real-hardware finding): 8192 was
+// copied directly from Rf433Scan::kMaxEdgesPerSignal without re-deriving it
+// for CC1101's own real use case -- RF433 only ever captures short,
+// fixed/rolling-code OOK bursts from garage/doorbell-class remotes (its own
+// real worst case, a genuine Tesla charge-port remote, was 2395 edges,
+// comfortably under 8192), but CC1101 is a full sub-GHz radio meant to
+// capture arbitrary, potentially much longer raw signals -- the project
+// owner hit real truncation on a real capture at the old cap. Raised 16x to
+// 131072. Real PSRAM math, not a guess: EdgeSample is 8 bytes (4-byte
+// timestamp_us + 1-byte level, padded to 4-byte alignment); both
+// kMaxCapturedSignals * sizeof(CapturedSignal) (s_signals, below) and the
+// live-accumulation buffer (s_accum_edges, cc1101_scan.cpp) are already
+// heap-allocated in PSRAM (MALLOC_CAP_SPIRAM), not static arrays, matching
+// rf433_scan.cpp's own identical internal-DRAM-exhaustion reasoning -- so
+// this cost lands entirely in PSRAM (32MB total on this hardware, confirmed
+// via ESP.getPsramSize() elsewhere in this project). At 131072: 16 signals
+// * 131072 edges * 8 bytes = 16,777,216 bytes (~16MB, half of PSRAM) for
+// s_signals, plus one more ~1MB for s_accum_edges -- real, generous
+// headroom against any realistic capture while still a finite, bounded
+// allocation (a truly unbounded buffer would need its own capture-duration
+// stop condition, a separate concern from this constant's own sizing).
+constexpr size_t kMaxEdgesPerSignal = 131072;
 constexpr size_t kMaxCapturedSignals = 16;
 
 struct CapturedSignal {
