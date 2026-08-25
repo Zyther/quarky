@@ -192,6 +192,25 @@
                                         // trigger 'x' is its only entry point
                                         // for now, same shape as 'i'/'c'/'h'
                                         // above.
+#include "features/cc1101/cc1101_scan.h" // Phase 10 Task 3: scan/capture +
+                                          // SubghzProto decode + hot/cold
+                                          // (Category::SUBGHZ)
+#include "features/cc1101/cc1101_record.h" // Phase 10 Task 4a: .sub save/load --
+                                            // no register_module()/launcher
+                                            // tile of its own, consumed by
+                                            // cc1101_scan.cpp's screen
+#include "features/cc1101/cc1101_replay.h" // Phase 10 Task 4b: replay -- no
+                                            // register_module()/launcher tile
+                                            // of its own, same shape as
+                                            // rf433_replay.h
+#include "features/cc1101/cc1101_spectrum.h" // Phase 10 Task 5: full-range
+                                              // RSSI sweep + lv_chart
+#include "features/cc1101/cc1101_bruteforce.h" // Phase 10 Task 6: fixed-code
+                                                // bruteforce (6 protocols)
+#include "features/cc1101/cc1101_jammer.h" // Phase 10 Task 7: full/intermittent
+                                            // jammer
+#include "features/cc1101/cc1101_keeloq.h" // Phase 10 Task 8: KeeLoq decode +
+                                            // Replay +1
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -477,6 +496,28 @@ void setup() {
     // via IrCommon::transmit_raw(). See ir_jammer.h.
     IrJammer::register_module();
 
+    // Phase 10 Task 3: CC1101 Scan/Decode (Category::SUBGHZ) -- M-Bus CC1101,
+    // independent of Phase 3's RF433/Phase 5's Cardputer-ADV hydra-hat
+    // CC1101 (see this phase's spec Section 1).
+    Cc1101Scan::register_module();
+
+    // Phase 10 Task 5: CC1101 Spectrum -- full-range (855-925MHz) RSSI sweep.
+    Cc1101Spectrum::register_module();
+
+    // Phase 10 Task 6: CC1101 Bruteforce -- 6 fixed-code protocols (Came/
+    // Nice/Ansonic/Holtek/Linear/Chamberlain), ported from Bruce's real
+    // brute_protocols[] table.
+    Cc1101Bruteforce::register_module();
+
+    // Phase 10 Task 7: CC1101 Jammer -- full/intermittent modes. Real
+    // regulatory exposure; authorized test environment only.
+    Cc1101Jammer::register_module();
+
+    // Phase 10 Task 8: CC1101 KeeLoq -- decode + "Replay +1" rolling-code
+    // attack. Legally sensitive; owner-authorized equipment only, explicit
+    // "actively attacking" UI state (see cc1101_keeloq.h).
+    Cc1101Keeloq::register_module();
+
     lv_obj_t *root = Shell::build(g_registry);
     ScreenStack::push(root);
     Serial.println("quarky-tab5: lvgl ready");
@@ -742,6 +783,19 @@ void loop() {
     IrJammer::poll(); // Phase 3 Task 19: no-ops unless a jam session is
                       // active; one bounded randomized-noise burst per
                       // tick -- see ir_jammer.h
+
+    // Phase 10: CC1101 M-Bus feature modules. Cc1101Replay::poll() runs
+    // BEFORE Cc1101Scan::poll() for the same reason Rf433Replay::poll() runs
+    // before Rf433Scan::poll() above -- Cc1101Scan's screen reads
+    // Cc1101Replay::state() when rendering its own Replay status label.
+    Cc1101Replay::poll();   // Task 4b: no-ops unless a transmit task is in flight
+    Cc1101Scan::poll();     // Task 3: no-ops unless the scan/hot-cold screen is open
+    Cc1101Spectrum::poll(); // Task 5: no-ops unless the spectrum screen is open
+    Cc1101Bruteforce::poll(nullptr); // Task 6: no-ops unless a sweep is running
+    Cc1101Jammer::poll(nullptr);     // Task 7: no-ops unless a jam session is running
+    Cc1101Keeloq::poll();            // Task 8: no-ops unless a Replay +1 transmit
+                                      // is in flight or has just finished
+
     WifiSpectrumFeature::poll(); // no-ops unless the WiFi Spectrum screen is open
     WifiConnectFeature::poll();  // no-ops unless a connect is in flight; drains the
                                   // background connect_task()'s result -- real-hardware

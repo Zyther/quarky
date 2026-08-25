@@ -21,7 +21,7 @@ Phase numbers are execution order, **except Phase 10** (see note). Don't infer t
 | 6 | GNSS/SX1262 LoRa | Cardputer-ADV | Not started |
 | 7 | ESP32-C5 5GHz Sidecar | C5 (new satellite) | Not started |
 | 8 | Remaining Feature Sweep | Whichever fits | Not started |
-| 10 | Tab5-Native CC1101 via M-Bus | Tab5 | In progress — fast-tracked ahead of Phase 4 |
+| 10 | Tab5-Native CC1101 via M-Bus | Tab5 | Code-complete, hardware verification pending — see `docs/phases/phase-10-tab5-cc1101-mbus.md` |
 
 **2026-08-24 rescope discussion (real DMA-budget evidence from Phase 3 Task 18, WiFi/BLE-over-SDIO consuming ~180KB of the Tab5's ~187KB DMA-capable pool):** the project owner considered, then substantially reverted, moving most Cardputer-ADV-targeted work to a hardwired ESP32-C5 companion. Resolution: the Cardputer-ADV stays in the roadmap with Phase 5 and Phase 6 unchanged (owner already owns both Hydra Hats — CC1101-433+NRF24L01 and CC1101-915+NRF24L01 — and wants to keep Meshtastic/LoRa and 2.4GHz on the docket). Phase 10 (Tab5-native CC1101 via M-Bus) is independently confirmed to still ship alongside Phase 5's Cardputer-ADV CC1101, not superseded by it (see that phase's own spec, Section 1) — Tab5-solo sub-GHz work and Cardputer-ADV dual-radio work are both wanted. The one piece of the rescope idea that survived: WiFi-server-hosting features (softAP, Evil Portal, etc.) that don't fit the Tab5's own DMA budget when WiFi/BLE is active are still a real candidate to move to a hardwired C5 companion — this has **not** been given a phase number or scoped in detail yet (nor has a tentative second, wireless C5 for Karma/EAPOL capture), and should not be assumed decided until a spec exists.
 

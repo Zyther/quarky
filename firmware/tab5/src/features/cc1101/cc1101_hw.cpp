@@ -53,4 +53,22 @@ float rssi() {
     return s_radio.getRSSI();
 }
 
+bool enable_async_rx() {
+    if (s_radio.setOOK(true) != RADIOLIB_ERR_NONE) return false;
+    return s_radio.receiveDirectAsync() == RADIOLIB_ERR_NONE;
+}
+
+bool enable_async_tx() {
+    if (s_radio.setOOK(true) != RADIOLIB_ERR_NONE) return false;
+    return s_radio.transmitDirectAsync() == RADIOLIB_ERR_NONE;
+}
+
+void idle() {
+    s_radio.standby();
+}
+
+int gdo0_pin() {
+    return TAB5_CC1101_GDO0_GPIO;
+}
+
 } // namespace Cc1101Hw
