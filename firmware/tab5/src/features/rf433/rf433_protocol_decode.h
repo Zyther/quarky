@@ -50,6 +50,25 @@
 // the seven. A later task can port more of kDecoders[] the same way if a
 // real capture needs one that is missing.
 //
+// EXTRACTED INTO shared/subghz_proto (Phase 10 Task 2, 2026-08-25): all
+// seven decoders this file originally ported (plus Princeton, freshly added
+// there) now live in shared/subghz_proto/src/subghz_protocol_decode.{h,cpp}
+// -- CC1101 (Phase 10) needs the same 6-of-7 protocol set this file already
+// had proven and tested, and duplicating them would have been real,
+// avoidable waste and a real future-divergence risk (see this phase's plan,
+// Task 2's revised write-up, for the full reasoning). This file (and its
+// .cpp) is now a THIN WRAPPER: its own public API
+// (Rf433ProtocolDecode::decode(CapturedSignal, DecodedCode*)) and this
+// project's real callers (rf433_scan.cpp) are UNCHANGED, and
+// test/test_rf433_protocol_decode.cpp passes unmodified against this
+// wrapper -- the RF433-specific parts that stayed here are the
+// EdgeSample[]->duration[] conversion (build_durations(), which depends on
+// Rf433Scan::CapturedSignal/Rf433Common::EdgeSample, types shared/subghz_proto
+// deliberately has no dependency on) and the DecodedCode struct/output
+// shaping. The actual per-brand decode state machines now live in, and are
+// maintained in, shared/subghz_proto -- see that library's own header
+// comment for the current, authoritative provenance/citation record.
+//
 // REACHABILITY CAVEAT (documented, not fixed -- round-2 review ruling): Task
 // 5's burst-splitting threshold (rf433_scan.cpp's kBurstGapThresholdUs,
 // 25ms) means not every ported decoder's full documented sync window can
