@@ -20,19 +20,133 @@ namespace SubghzProto {
 
 namespace {
 
-constexpr char kFiletypeLine[] = "Filetype: Flipper SubGhz RAW File";
+constexpr char kFiletypeRawLine[] = "Filetype: Flipper SubGhz RAW File";
+constexpr char kFiletypeKeyLine[] = "Filetype: Flipper SubGhz Key File";
 constexpr char kVersionLine[] = "Version: 1";
 constexpr char kProtocolLine[] = "Protocol: RAW";
 constexpr char kRawDataPrefix[] = "RAW_Data:";
 constexpr size_t kRawDataPrefixLen = sizeof(kRawDataPrefix) - 1;
 constexpr size_t kMaxValuesPerLine = 512; // real spec's own per-line cap
 
-// ── WRITE direction: EdgeSample[] -> signed RAW_Data durations ────────────
-
 struct LevelPulse {
     uint32_t duration;
     bool level;
 };
+
+// ── Protocol-keyed .sub support (2026-08-25, real gap found: a real
+// Flipper SubGhz-DB file -- "Protocol: Princeton", Bit/Key/TE fields, no
+// RAW_Data at all -- failed to load, since this module originally only
+// recognized Protocol: RAW). This is a genuinely different real Flipper
+// file shape (Filetype: "...Key File", not "...RAW File") that stores a
+// decoded protocol + key instead of a raw pulse train, for compact
+// storage. Scoped to Princeton only for now (the concrete real file that
+// surfaced this gap) -- the same real bit-timing shape already established
+// and cited in subghz_protocol_decode.cpp's own decode_princeton() (sync
+// LOW pulse of 36*TE, then per-bit HIGH/LOW pairs: bit 0 = TE-high +
+// 3*TE-low, bit 1 = 3*TE-high + TE-low), just run in the ENCODE direction.
+// Uses the file's OWN stated TE (not this project's internal te_short
+// constant) -- a real captured remote's actual timing varies device to
+// device, and reproducing the file's own value is more faithful than
+// substituting our internal default. Repeated 4x (real Princeton devices
+// send multiple repeats for noise robustness; this project's own decoder
+// requires at least 2 IDENTICAL consecutive frames to call it a match, so
+// 4 gives real margin, not just the minimum).
+constexpr int kPrincetonRepeats = 4;
+constexpr int kPrincetonBits = 24; // this module only supports the real,
+                                    // observed 24-bit Princeton case so far
+
+// Builds the real pulse sequence decode_princeton() (subghz_protocol_decode.cpp)
+// actually requires -- confirmed against that function's own real state
+// machine, NOT re-derived from guesswork: an initial LOW sync of 36*TE
+// (Reset -> SaveDur, cnt=0), then per repeat: 24 [HIGH, LOW] bit pairs,
+// then one more arbitrary-duration HIGH pulse (SaveDur -> CheckDur; the
+// PROVEN real fixture, test_subghz_protocol_decode.cpp's own
+// test_decode_accepts_synthesized_princeton_signal, uses te_short here and
+// its own comment calls the value "irrelevant to the end-of-frame branch"
+// -- reused verbatim, not invented), then one LOW gap >= 2*te_long (this is
+// what CheckDur's own frame-end branch actually tests -- duration >=
+// te_long*2 -- to close a frame, check cnt==24, and compare against the
+// PRIOR repeat's data; on a match it returns true). CRITICALLY: after a
+// frame closes, decode_princeton returns to SaveDur, NOT Reset -- repeat 2+
+// must NOT re-emit a 36*TE sync (an earlier version of this function got
+// exactly this wrong, inserting a full sync between every repeat instead
+// of only before the first).
+bool encode_princeton_edges(uint64_t key, uint16_t te, EdgeSample *edges_out,
+                             size_t edges_capacity, size_t *edge_count_out) {
+    uint32_t short_us = te;
+    uint32_t long_us = te * 3u;
+    uint32_t sync_us = te * 36u;
+    uint32_t frame_gap_us = long_us * 4u; // real requirement is just ">= 2*te_long"
+                                          // (te_long*2); 4x gives real margin
+
+    std::vector<LevelPulse> pulses;
+    pulses.reserve(1 + static_cast<size_t>(kPrincetonRepeats) * (2u * kPrincetonBits + 2));
+    pulses.push_back(LevelPulse{sync_us, false}); // ONLY before the first repeat
+    for (int rep = 0; rep < kPrincetonRepeats; rep++) {
+        for (int b = kPrincetonBits - 1; b >= 0; b--) {
+            bool bit = (key >> b) & 1u;
+            pulses.push_back(LevelPulse{bit ? long_us : short_us, true});
+            pulses.push_back(LevelPulse{bit ? short_us : long_us, false});
+        }
+        pulses.push_back(LevelPulse{short_us, true});    // closing HIGH, value irrelevant (per the
+                                                          // proven fixture's own comment)
+        pulses.push_back(LevelPulse{frame_gap_us, false}); // frame-end LOW, must be >= 2*te_long
+    }
+
+    std::vector<LevelPulse> merged;
+    merged.reserve(pulses.size());
+    for (const auto &p : pulses) {
+        if (!merged.empty() && merged.back().level == p.level) {
+            merged.back().duration += p.duration;
+        } else {
+            merged.push_back(p);
+        }
+    }
+
+    if (merged.size() + 1 > edges_capacity) return false;
+    uint32_t t = 0;
+    size_t idx = 0;
+    edges_out[idx++] = EdgeSample{0u, merged[0].level};
+    for (size_t i = 0; i < merged.size(); i++) {
+        t += merged[i].duration;
+        bool level_after = (i + 1 < merged.size()) ? merged[i + 1].level : !merged[i].level;
+        edges_out[idx++] = EdgeSample{t, level_after};
+    }
+    *edge_count_out = idx;
+    return true;
+}
+
+// Hex-byte Key: field, e.g. "00 00 00 00 00 BE AF 03" -- real Flipper
+// convention: big-endian, right-aligned in a fixed-width field regardless
+// of the real Bit count (the low `bits` bits of the parsed value are the
+// actual code -- confirmed against this module's own real motivating file,
+// where the last 3 of 8 given bytes exactly equal its own Bit: 24).
+bool parse_hex_key(const char *line, size_t line_len, size_t value_start, uint64_t *out) {
+    uint64_t v = 0;
+    size_t i = value_start;
+    bool saw_byte = false;
+    while (i < line_len) {
+        while (i < line_len && line[i] == ' ') i++;
+        if (i + 1 >= line_len) break;
+        auto hex_nibble = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            return -1;
+        };
+        int hi = hex_nibble(line[i]);
+        int lo = hex_nibble(line[i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        v = (v << 8) | static_cast<uint64_t>((hi << 4) | lo);
+        saw_byte = true;
+        i += 2;
+    }
+    if (!saw_byte) return false;
+    *out = v;
+    return true;
+}
+
+// ── WRITE direction: EdgeSample[] -> signed RAW_Data durations ────────────
 
 // Merges consecutive EdgeSamples that share the same held level into one
 // true pulse (summing their durations) -- same real fix rf433_sub_format.cpp's
@@ -174,7 +288,7 @@ bool encode_sub(uint32_t freq_hz, const char *preset, const EdgeSample *edges, s
     if (durations.empty()) return false;
 
     int written = std::snprintf(buf, buf_size, "%s\n%s\nFrequency: %u\nPreset: %s\n%s\n%s",
-                                 kFiletypeLine, kVersionLine, static_cast<unsigned>(freq_hz), preset,
+                                 kFiletypeRawLine, kVersionLine, static_cast<unsigned>(freq_hz), preset,
                                  kProtocolLine, kRawDataPrefix);
     if (written < 0 || static_cast<size_t>(written) >= buf_size) return false;
     size_t pos = static_cast<size_t>(written);
@@ -209,9 +323,17 @@ bool decode_sub(const char *text, size_t len, uint32_t *freq_hz_out, EdgeSample 
     size_t line_len = 0;
 
     // Filetype/Version are always the first two lines, real spec's own
-    // fixed field order.
-    if (!next_line(text, len, &pos, &line, &line_len) || !line_equals(line, line_len, kFiletypeLine)) return false;
-    if (!next_line(text, len, &pos, &line, &line_len) || !line_equals(line, line_len, kVersionLine)) return false;
+    // fixed field order. Filetype accepts either real shape -- "...RAW
+    // File" (RAW_Data-bearing) or "...Key File" (protocol-keyed, see the
+    // Princeton branch below) -- both are real Flipper filetypes, not one
+    // canonical string.
+    if (!next_line(text, len, &pos, &line, &line_len) ||
+        (!line_equals(line, line_len, kFiletypeRawLine) && !line_equals(line, line_len, kFiletypeKeyLine))) {
+        return false;
+    }
+    if (!next_line(text, len, &pos, &line, &line_len) || !line_equals(line, line_len, kVersionLine)) {
+        return false;
+    }
 
     // Remaining header lines scanned for by key rather than assumed to sit
     // at fixed positions, so both real file shapes parse (standard-preset,
@@ -223,6 +345,7 @@ bool decode_sub(const char *text, size_t len, uint32_t *freq_hz_out, EdgeSample 
     bool saw_frequency = false;
     bool saw_preset = false;
     bool found_protocol = false;
+    bool is_princeton = false;
     unsigned long parsed_freq = 0;
     for (int header_lines = 0; header_lines < kMaxHeaderLines; header_lines++) {
         if (!next_line(text, len, &pos, &line, &line_len)) break;
@@ -230,7 +353,19 @@ bool decode_sub(const char *text, size_t len, uint32_t *freq_hz_out, EdgeSample 
             found_protocol = true;
             break;
         }
-        if (starts_with(line, line_len, "Protocol:", 9)) return false; // non-RAW protocol -- out of scope
+        if (starts_with(line, line_len, "Protocol:", 9)) {
+            // Real, disclosed scope: only Princeton is supported among
+            // protocol-keyed files so far (2026-08-25 -- see this file's
+            // own top-of-block comment for why). Any other keyed protocol
+            // still correctly reports "can't load this" rather than
+            // silently misinterpreting it.
+            if (line_equals(line, line_len, "Protocol: Princeton")) {
+                is_princeton = true;
+                found_protocol = true;
+                break;
+            }
+            return false;
+        }
         if (starts_with(line, line_len, "Frequency:", 10)) {
             size_t vpos = 10;
             while (vpos < line_len && line[vpos] == ' ') vpos++;
@@ -244,6 +379,58 @@ bool decode_sub(const char *text, size_t len, uint32_t *freq_hz_out, EdgeSample 
         return false; // unrecognized header line -- malformed
     }
     if (!found_protocol || !saw_frequency || !saw_preset) return false;
+
+    if (is_princeton) {
+        // Bit:/Key:/TE: lines follow Protocol:, in this real order but
+        // scanned for by key like the header above (not assumed fixed) --
+        // real files could plausibly reorder them.
+        bool saw_bit = false, saw_key = false, saw_te = false;
+        long bits = 0;
+        uint64_t key = 0;
+        long te = 0;
+        constexpr int kMaxKeyedLines = 4; // Bit, Key, TE, +1 slack
+        for (int i = 0; i < kMaxKeyedLines; i++) {
+            if (!next_line(text, len, &pos, &line, &line_len)) break;
+            if (starts_with(line, line_len, "Bit:", 4)) {
+                size_t vpos = 4;
+                while (vpos < line_len && line[vpos] == ' ') vpos++;
+                size_t consumed = 0;
+                if (!parse_long_bounded(line + vpos, line_len - vpos, &bits, &consumed)) return false;
+                saw_bit = true;
+                continue;
+            }
+            if (starts_with(line, line_len, "Key:", 4)) {
+                size_t vpos = 4;
+                while (vpos < line_len && line[vpos] == ' ') vpos++;
+                if (!parse_hex_key(line, line_len, vpos, &key)) return false;
+                saw_key = true;
+                continue;
+            }
+            if (starts_with(line, line_len, "TE:", 3)) {
+                size_t vpos = 3;
+                while (vpos < line_len && line[vpos] == ' ') vpos++;
+                size_t consumed = 0;
+                if (!parse_long_bounded(line + vpos, line_len - vpos, &te, &consumed)) return false;
+                saw_te = true;
+                continue;
+            }
+        }
+        if (!saw_bit || !saw_key || !saw_te) return false;
+        if (bits != kPrincetonBits) return false; // only the real, observed 24-bit case is supported
+        if (te <= 0 || te > 0xFFFF) return false;
+
+        // Mask to the low `bits` bits -- real Flipper convention stores the
+        // key right-aligned in a fixed-width field (see parse_hex_key's own
+        // header comment).
+        uint64_t masked_key = (bits >= 64) ? key : (key & ((1ull << bits) - 1));
+
+        if (!encode_princeton_edges(masked_key, static_cast<uint16_t>(te), edges_out, edges_capacity,
+                                     edge_count_out)) {
+            return false;
+        }
+        *freq_hz_out = static_cast<uint32_t>(parsed_freq);
+        return true;
+    }
 
     // One or more RAW_Data: lines, concatenated -- real spec's own
     // continuation convention. Bounded to at most edges_capacity - 1 values

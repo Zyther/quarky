@@ -1,5 +1,6 @@
 #include <unity.h>
 #include "subghz_sub_format.h"
+#include "subghz_protocol_decode.h"
 #include <cstring>
 #include <cstdio>
 
@@ -352,6 +353,76 @@ void test_encode_sub_succeeds_on_undecodable_raw_capture() {
     TEST_ASSERT_TRUE(std::strstr(buf, "Protocol: RAW") != nullptr);
 }
 
+// ── Protocol-keyed Princeton .sub support (2026-08-25) ─────────────────────
+// Real file that surfaced this gap, verbatim (project owner's own report --
+// a genuine Flipper SubGhz-DB entry, "LED/Aurora_RGB"):
+//
+//   Filetype: Flipper SubGhz Key File
+//   Version: 1
+//   Frequency: 433920000
+//   Preset: FuriHalSubGhzPresetOok650Async
+//   Protocol: Princeton
+//   Bit: 24
+//   Key: 00 00 00 00 00 BE AF 03
+//   TE: 412
+//
+// Strongest available verification with no physical hardware in the loop:
+// decode this exact real file, then feed the resulting edges into this
+// project's OWN SubghzProto::decode() (Princeton branch) and confirm it
+// comes back out as a Princeton match with the SAME key (0xBEAF03) --
+// end-to-end round-trip through both directions of this codebase's real
+// Princeton logic, not just "decode_sub() returned true".
+void test_decode_sub_accepts_real_princeton_keyed_file() {
+    const char *text =
+        "Filetype: Flipper SubGhz Key File\n"
+        "Version: 1\n"
+        "Frequency: 433920000\n"
+        "Preset: FuriHalSubGhzPresetOok650Async\n"
+        "Protocol: Princeton\n"
+        "Bit: 24\n"
+        "Key: 00 00 00 00 00 BE AF 03\n"
+        "TE: 412\n";
+    size_t len = std::strlen(text);
+
+    static SubghzProto::EdgeSample edges[512];
+    uint32_t freq_out = 0;
+    size_t edge_count = 0;
+    TEST_ASSERT_TRUE(SubghzProto::decode_sub(text, len, &freq_out, edges, 512, &edge_count));
+    TEST_ASSERT_EQUAL_UINT32(433920000u, freq_out);
+    TEST_ASSERT_TRUE(edge_count > 2);
+
+    // edges[] -> duration[] (gap between consecutive edges), same
+    // conversion every real caller in this codebase performs before calling
+    // SubghzProto::decode().
+    static unsigned int durations[512];
+    for (size_t i = 1; i < edge_count; i++) {
+        durations[i - 1] = static_cast<unsigned int>(edges[i].timestamp_us - edges[i - 1].timestamp_us);
+    }
+
+    SubghzProto::Match m{};
+    TEST_ASSERT_TRUE(SubghzProto::decode(durations, static_cast<uint16_t>(edge_count - 1), &m));
+    TEST_ASSERT_EQUAL_STRING("Princeton", m.name);
+    TEST_ASSERT_EQUAL_UINT32(0xBEAF03u, static_cast<uint32_t>(m.key));
+    TEST_ASSERT_EQUAL_UINT8(24, m.bits);
+}
+
+void test_decode_sub_rejects_unsupported_keyed_protocol() {
+    const char *text =
+        "Filetype: Flipper SubGhz Key File\n"
+        "Version: 1\n"
+        "Frequency: 433920000\n"
+        "Preset: FuriHalSubGhzPresetOok650Async\n"
+        "Protocol: KeeLoq\n"
+        "Bit: 64\n"
+        "Key: 00 00 00 00 00 BE AF 03\n"
+        "TE: 400\n";
+    size_t len = std::strlen(text);
+    static SubghzProto::EdgeSample edges[512];
+    uint32_t freq_out = 0;
+    size_t edge_count = 0;
+    TEST_ASSERT_FALSE(SubghzProto::decode_sub(text, len, &freq_out, edges, 512, &edge_count));
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_encode_rejects_too_few_edges);
@@ -369,5 +440,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_decode_caps_output_at_edges_capacity);
     RUN_TEST(test_encode_decode_real_fixture_is_a_fixed_point);
     RUN_TEST(test_encode_sub_succeeds_on_undecodable_raw_capture);
+    RUN_TEST(test_decode_sub_accepts_real_princeton_keyed_file);
+    RUN_TEST(test_decode_sub_rejects_unsupported_keyed_protocol);
     return UNITY_END();
 }
