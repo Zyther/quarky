@@ -183,15 +183,26 @@ const char *protocol_name(Protocol p) { return def_for(p).name; }
 namespace {
 lv_obj_t *s_status_label = nullptr;
 lv_obj_t *s_progress_bar = nullptr;
-lv_obj_t *s_start_btn = nullptr;
-lv_obj_t *s_start_lbl = nullptr;
-lv_obj_t *s_proto_dropdown = nullptr;
+lv_obj_t *s_stop_btn = nullptr;
 float s_ui_freq_mhz = 433.92f; // real common fixed-code-remote frequency,
                                 // same default Poseidon/Bruce both use
 bool s_ui_active = false;
 
-const char *kDropdownOptions =
-    "Came 12bit\nNice 12bit\nAnsonic 12bit\nHoltek 12bit\nLinear 10bit\nChamberlain 9bit";
+// 4-col button grid, each protocol starting a run directly on tap --
+// replaces a dropdown+separate-Start-button combo the project owner found
+// unreliable (2026-08-25: "dropdown does not select the right option"). No
+// intermediate "selected index" state to get out of sync with what's
+// actually started. Same 4-col wrap idiom ir_clone.cpp's own signal-button
+// grid already uses in this codebase.
+struct ProtoBtn { const char *label; Protocol proto; };
+const ProtoBtn kProtoButtons[] = {
+    {"Came 12bit", Protocol::kCame12},
+    {"Nice 12bit", Protocol::kNice12},
+    {"Ansonic 12bit", Protocol::kAnsonic12},
+    {"Holtek 12bit", Protocol::kHoltek12},
+    {"Linear 10bit", Protocol::kLinear10},
+    {"Chamberlain 9bit", Protocol::kChamberlain9},
+};
 
 void update_status_ui(const BruteforceStatus &st) {
     if (!s_status_label) return;
@@ -217,8 +228,24 @@ lv_obj_t *build_screen() {
     lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
     lv_label_set_text(note, "Fixed-code bruteforce -- authorized targets only.");
 
-    s_proto_dropdown = lv_dropdown_create(content);
-    lv_dropdown_set_options(s_proto_dropdown, kDropdownOptions);
+    lv_obj_t *proto_grid = lv_obj_create(content);
+    lv_obj_set_width(proto_grid, LV_PCT(100));
+    lv_obj_set_height(proto_grid, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(proto_grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_all(proto_grid, 2, 0);
+    lv_obj_set_style_pad_gap(proto_grid, 4, 0);
+    for (const auto &p : kProtoButtons) {
+        lv_obj_t *btn = lv_button_create(proto_grid);
+        lv_obj_set_width(btn, LV_PCT(23));
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, p.label);
+        lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+            if (s_ui_active) return; // already running -- use Stop first
+            Protocol proto = *static_cast<Protocol *>(lv_event_get_user_data(e));
+            start(proto, s_ui_freq_mhz, 2);
+            s_ui_active = true;
+        }, LV_EVENT_CLICKED, (void *)&p.proto);
+    }
 
     s_status_label = lv_label_create(content);
     lv_label_set_text(s_status_label, "Idle");
@@ -227,28 +254,19 @@ lv_obj_t *build_screen() {
     lv_obj_set_size(s_progress_bar, LV_PCT(100), 16);
     lv_bar_set_range(s_progress_bar, 0, 100);
 
-    s_start_btn = lv_button_create(content);
-    s_start_lbl = lv_label_create(s_start_btn);
-    lv_label_set_text(s_start_lbl, "Start");
-    lv_obj_add_event_cb(s_start_btn, [](lv_event_t *) {
-        if (s_ui_active) {
-            stop();
-            lv_label_set_text(s_start_lbl, "Start");
-            s_ui_active = false;
-            return;
-        }
-        uint32_t sel = lv_dropdown_get_selected(s_proto_dropdown);
-        start((Protocol)sel, s_ui_freq_mhz, 2);
-        lv_label_set_text(s_start_lbl, "Stop");
-        s_ui_active = true;
+    s_stop_btn = lv_button_create(content);
+    lv_obj_t *stop_lbl = lv_label_create(s_stop_btn);
+    lv_label_set_text(stop_lbl, "Stop");
+    lv_obj_add_event_cb(s_stop_btn, [](lv_event_t *) {
+        if (!s_ui_active) return;
+        stop();
+        s_ui_active = false;
     }, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_add_event_cb(content, [](lv_event_t *) {
         s_status_label = nullptr;
         s_progress_bar = nullptr;
-        s_start_btn = nullptr;
-        s_start_lbl = nullptr;
-        s_proto_dropdown = nullptr;
+        s_stop_btn = nullptr;
         if (s_ui_active) { stop(); s_ui_active = false; }
     }, LV_EVENT_DELETE, nullptr);
 

@@ -244,11 +244,9 @@ bool poll(JammerStatus *out) {
 // ===========================================================================
 namespace {
 
-lv_obj_t *s_mode_dropdown = nullptr;
 lv_obj_t *s_status_label = nullptr;
 lv_obj_t *s_banner = nullptr;
-lv_obj_t *s_start_btn = nullptr;
-lv_obj_t *s_start_lbl = nullptr;
+lv_obj_t *s_stop_btn = nullptr;
 float s_ui_freq_mhz = 433.92f;
 bool s_ui_active = false;
 
@@ -280,8 +278,36 @@ lv_obj_t *build_screen() {
     lv_label_set_text(note, "RF jamming -- authorized test environment only. "
                              "Real regulatory exposure -- confirm authorization before starting.");
 
-    s_mode_dropdown = lv_dropdown_create(content);
-    lv_dropdown_set_options(s_mode_dropdown, "Full\nIntermittent");
+    // 4-col button grid, each mode starting jamming directly on tap --
+    // replaces a dropdown+separate-Start-button combo the project owner
+    // found unreliable (2026-08-25: "dropdown does not select the right
+    // option"). No intermediate "selected index" state to get out of sync
+    // with what's actually started -- tapping "Full" calls
+    // start(JamMode::kFull, ...) directly. Same 4-col wrap idiom
+    // ir_clone.cpp's own signal-button grid already uses in this codebase.
+    struct ModeBtn { const char *label; JamMode mode; };
+    static const ModeBtn kModes[] = {
+        {"Full", JamMode::kFull},
+        {"Intermittent", JamMode::kIntermittent},
+    };
+    lv_obj_t *mode_grid = lv_obj_create(content);
+    lv_obj_set_width(mode_grid, LV_PCT(100));
+    lv_obj_set_height(mode_grid, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(mode_grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_all(mode_grid, 2, 0);
+    lv_obj_set_style_pad_gap(mode_grid, 4, 0);
+    for (const auto &m : kModes) {
+        lv_obj_t *btn = lv_button_create(mode_grid);
+        lv_obj_set_width(btn, LV_PCT(23));
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, m.label);
+        lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+            if (s_ui_active) return; // already running -- use Stop first
+            JamMode mode = *static_cast<JamMode *>(lv_event_get_user_data(e));
+            start(mode, s_ui_freq_mhz);
+            s_ui_active = true;
+        }, LV_EVENT_CLICKED, (void *)&m.mode);
+    }
 
     s_status_label = lv_label_create(content);
     lv_label_set_text(s_status_label, "Idle");
@@ -290,29 +316,20 @@ lv_obj_t *build_screen() {
     lv_obj_set_style_text_color(s_banner, lv_palette_main(LV_PALETTE_RED), 0);
     lv_obj_add_flag(s_banner, LV_OBJ_FLAG_HIDDEN);
 
-    s_start_btn = lv_button_create(content);
-    lv_obj_set_style_bg_color(s_start_btn, lv_palette_main(LV_PALETTE_RED), 0);
-    s_start_lbl = lv_label_create(s_start_btn);
-    lv_label_set_text(s_start_lbl, "Start Jamming");
-    lv_obj_add_event_cb(s_start_btn, [](lv_event_t *) {
-        if (s_ui_active) {
-            stop();
-            lv_label_set_text(s_start_lbl, "Start Jamming");
-            s_ui_active = false;
-            return;
-        }
-        uint32_t sel = lv_dropdown_get_selected(s_mode_dropdown);
-        start(sel == 0 ? JamMode::kFull : JamMode::kIntermittent, s_ui_freq_mhz);
-        lv_label_set_text(s_start_lbl, "Stop Jamming");
-        s_ui_active = true;
+    s_stop_btn = lv_button_create(content);
+    lv_obj_set_style_bg_color(s_stop_btn, lv_palette_main(LV_PALETTE_RED), 0);
+    lv_obj_t *stop_lbl = lv_label_create(s_stop_btn);
+    lv_label_set_text(stop_lbl, "Stop Jamming");
+    lv_obj_add_event_cb(s_stop_btn, [](lv_event_t *) {
+        if (!s_ui_active) return;
+        stop();
+        s_ui_active = false;
     }, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_add_event_cb(content, [](lv_event_t *) {
-        s_mode_dropdown = nullptr;
         s_status_label = nullptr;
         s_banner = nullptr;
-        s_start_btn = nullptr;
-        s_start_lbl = nullptr;
+        s_stop_btn = nullptr;
         if (s_ui_active) { stop(); s_ui_active = false; }
     }, LV_EVENT_DELETE, nullptr);
 
