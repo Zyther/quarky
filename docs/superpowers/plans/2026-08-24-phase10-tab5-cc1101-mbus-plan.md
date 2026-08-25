@@ -99,9 +99,32 @@
 
 ## Task 4: CC1101 record (.sub save) + replay
 
+**Follow-up fix, 2026-08-25 (project owner):** the batch implementation's
+"Load from SD" originally used Task 22's flat, single-directory
+`FileBrowser` (matching what RF433 already uses) — the project owner
+flagged this as wrong for CC1101's real use case: the bundled Flipper
+SubGhz signal database at `/quarky/sub/flipperdb` is genuinely deep, the
+same shape as the Flipper-IRDB `ir_clone.cpp` already navigates via
+`IStorage::list_dirs()`. Built a new, generalized `DeepFileBrowser`
+component (`firmware/tab5/src/ui/deep_file_browser.{h,cpp}`) directly from
+`ir_clone.cpp`'s own real, working recursive-navigation logic (subdirectory
+descent, dotfile/AppleDouble filtering already handled at the
+`StorageSD::list_dirs()`/`list_files()` layer, unaffected either way) —
+simplified relative to IR's version since a `.sub` file is always exactly
+one capture (no per-file signal-picker sub-screen needed, unlike `.ir`
+files which can hold several named signals). `cc1101_scan.cpp`'s "Load from
+SD" now deep-browses from `/quarky/sub` (one level above `flipperdb/`, same
+reasoning as `ir_clone.cpp`'s own root placement) instead of the flat
+picker. `kCaptureDir` (`/quarky/captures/subghz`, where this project's own
+new captures save to) is untouched — kept as a separate tree from the
+browse root, mirroring IR's own real established split (`/quarky/ir` browse
+root vs. `/quarky/captures/ir` save target). Verified: real `pio run -e
+tab5` build SUCCESS, `pio test -e native` 58/58 unchanged.
+
 **Files:**
 - Create: `firmware/tab5/src/features/cc1101/cc1101_record.h` / `.cpp`
 - Create: `firmware/tab5/src/features/cc1101/cc1101_replay.h` / `.cpp`
+- Create: `firmware/tab5/src/ui/deep_file_browser.h` / `.cpp` (2026-08-25 follow-up, see above)
 
 **Interfaces:**
 - Consumes: `Cc1101Hw`, `SubghzProto::write_sub()`/`read_sub()` (Task 2), `Cc1101Scan`'s capture path (Task 3).

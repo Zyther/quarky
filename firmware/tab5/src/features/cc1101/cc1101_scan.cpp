@@ -4,7 +4,7 @@
 #include "cc1101_replay.h"
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
-#include "../../ui/file_browser.h"
+#include "../../ui/deep_file_browser.h"
 #include "../../hal/storage_sd.h"
 #include <subghz_protocol_decode.h>
 #include <feature_registry.h>
@@ -147,6 +147,17 @@ constexpr size_t kMaxFinalizesPerPoll = 2;
 constexpr size_t kDrainChunk = 64;
 
 static const char kCaptureDir[] = "/quarky/captures/subghz";
+
+// Root for the deep-browsable bundled Flipper SubGhz signal database
+// (/quarky/sub/flipperdb) -- rooted one level above flipperdb/ itself, same
+// reasoning as ir_clone.cpp's own kRootDir (/quarky/ir, one level above
+// /quarky/ir/flipperdb): a future second bundle/category living alongside
+// flipperdb/ is browsable too without hardcoding the flipperdb name here.
+// Deliberately separate from kCaptureDir above -- this project's own
+// established pattern (see IR: /quarky/ir browse root vs. /quarky/captures/ir
+// save target) keeps a bundled-library browse root and this project's own
+// new-capture save directory as two distinct real trees, not one.
+static const char kSubLibraryRootDir[] = "/quarky/sub";
 
 // ── UI widgets ──────────────────────────────────────────────────────────────
 static lv_obj_t *s_status_label = nullptr;
@@ -492,8 +503,15 @@ static lv_obj_t *build_screen() {
     lv_obj_t *load_lbl = lv_label_create(load_btn);
     lv_label_set_text(load_lbl, "Load from SD");
     lv_obj_add_event_cb(load_btn, [](lv_event_t *) {
-        FileBrowser::push(storage, "Load CC1101 .sub file", kCaptureDir, kSubFileExt,
-                           on_sub_file_selected);
+        // Deep-navigates from /quarky/sub (parent of the bundled Flipper
+        // SubGhz database, /quarky/sub/flipperdb -- confirmed genuinely
+        // deep, same shape as Flipper-IRDB) rather than a flat picker --
+        // matches IrClone's own real browser exactly (project owner's
+        // explicit 2026-08-25 request). Kept separate from kCaptureDir
+        // (/quarky/captures/subghz, where THIS project's own new captures
+        // save to) the same way IR keeps its own /quarky/ir browse root
+        // and /quarky/captures/ir save target as two distinct real trees.
+        DeepFileBrowser::push(storage, kSubLibraryRootDir, kSubFileExt, on_sub_file_selected);
     }, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t *replay_loaded_btn = lv_button_create(btn_grid);
