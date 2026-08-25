@@ -700,9 +700,42 @@
 #define TAB5_IR_RX_GPIO 54
 #endif
 
-// Free GPIOs on the Tab5's rear M5-Bus connector (per docs.m5stack.com/en/
-// core/Tab5's pin table, fetched 2026-08-08), recorded here as the most
-// likely place a future RF433R/T wiring would land, since PORT.A is already
-// spoken for: G16, G17, G18, G45, G19, G52, G7, G6, G3, G4, G2, G48, G47,
-// G35, G51, G38, G37, G5 (G31/G32 on that same connector are the internal
-// I2C bus, already in use -- exclude those two from consideration).
+// CC1101 module (M5Stack "CC1101 Module (855-925MHz)") on the Tab5's rear
+// M5-Bus connector, Phase 10. CONFIRMED 2026-08-24 from two real M5Stack
+// vendor PDFs (docs/vendor/Tab5.pdf "Tab5 Board PinMap Overview", Update
+// Time 2026-08-05; docs/vendor/Module_CC1101.pdf PinMap + schematic pages,
+// Update Time 2026-01-23) -- not the generic docs.m5stack.com/en/learn/
+// interface/mbus Core-series table, which uses classic-ESP32 GPIO numbering
+// that does not apply to this P4-based board. MOSI/MISO/SCK are fixed on
+// both the module's and the Tab5's own M-Bus connector at positions 7/9/11;
+// CSN/GDO0/GDO2 are DIP-switch-selectable on the module (traced from its
+// own schematic's SW1/SW2 net routing, cross-checked against both devices'
+// M-Bus position tables). Physical switches CONFIRMED set by the project
+// owner 2026-08-24 to match this mapping: SW1 position 1 ON (CSN only),
+// SW2 positions 2 and 6 ON (GDO2, GDO0 only), all other positions in both
+// switch banks OFF -- see docs/superpowers/specs/2026-08-09-phase10-tab5-
+// cc1101-mbus-design.md Section 3 for the full derivation.
+#ifndef TAB5_CC1101_MOSI_GPIO
+#define TAB5_CC1101_MOSI_GPIO 18 // M-Bus position 7, fixed (no switch)
+#endif
+#ifndef TAB5_CC1101_MISO_GPIO
+#define TAB5_CC1101_MISO_GPIO 19 // M-Bus position 9, fixed (no switch)
+#endif
+#ifndef TAB5_CC1101_SCK_GPIO
+#define TAB5_CC1101_SCK_GPIO 5   // M-Bus position 11, fixed (no switch)
+#endif
+#ifndef TAB5_CC1101_CSN_GPIO
+#define TAB5_CC1101_CSN_GPIO 45  // M-Bus position 8, module's SW1 switch 1
+#endif
+#ifndef TAB5_CC1101_GDO0_GPIO
+#define TAB5_CC1101_GDO0_GPIO 4  // M-Bus position 20, module's SW2 switch 6
+#endif
+#ifndef TAB5_CC1101_GDO2_GPIO
+#define TAB5_CC1101_GDO2_GPIO 48 // M-Bus position 22, module's SW2 switch 2
+#endif
+
+// Free GPIOs remaining on the Tab5's rear M5-Bus connector (per
+// docs.m5stack.com/en/core/Tab5's pin table, fetched 2026-08-08) after the
+// CC1101 module above claims G18/G19/G5/G45/G4/G48: G16, G17, G52, G7, G6,
+// G3, G2, G47, G35, G51, G38, G37 (G31/G32 on that same connector are the
+// internal I2C bus, already in use -- exclude those two from consideration).

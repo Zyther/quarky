@@ -44,7 +44,13 @@ firmware/cardputer-adv/src/features/
 │   ├── cc1101_bruteforce.{h,cpp}
 │   ├── cc1101_jammer.{h,cpp}
 │   ├── cc1101_keeloq.{h,cpp}
-│   └── cc1101_hw.{h,cpp}         # SmartRC-CC1101-Driver-Lib wrapper, owns the shared hat SPI bus
+│   └── cc1101_hw.{h,cpp}         # Driver library: see Phase 10 spec Section 2 (2026-08-24 update)
+│                                 # before implementing this -- that phase's own real-hardware
+│                                 # testing found a reliability bug in SmartRC-CC1101-Driver-Lib
+│                                 # (this line's original choice) and switched to jgromes/RadioLib,
+│                                 # which is also M5Stack's own documented library for the sibling
+│                                 # M5Stack CC1101 Module. Use RadioLib here too unless something
+│                                 # about the hydra-hat's specific CC1101 wiring rules that out.
 ├── nrf24/
 │   ├── nrf24_spectrum.{h,cpp}
 │   ├── nrf24_jammer.{h,cpp}

@@ -187,6 +187,11 @@
                                           // (see the .cpp header). Spike only
                                           // for now; serial-trigger '2' is its
                                           // only entry point.
+#include "features/cc1101/cc1101_hw.h" // Phase 10 Task 1: CC1101 module on the
+                                        // Tab5's own M-Bus connector. Serial-
+                                        // trigger 'x' is its only entry point
+                                        // for now, same shape as 'i'/'c'/'h'
+                                        // above.
 #include "hal/psk_store.h"
 #include "../boards/tab5/pins_config.h"
 #include <feature_registry.h>
@@ -1269,6 +1274,32 @@ void loop() {
                 s_ir_spike_phase_start_ms = millis();
                 s_ir_spike_blink_count = 0;
                 s_ir_spike_blink_on = false;
+            }
+        } else if (c == 'x') {
+            // Phase 10 Task 1: CC1101 M-Bus SPI bring-up SPIKE. No launcher
+            // tile, same shape as 'c'/'h'/'r'/'n'/'2'/'i' above; serial is
+            // its only entry point by design. 'x' (mnemonic: none free that
+            // reads naturally -- k/p/b/w/s/m/g/a/c/h/j/f/r/n/2/i are the
+            // sixteen already taken above) is free.
+            //
+            // *** HARDWARE PRECONDITION ***: the M5Stack CC1101 Module must
+            // be physically attached to the Tab5's rear M5-Bus connector,
+            // with its DIP switches set per pins_config.h's own citation
+            // (SW1 position 1 ON; SW2 positions 2 and 6 ON; all others OFF
+            // in both banks) -- CONFIRMED by the project owner 2026-08-24.
+            //
+            // Calls the real driver's real presence check (getCC1101(), a
+            // PARTNUM/VERSION status-register read against known CC1101
+            // values) -- a true/false result here is real hardware evidence,
+            // not a guess.
+            Serial.println("quarky-tab5: [debug] CC1101 M-Bus bring-up via serial trigger");
+            bool init_ok = Cc1101Hw::init();
+            Serial.printf("quarky-tab5: [cc1101] init() returned %s\n", init_ok ? "true" : "false");
+            bool present = Cc1101Hw::is_present();
+            Serial.printf("quarky-tab5: [cc1101] is_present() = %s\n", present ? "TRUE (real chip detected)" : "FALSE");
+            if (present) {
+                Serial.printf("quarky-tab5: [cc1101] frequency_mhz() = %.2f, rssi() = %.1f\n",
+                              Cc1101Hw::frequency_mhz(), Cc1101Hw::rssi());
             }
         }
     }

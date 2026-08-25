@@ -14,17 +14,31 @@ Two CC1101 units existing on two different devices is a deliberate hardware choi
 ## 2. Real Reference Material
 
 - **The physical module**: M5Stack "CC1101 Module (855-925MHz)" — a real, currently-shipping product (confirmed via M5Stack's own store listing and official docs at `docs.m5stack.com/en/module/Module_CC1101`), built around the E07-900M10S module (TI CC1101 transceiver), SPI interface, supporting 2-FSK/4-FSK/GFSK/MSK/ASK/OOK modulation, RSSI/LQI reporting, independent 64-byte RX/TX FIFOs.
-- **M-Bus attachment, per the module's own official docs**: MOSI on M-Bus pin 7, MISO on pin 9, SCK on pin 10, CSN on pin 8 (DIP-switch selectable), GDO0/GDO2 interrupt lines DIP-switch selectable across a shared set of pins (module docs list pins 1/20/22 as CSN/GDO0/GDO2 candidates — **the module's own documentation does not specify which physical GPIO on any particular host those M-Bus pin *positions* correspond to**; that mapping is host-specific and must be sourced from the host's own schematic, not assumed from the module's side of the connector).
-- **Driver library**: reuse `SmartRC-CC1101-Driver-Lib`, the same library Phase 5's `cc1101_hw.{h,cpp}` wraps, for consistency — one proven CC1101 driver, two host integrations.
+- **M-Bus attachment, per the module's own official docs**: MOSI on M-Bus pin 7, MISO on pin 9, SCK on ~~pin 10~~ **pin 11** (corrected 2026-08-24 — pin 10 was this section's original pre-research guess, before the module's own real PinMap table was actually read; see Section 3), CSN DIP-switch-selectable across pins 8/21/23/24, GDO0/GDO2 interrupt lines DIP-switch-selectable across a shared pool of pins 2/20/22 (**the module's own documentation does not specify which physical GPIO on any particular host those M-Bus pin *positions* correspond to**; that mapping is host-specific and must be sourced from the host's own schematic, not assumed from the module's side of the connector — Section 3 has the full resolution).
+- **Driver library**: `jgromes/RadioLib` (corrected 2026-08-24 — this section originally specified `SmartRC-CC1101-Driver-Lib`; real-hardware testing during Task 1 found a repeat-call reliability bug in that library, and separately, M5Stack's own CC1101 module docs turned out to document RadioLib, not SmartRC, as this module's own Arduino library — see Section 3's Task-1 note and `platformio.ini`'s citation for the full account). **If Phase 5 (Cardputer-ADV hydra-hat CC1101) is implemented after this phase, it should also use RadioLib**, not the originally-planned SmartRC, for this same "one proven driver, two host integrations" consistency goal to still hold — check this file's own update rather than trusting Phase 5's own spec text verbatim if it still says SmartRC at that time.
 - **Feature logic donor references**: same as Phase 5's CC1101 table (Poseidon `subghz_*.cpp`/`cc1101_hw.cpp/.h`, Bruce `rf_record.cpp`/`rf_send.cpp`/`rf_bruteforce.cpp`, UniGeek's broader protocol-decoder set) — do not re-list here, see Phase 5 Section 1 for the full feature-to-donor mapping; port the same way.
 
-## 3. Real Hardware Fact Still Needed Before Implementation
+## 3. Real Hardware Fact: M-Bus GPIO Mapping (RESOLVED 2026-08-24)
 
-**Tab5's own M5-Bus-pin-to-P4-GPIO mapping is not yet confirmed and must not be assumed.** A generic M5-Bus pinout table exists at `docs.m5stack.com/en/learn/interface/mbus`, but it documents classic-ESP32 GPIO numbering (e.g. `G23`/`G19`/`G18` for MOSI/MISO/SCK) inherited from the original Core/Core2-era M5-Bus products — the Tab5 is an ESP32-P4 (an entirely different chip generation with different GPIO numbering), so that table almost certainly does not apply verbatim. This is exactly the failure mode this project has hit repeatedly already (the eval-board's C6 SDIO pins being wrong for the real Tab5, ST7123-vs-ST7121 panel misidentification, PN532-vs-actual-chip assumptions on the HY2.0 units) — a generic/adjacent-product datasheet number that looks authoritative but is wrong for this specific board revision.
+**Resolved from real, Tab5-specific and module-specific vendor PDFs** (`docs/vendor/Tab5.pdf`, M5Stack's own Tab5 datasheet, "Tab5 Board PinMap Overview" page, Update Time 2026-08-05; `docs/vendor/Module_CC1101.pdf`, M5Stack's own CC1101 Module datasheet, PinMap + schematic pages, Update Time 2026-01-23) — not the generic `docs.m5stack.com/en/learn/interface/mbus` Core-series table, which documents classic-ESP32 GPIO numbering (`G23`/`G19`/`G18` for MOSI/MISO/SCK) that does not apply to the Tab5's ESP32-P4. This is the same failure mode this project has hit repeatedly before (eval-board C6 SDIO pins, ST7123-vs-ST7121 panel ID, PN532-vs-actual-chip assumptions) — resolved here by going to the two devices' own datasheets rather than an adjacent/generic one, and cross-validating both documents' pin tables against each other position-by-position (M5-Bus connector positions 1-30 are a standardized physical layout shared across both devices, confirmed identical in both PDFs' own tables).
 
-Before any wiring/driver work starts: source Tab5's actual M-Bus-to-GPIO mapping from Tab5's own schematic or pinout documentation (the same class of source this project used successfully for the C6 SDIO pins — espp's BSP, M5Stack's own Tab5-specific docs — not the generic M5-Bus page). If no Tab5-specific M-Bus pin documentation exists publicly, this becomes a real-hardware continuity-test task (probe each M-Bus pin position with the physical module attached and a multimeter/logic analyzer, or trace against a real Tab5 schematic if M5Stack publishes one) before any SPI transaction can be attempted.
+**Fixed pins (no DIP switch involved) — MOSI/MISO/SCK are wired straight through on both the module and the Tab5's own M-Bus connector at positions 7/9/11:**
 
-Also confirm, once the module is in hand: which DIP-switch position it's actually set to for CSN/GDO0/GDO2 (the module supports multiple selectable pin positions precisely because different host devices wire the M-Bus differently) — read the switches directly rather than assuming a default.
+| Signal | M-Bus position | Tab5 GPIO |
+|---|---|---|
+| MOSI | 7 | **G18** |
+| MISO | 9 | **G19** |
+| SCK | 11 | **G5** |
+
+**Switch-selectable pins — CC1101 module has SW1 (4-way, selects CSN's exposed connector position) and SW2 (6-way, shared pool selecting GDO0's and GDO2's exposed connector positions), read directly off the module's own schematic (`Module_CC1101.pdf` page 5) and cross-checked against its M-Bus pin table (page 6) and Tab5's M-Bus pin table (`Tab5.pdf` page 14):**
+
+| Signal | Switch | Position to close (ON; all others in that signal's group OFF) | M-Bus position | Tab5 GPIO |
+|---|---|---|---|---|
+| CSN | SW1 | 1 | 8 | **G45** |
+| GDO0 | SW2 | 6 | 20 | **G4** |
+| GDO2 | SW2 | 2 | 22 | **G48** |
+
+Exactly one switch per signal group must be closed at a time — every option within a group (e.g. SW1's 4 positions for CSN, or SW2's 3-position pools for GDO0/GDO2) ties back to the same internal net, so closing two simultaneously would short two different Tab5 GPIOs together through that net. None of G45/G4/G48 conflict with anything else already claimed in `pins_config.h`. Recommend a multimeter continuity check from each physical switch to its expected connector pin before first power-up, given the small SMD switch package — this is now a verification step, not an open research gap.
 
 ## 4. Architecture
 
@@ -39,7 +53,7 @@ firmware/tab5/src/features/cc1101/
 ├── cc1101_bruteforce.{h,cpp}
 ├── cc1101_jammer.{h,cpp}
 ├── cc1101_keeloq.{h,cpp}
-└── cc1101_hw.{h,cpp}         # SmartRC-CC1101-Driver-Lib wrapper, Tab5 M-Bus SPI pins
+└── cc1101_hw.{h,cpp}         # RadioLib wrapper (corrected 2026-08-24, see Section 2), Tab5 M-Bus SPI pins
 ```
 
 Mirrors Phase 5's `firmware/cardputer-adv/src/features/cc1101/` module list closely (same feature set, same underlying driver library) — this parallel structure is intentional, not accidental duplication.
@@ -62,7 +76,7 @@ Captures land in `/quarky/captures/subghz/` (distinct from Phase 3's `/quarky/ca
 
 ## 5. Risks / Open Questions
 
-- **M-Bus GPIO mapping is the single blocking unknown** (Section 3) — nothing in this phase can start against real hardware until it's resolved.
+- ~~**M-Bus GPIO mapping is the single blocking unknown**~~ — **RESOLVED 2026-08-24**, see Section 3. Still needs the physical continuity-check/DIP-switch-set step on real hardware before first SPI transaction, but the mapping itself is no longer unknown.
 - **Frequency range**: the module's advertised range is 855-925MHz; the owner's stated intended tuning (868-925MHz) is a subset of that, consistent with the real hardware — no discrepancy, just note the module's full documented range in code/UI rather than hard-coding the owner's narrower intended-use band as a hard limit, in case future work wants the module's full range.
 - **Physical/electrical conflict with other M-Bus-attached hardware**: if any other M5-Bus module is ever stacked simultaneously (none currently planned), confirm SPI bus sharing behavior — out of scope until it's an actual configuration, flagged here only so it isn't forgotten.
 - **`shared/subghz_proto`'s existence depends on which phase (this one or Phase 5) actually gets implemented first** — see Section 4.2. Whichever phase's implementation plan is written second should explicitly check for the shared library's existence rather than assume it doesn't exist yet.
@@ -75,8 +89,8 @@ Captures land in `/quarky/captures/subghz/` (distinct from Phase 3's `/quarky/ca
 
 ## 7. Definition of Done
 
-- [ ] Tab5's real M-Bus-to-GPIO mapping confirmed from an authoritative, Tab5-specific source (not the generic Core-series M-Bus table) and recorded with citations, the same way the C6 SDIO pins were documented in Phase 1.
-- [ ] CC1101 module's DIP-switch position (CSN/GDO0/GDO2) confirmed against the physical unit in hand.
+- [x] Tab5's real M-Bus-to-GPIO mapping confirmed from an authoritative, Tab5-specific source (not the generic Core-series M-Bus table) and recorded with citations, the same way the C6 SDIO pins were documented in Phase 1. **DONE 2026-08-24**, see Section 3.
+- [x] CC1101 module's DIP-switch position (CSN/GDO0/GDO2) physically set per Section 3's table. **DONE 2026-08-24** — project owner confirmed physical switches: SW1 position 1 ON (CSN), SW2 positions 2 and 6 ON (GDO2, GDO0), matching this section's derived mapping exactly.
 - [ ] `shared/subghz_proto` exists (created by this phase or already present from Phase 5) and both device trees' CC1101 feature modules consume it rather than duplicating protocol logic.
 - [ ] At least one real scan/capture and one real replay demonstrated against the owner's own RF equipment, on real hardware.
 - [ ] This phase's `docs/phases/phase-10-tab5-cc1101-mbus.md` write-up completed per this program's per-phase documentation convention (`CLAUDE.md`), including the resolved M-Bus pin mapping as a durable reference for any future M-Bus module work.
