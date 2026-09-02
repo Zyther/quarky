@@ -1,6 +1,7 @@
 #include "wifi_spectrum.h"
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
+#include "../../ui/theme.h"
 #include <feature_registry.h>
 #include <lvgl.h>
 #include <WiFi.h>
@@ -31,6 +32,12 @@ static bool s_scanning = false;
 static uint32_t s_scan_started_ms = 0;
 static uint8_t s_channel = 1;
 
+static void wifi_spectrum_on_theme() {
+    if (s_chart && s_series) {
+        lv_chart_set_series_color(s_chart, s_series, Theme::color(Token::Chart));
+    }
+}
+
 static lv_obj_t *build_screen() {
     // Menu-bar Back button + flex content area -- see ui/screen_scaffold.cpp
     // for why every sub-screen must build through this rather than
@@ -49,7 +56,9 @@ static lv_obj_t *build_screen() {
     // not exist in this tree and would fail to compile.
     lv_chart_set_axis_range(s_chart, LV_CHART_AXIS_PRIMARY_Y, -100, 0); // dBm
     lv_chart_set_point_count(s_chart, 14); // channels 1-14
-    s_series = lv_chart_add_series(s_chart, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
+    s_series = lv_chart_add_series(s_chart, Theme::color(Token::Chart), LV_CHART_AXIS_PRIMARY_Y);
+    Theme::add_listener(wifi_spectrum_on_theme);
+    wifi_spectrum_on_theme();
     for (int i = 0; i < 14; i++) lv_chart_set_next_value(s_chart, s_series, -100);
 
     // Real-hardware finding (2026-08-12, controller verification pass): the
@@ -77,6 +86,7 @@ static lv_obj_t *build_screen() {
     // wifi_scan.cpp established for its list (closes the same "stale
     // pointer after Back" class of bug).
     lv_obj_add_event_cb(s_chart, [](lv_event_t *e) {
+        Theme::remove_listener(wifi_spectrum_on_theme);
         s_active = false;
         s_scanning = false;
         s_chart = nullptr;

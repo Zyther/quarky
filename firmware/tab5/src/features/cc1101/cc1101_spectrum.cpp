@@ -2,6 +2,7 @@
 #include "cc1101_hw.h"
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
+#include "../../ui/theme.h"
 #include <feature_registry.h>
 #include <lvgl.h>
 #include <Arduino.h>
@@ -35,6 +36,12 @@ bool s_active = false;
 int s_bin = 0;
 uint32_t s_last_step_ms = 0;
 
+static void spectrum_on_theme() {
+    if (s_chart && s_series) {
+        lv_chart_set_series_color(s_chart, s_series, Theme::color(Token::Chart));
+    }
+}
+
 } // namespace
 
 static lv_obj_t *build_screen() {
@@ -58,7 +65,9 @@ static lv_obj_t *build_screen() {
     lv_chart_set_axis_range(s_chart, LV_CHART_AXIS_PRIMARY_Y, -100, 0); // dBm
     lv_chart_set_point_count(s_chart, kNumBins);
     lv_chart_set_div_line_count(s_chart, 5, 0);
-    s_series = lv_chart_add_series(s_chart, lv_palette_main(LV_PALETTE_RED), LV_CHART_AXIS_PRIMARY_Y);
+    s_series = lv_chart_add_series(s_chart, Theme::color(Token::Chart), LV_CHART_AXIS_PRIMARY_Y);
+    Theme::add_listener(spectrum_on_theme);
+    spectrum_on_theme();
     for (int i = 0; i < kNumBins; i++) lv_chart_set_next_value(s_chart, s_series, -100);
 
     // Start/mid/end frequency labels under the chart, project owner's own
@@ -87,6 +96,7 @@ static lv_obj_t *build_screen() {
     lv_label_set_text_fmt(lbl_end, "%d", (int)kFreqEndMhz);
 
     lv_obj_add_event_cb(s_chart, [](lv_event_t *) {
+        Theme::remove_listener(spectrum_on_theme);
         s_active = false;
         s_chart = nullptr;
         s_series = nullptr;

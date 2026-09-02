@@ -2,6 +2,7 @@
 #include "cc1101_hw.h"
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
+#include "../../ui/theme.h"
 #include <feature_registry.h>
 #include <lvgl.h>
 #include <Arduino.h>
@@ -250,6 +251,11 @@ lv_obj_t *s_stop_btn = nullptr;
 float s_ui_freq_mhz = 433.92f;
 bool s_ui_active = false;
 
+static void jammer_on_theme() {
+    if (s_banner) lv_obj_set_style_text_color(s_banner, Theme::color(Token::Danger), 0);
+    if (s_stop_btn) lv_obj_set_style_bg_color(s_stop_btn, Theme::color(Token::Danger), 0);
+}
+
 void update_status_ui(const JammerStatus &st) {
     if (!s_status_label) return;
     char buf[80];
@@ -313,11 +319,9 @@ lv_obj_t *build_screen() {
     lv_label_set_text(s_status_label, "Idle");
 
     s_banner = lv_label_create(content);
-    lv_obj_set_style_text_color(s_banner, lv_palette_main(LV_PALETTE_RED), 0);
     lv_obj_add_flag(s_banner, LV_OBJ_FLAG_HIDDEN);
 
     s_stop_btn = lv_button_create(content);
-    lv_obj_set_style_bg_color(s_stop_btn, lv_palette_main(LV_PALETTE_RED), 0);
     lv_obj_t *stop_lbl = lv_label_create(s_stop_btn);
     lv_label_set_text(stop_lbl, "Stop Jamming");
     lv_obj_add_event_cb(s_stop_btn, [](lv_event_t *) {
@@ -326,7 +330,11 @@ lv_obj_t *build_screen() {
         s_ui_active = false;
     }, LV_EVENT_CLICKED, nullptr);
 
+    Theme::add_listener(jammer_on_theme);
+    jammer_on_theme();
+
     lv_obj_add_event_cb(content, [](lv_event_t *) {
+        Theme::remove_listener(jammer_on_theme);
         s_status_label = nullptr;
         s_banner = nullptr;
         s_stop_btn = nullptr;

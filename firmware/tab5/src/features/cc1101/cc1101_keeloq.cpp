@@ -3,6 +3,7 @@
 #include "../../hal/storage_sd.h"
 #include "../../ui/screen_scaffold.h"
 #include "../../ui/screen_stack.h"
+#include "../../ui/theme.h"
 #include <feature_registry.h>
 #include <lvgl.h>
 #include <Arduino.h>
@@ -462,6 +463,11 @@ uint32_t s_selected_id = 0;
 KeeloqInfo s_last_info{};
 bool s_have_decode = false;
 
+static void keeloq_on_theme() {
+    if (s_replay_btn) lv_obj_set_style_bg_color(s_replay_btn, Theme::color(Token::Danger), 0);
+    if (s_attack_banner) lv_obj_set_style_text_color(s_attack_banner, Theme::color(Token::Danger), 0);
+}
+
 void update_attack_banner() {
     if (!s_attack_banner) return;
     if (s_state == ReplayState::kTransmitting) {
@@ -557,7 +563,6 @@ lv_obj_t *build_screen() {
     lv_label_set_text(s_result_label, "");
 
     s_replay_btn = lv_button_create(content);
-    lv_obj_set_style_bg_color(s_replay_btn, lv_palette_main(LV_PALETTE_RED), 0);
     s_replay_lbl = lv_label_create(s_replay_btn);
     lv_label_set_text(s_replay_lbl, "Replay +1 (ACTIVELY ATTACKING)");
     lv_obj_add_state(s_replay_btn, LV_STATE_DISABLED);
@@ -568,10 +573,13 @@ lv_obj_t *build_screen() {
     }, LV_EVENT_CLICKED, nullptr);
 
     s_attack_banner = lv_label_create(content);
-    lv_obj_set_style_text_color(s_attack_banner, lv_palette_main(LV_PALETTE_RED), 0);
     lv_obj_add_flag(s_attack_banner, LV_OBJ_FLAG_HIDDEN);
 
+    Theme::add_listener(keeloq_on_theme);
+    keeloq_on_theme();
+
     lv_obj_add_event_cb(content, [](lv_event_t *) {
+        Theme::remove_listener(keeloq_on_theme);
         s_list = nullptr;
         s_result_label = nullptr;
         s_attack_banner = nullptr;
