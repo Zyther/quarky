@@ -80,6 +80,8 @@ static void render_qr_canvas(lv_obj_t *parent, const uint8_t psk[16]) {
 
     lv_obj_t *canvas = lv_canvas_create(parent);
     lv_canvas_set_buffer(canvas, s_canvas_buf, kCanvasSize, kCanvasSize, LV_COLOR_FORMAT_RGB565);
+    // Theme-exempt on purpose (theming spec §3.6): a themed QR can fail to
+    // scan. Chrome around this canvas still follows the LVGL theme.
     lv_canvas_fill_bg(canvas, lv_color_white(), LV_OPA_COVER);
 
     int scale = kCanvasSize / qr.size;
