@@ -90,6 +90,8 @@ lv_obj_t *build_sub_screen(const char *title, lv_obj_t **content_out) {
     }
 
     lv_obj_t *content = lv_obj_create(screen);
+    // USER_1 = theme apply_cb skip (not a feature flag); lv_theme_apply wipes TRANSP.
+    lv_obj_add_flag(content, LV_OBJ_FLAG_USER_1);
     lv_obj_set_width(content, LV_PCT(100));
     lv_obj_set_flex_grow(content, 1); // everything the menu bar does not use
     lv_obj_set_style_pad_all(content, kContentPad, LV_PART_MAIN);

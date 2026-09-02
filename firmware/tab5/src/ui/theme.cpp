@@ -217,11 +217,13 @@ static void apply_cb(lv_theme_t *th, lv_obj_t *obj) {
     const ThemeDesc &d = *s_current_desc;
 
     if (lv_obj_check_type(obj, &lv_obj_class)) {
-        lv_color_t bg_color = (lv_obj_get_parent(obj) == nullptr)
-            ? lv_color_hex(d.bg)
-            : lv_color_hex(d.surface);
-
-        if (lv_obj_get_style_bg_opa(obj, LV_PART_MAIN) != LV_OPA_TRANSP) {
+        // USER_1 marks scaffold content: skip fill after lv_theme_apply wipe.
+        // TRANSP check remains for widgets not yet wiped.
+        if (!lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_1) &&
+            lv_obj_get_style_bg_opa(obj, LV_PART_MAIN) != LV_OPA_TRANSP) {
+            lv_color_t bg_color = (lv_obj_get_parent(obj) == nullptr)
+                ? lv_color_hex(d.bg)
+                : lv_color_hex(d.surface);
             lv_obj_set_style_bg_color(obj, bg_color, LV_PART_MAIN);
             lv_obj_set_style_text_font(obj, map_font(d.font), LV_PART_MAIN);
         }
@@ -281,9 +283,9 @@ static void apply_cb(lv_theme_t *th, lv_obj_t *obj) {
         lv_obj_set_style_bg_color(obj, lv_color_hex(d.surface), LV_PART_MAIN);
         lv_obj_set_style_text_color(obj, lv_color_hex(d.text), LV_PART_MAIN);
         lv_obj_set_style_text_font(obj, map_font(d.font), LV_PART_MAIN);
-        lv_obj_set_style_radius(obj, d.button_radius, LV_PART_MAIN);
-        lv_obj_set_style_border_width(obj, d.button_border_width, LV_PART_MAIN);
         if (d.button_border_width > 0) {
+            lv_obj_set_style_radius(obj, d.button_radius, LV_PART_MAIN);
+            lv_obj_set_style_border_width(obj, d.button_border_width, LV_PART_MAIN);
             lv_obj_set_style_border_color(obj, lv_color_hex(d.accent), LV_PART_MAIN);
             lv_obj_set_style_border_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
         }

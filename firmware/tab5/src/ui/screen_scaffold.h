@@ -10,9 +10,10 @@
 //
 // Returns the screen object (hand it to ScreenStack::push). *content_out
 // receives the container to parent the screen's own widgets to; it is
-// flex-managed (LV_FLEX_FLOW_ROW_WRAP by default -- callers are free to change
-// the flow) and occupies all the space the menu bar does not, so nothing a
-// caller adds can ever land on top of the Back button.
+// marked LV_OBJ_FLAG_USER_1 so Theme apply_cb skips filling it (not a feature
+// flag), is flex-managed (LV_FLEX_FLOW_ROW_WRAP by default -- callers are free
+// to change the flow) and occupies all the space the menu bar does not, so
+// nothing a caller adds can ever land on top of the Back button.
 lv_obj_t *build_sub_screen(const char *title, lv_obj_t **content_out);
 
 // Height of the menu bar, in logical pixels. Exposed so callers that need to
