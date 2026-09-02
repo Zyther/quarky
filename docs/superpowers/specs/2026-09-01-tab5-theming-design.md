@@ -216,3 +216,35 @@ Settings → Theme → tap
 6. Section 6 on-device list walked on real Tab5 hardware.
 7. Custom id exists as API/NVS reserved slot; no editor UI.
 8. No existing phase spec or plan file modified.
+
+## 9. Addendum (2026-09-02): console font + word wrap
+
+Follow-up refinements from on-device use of the four baked themes. Does not change §1–§8; extends the font mapping and adds two wrap rules.
+
+### 9.1 Console font — custom 12px monospace with symbols (supersedes UNSCII_16 for console)
+
+`UNSCII_16` was chosen for the console themes' monospace/TUI look, but on real hardware it has two defects:
+- **Missing symbol glyphs.** UNSCII contains only ASCII/Latin; it has none of LVGL's symbol glyphs (FontAwesome range). Under a console theme every symbol renders as a missing-glyph rectangle — the Back label (`LV_SYMBOL_LEFT`) and the on-screen keyboard's control keys (`LV_SYMBOL_BACKSPACE/NEW_LINE/KEYBOARD/LEFT/RIGHT/OK`).
+- **Fixed size, too large.** UNSCII ships only at 8px and 16px. 16px is oversized for the console body text; the desired size is 12px (−4).
+
+Resolution: replace the console font with a **generated 12px monospace font that merges the LVGL symbol range**, so console themes keep a true monospace face *and* render every chrome/keyboard symbol.
+
+- Source face: **JetBrains Mono Regular** (Apache-2.0 / OFL — free to embed and redistribute the generated bitmaps). Attribution + license recorded in the generated file's header.
+- Symbol glyphs merged from LVGL's own `FontAwesome5-Solid+Brands+Regular.woff` using LVGL's built-in symbol codepoint list (from `scripts/built_in_font/built_in_font_gen.py`), so the symbol set matches Montserrat's exactly.
+- Generated with `lv_font_conv` (bpp 4, size 12, ranges `0x20-0x7F,0xB0,0x2022` from the mono face + the FontAwesome symbol list), committed as `firmware/tab5/src/ui/fonts/lv_font_quarky_mono_12.c`. A regen command is documented in that file's header.
+- Wire-up: new `FontId::QuarkyMono12`; both console `ThemeDesc` rows point at it; `map_font()` maps it; the font is `LV_FONT_DECLARE`d and the `.c` is added to the tab5 `build_src_filter`. Modern themes keep Montserrat 14. `test_theme` asserts both console rows now use `QuarkyMono12` (and no longer `Unscii16`).
+- `LV_FONT_UNSCII_16` may remain enabled in `lv_conf.h` or be disabled once nothing references it; disabling is optional flash savings, not required.
+
+### 9.2 Word wrap on buttons (all themes)
+
+Long button labels currently clip/overflow because no button-child label sets a wrap mode. Fix centrally in the theme `apply_cb`: for any label whose parent is a button, set `LV_LABEL_LONG_WRAP`, width `pct(100)`, and centered text. This is theme-independent (runs for modern and console alike, on object creation and on live theme change) and needs no per-call-site edits. Fixed 200×100 touch targets are unchanged; short labels are unaffected.
+
+### 9.3 Word wrap in text areas
+
+Typing text areas should wrap long input instead of scrolling off-screen. Make the **Keyboard Test** textarea multi-line (drop `set_one_line(true)`); multi-line `lv_textarea` wraps by default, so no further change is needed. Single-field inputs (WiFi SSID/password, BLE Bad-KB name) stay one-line by design.
+
+### 9.4 Definition of Done (addendum)
+
+9. Console themes use the 12px monospace font; Back chevron and on-screen keyboard control keys render as glyphs (no rectangles).
+10. Long button labels wrap within the tile under both modern and console themes.
+11. Keyboard Test textarea wraps typed text onto multiple lines; SSID/password inputs remain single-line.
