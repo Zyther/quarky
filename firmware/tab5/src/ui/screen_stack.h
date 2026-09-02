@@ -10,6 +10,7 @@ public:
     // finding, not a hypothetical).
     static void push(lv_obj_t *screen);
     static void pop();
+    static void for_each(void (*fn)(lv_obj_t *));
 
 private:
     // Real, reachable depth found via independent code review (Task 18,

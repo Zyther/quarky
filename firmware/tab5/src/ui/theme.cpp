@@ -1,5 +1,6 @@
 #include "theme.h"
 #include "screen_scaffold.h"
+#include "screen_stack.h"
 #include <Preferences.h>
 #include <Arduino.h>
 
@@ -181,7 +182,7 @@ static void notify_listeners() {
 
 static void apply_live() {
     install_theme();
-    Theme::apply_tree(lv_display_get_screen_active(lv_display_get_default()));
+    ScreenStack::for_each([](lv_obj_t *screen) { Theme::apply_tree(screen); });
     notify_listeners();
 }
 

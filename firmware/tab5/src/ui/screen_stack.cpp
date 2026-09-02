@@ -26,3 +26,10 @@ void ScreenStack::pop() {
     lv_screen_load(stack_[depth_ - 1]);
     lv_obj_delete(top);
 }
+
+void ScreenStack::for_each(void (*fn)(lv_obj_t *)) {
+    if (fn == nullptr) return;
+    for (int i = 0; i < depth_; i++) {
+        if (stack_[i]) fn(stack_[i]);
+    }
+}
