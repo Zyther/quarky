@@ -3,6 +3,7 @@
 #include "screen_scaffold.h"
 #include "keyboard_test_screen.h"
 #include "pairing_screen.h"
+#include "settings_screen.h"
 #include "../features/ping_feature.h"
 #include <lvgl.h>
 #include <cstdio>
@@ -131,6 +132,14 @@ lv_obj_t *Shell::build(FeatureRegistry &registry) {
     lv_label_set_text(pairing_label, "Pair Satellite");
     lv_obj_add_event_cb(pairing_tile, [](lv_event_t *e) {
         ScreenStack::push(build_pairing_screen());
+    }, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *settings_tile = lv_button_create(launcher);
+    lv_obj_set_size(settings_tile, 200, 100);
+    lv_obj_t *settings_label = lv_label_create(settings_tile);
+    lv_label_set_text(settings_label, "Settings");
+    lv_obj_add_event_cb(settings_tile, [](lv_event_t *) {
+        ScreenStack::push(build_settings_hub());
     }, LV_EVENT_CLICKED, nullptr);
 
     return root;
