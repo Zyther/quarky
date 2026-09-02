@@ -17,6 +17,7 @@
                          // hardware story.
 #include "ui/lvgl_port.h"
 #include "ui/shell.h"
+#include "ui/theme.h"
 #include "ui/screen_stack.h"
 #include "ui/devices_panel.h"
 #include "ui/pairing_screen.h"
@@ -358,6 +359,7 @@ void setup() {
     display.init();
     touch.init();
     lvgl_port_init(display, touch);
+    Theme::init(); // load saved theme from NVS and install it before any widgets
 
     PingFeature::register_module(); // makes the "Ping Satellite" tile appear in
                                      // Shell::build's launcher grid (Task 7),
