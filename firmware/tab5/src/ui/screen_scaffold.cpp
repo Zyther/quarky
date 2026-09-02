@@ -48,8 +48,6 @@ namespace {
 constexpr int32_t kMenuBarHeight = 120;
 constexpr int32_t kBackButtonWidth = 200;
 constexpr int32_t kBackButtonHeight = 100;
-constexpr int32_t kMenuBarPad = 10;
-constexpr int32_t kContentPad = 20;
 
 } // namespace
 
@@ -66,6 +64,7 @@ lv_obj_t *build_sub_screen(const char *title, lv_obj_t **content_out) {
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *bar = lv_obj_create(screen);
+    lv_obj_add_flag(bar, LV_OBJ_FLAG_USER_2);
     lv_obj_set_size(bar, LV_PCT(100), kMenuBarHeight);
     lv_obj_set_style_pad_all(bar, kMenuBarPad, LV_PART_MAIN);
     lv_obj_set_style_radius(bar, 0, LV_PART_MAIN);
@@ -90,7 +89,7 @@ lv_obj_t *build_sub_screen(const char *title, lv_obj_t **content_out) {
     }
 
     lv_obj_t *content = lv_obj_create(screen);
-    // USER_1 = theme apply_cb skip (not a feature flag); lv_theme_apply wipes TRANSP.
+    // USER_1 = theme apply_cb restamp (not a feature flag); wipe leaves a card.
     lv_obj_add_flag(content, LV_OBJ_FLAG_USER_1);
     lv_obj_set_width(content, LV_PCT(100));
     lv_obj_set_flex_grow(content, 1); // everything the menu bar does not use

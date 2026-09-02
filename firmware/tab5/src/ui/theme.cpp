@@ -1,4 +1,5 @@
 #include "theme.h"
+#include "screen_scaffold.h"
 #include <Preferences.h>
 #include <Arduino.h>
 
@@ -217,53 +218,61 @@ static void apply_cb(lv_theme_t *th, lv_obj_t *obj) {
     const ThemeDesc &d = *s_current_desc;
 
     if (lv_obj_check_type(obj, &lv_obj_class)) {
-        // USER_1 marks scaffold content: skip fill after lv_theme_apply wipe.
-        // TRANSP check remains for widgets not yet wiped.
-        if (!lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_1) &&
-            lv_obj_get_style_bg_opa(obj, LV_PART_MAIN) != LV_OPA_TRANSP) {
-            lv_color_t bg_color = (lv_obj_get_parent(obj) == nullptr)
-                ? lv_color_hex(d.bg)
-                : lv_color_hex(d.surface);
-            lv_obj_set_style_bg_color(obj, bg_color, LV_PART_MAIN);
+        // After lv_theme_apply wipe, parent default paints a CARD on generic
+        // lv_obj. Scaffold chrome must restamp; skip leaves that card.
+        if (lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_1)) {
+            lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+            lv_obj_set_style_radius(obj, 0, LV_PART_MAIN);
+            lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN);
+            lv_obj_set_style_pad_all(obj, kContentPad, LV_PART_MAIN);
+            lv_obj_set_style_pad_row(obj, kContentPad, LV_PART_MAIN);
+            lv_obj_set_style_pad_column(obj, kContentPad, LV_PART_MAIN);
+            return;
+        }
+
+        if (lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_2)) {
+            lv_obj_set_style_radius(obj, 0, LV_PART_MAIN);
+            lv_obj_set_style_pad_all(obj, kMenuBarPad, LV_PART_MAIN);
+        }
+
+        const bool is_screen = (lv_obj_get_parent(obj) == nullptr);
+        if (is_screen) {
+            lv_obj_set_style_pad_all(obj, 0, LV_PART_MAIN);
+            lv_obj_set_style_pad_row(obj, 0, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(obj, lv_color_hex(d.bg), LV_PART_MAIN);
+            lv_obj_set_style_text_font(obj, map_font(d.font), LV_PART_MAIN);
+        } else if (d.button_border_width > 0) {
+            lv_obj_set_style_bg_color(obj, lv_color_hex(d.surface), LV_PART_MAIN);
             lv_obj_set_style_text_font(obj, map_font(d.font), LV_PART_MAIN);
         }
     } else if (lv_obj_check_type(obj, &lv_button_class)) {
-        lv_obj_set_style_radius(obj, d.button_radius, LV_PART_MAIN);
-        lv_obj_set_style_border_width(obj, d.button_border_width, LV_PART_MAIN);
-
-        if (d.font == FontId::Montserrat14) {
-            lv_obj_set_style_bg_color(obj, lv_color_hex(d.accent), LV_PART_MAIN);
-            lv_obj_set_style_bg_color(obj, lv_color_darken(lv_color_hex(d.accent), LV_OPA_20),
-                                      LV_PART_MAIN | LV_STATE_PRESSED);
-        } else {
+        // Console only. Modern leaves radius/border/shadow/grow/bg to parent default.
+        if (d.button_border_width > 0) {
+            lv_obj_set_style_radius(obj, d.button_radius, LV_PART_MAIN);
+            lv_obj_set_style_border_width(obj, d.button_border_width, LV_PART_MAIN);
             lv_obj_set_style_bg_color(obj, lv_color_hex(d.bg), LV_PART_MAIN);
             lv_obj_set_style_border_color(obj, lv_color_hex(d.accent), LV_PART_MAIN);
             lv_obj_set_style_bg_color(obj, lv_color_lighten(lv_color_hex(d.bg), LV_OPA_20),
                                       LV_PART_MAIN | LV_STATE_PRESSED);
-        }
-
-        if (d.button_border_width > 0) {
             lv_obj_set_style_text_color(obj, lv_color_hex(d.text), LV_PART_MAIN);
-        }
 
-        if (d.button_shadow) {
-            lv_obj_set_style_shadow_width(obj, 4, LV_PART_MAIN);
-            lv_obj_set_style_shadow_opa(obj, LV_OPA_30, LV_PART_MAIN);
-        } else {
-            lv_obj_set_style_shadow_width(obj, 0, LV_PART_MAIN);
-            lv_obj_set_style_shadow_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
-        }
+            if (d.button_shadow) {
+                lv_obj_set_style_shadow_width(obj, 4, LV_PART_MAIN);
+                lv_obj_set_style_shadow_opa(obj, LV_OPA_30, LV_PART_MAIN);
+            } else {
+                lv_obj_set_style_shadow_width(obj, 0, LV_PART_MAIN);
+                lv_obj_set_style_shadow_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+            }
 
-        // Default theme grow is transform_width/height (no scale layer).
-        // Always reset scale so a prior 256-based leftover cannot shrink.
-        lv_obj_set_style_transform_scale(obj, LV_SCALE_NONE, LV_PART_MAIN | LV_STATE_PRESSED);
-        if (d.button_grow) {
-            const int32_t grow = lv_dpx(3);
-            lv_obj_set_style_transform_width(obj, grow, LV_PART_MAIN | LV_STATE_PRESSED);
-            lv_obj_set_style_transform_height(obj, grow, LV_PART_MAIN | LV_STATE_PRESSED);
-        } else {
-            lv_obj_set_style_transform_width(obj, 0, LV_PART_MAIN | LV_STATE_PRESSED);
-            lv_obj_set_style_transform_height(obj, 0, LV_PART_MAIN | LV_STATE_PRESSED);
+            lv_obj_set_style_transform_scale(obj, LV_SCALE_NONE, LV_PART_MAIN | LV_STATE_PRESSED);
+            if (d.button_grow) {
+                const int32_t grow = lv_dpx(3);
+                lv_obj_set_style_transform_width(obj, grow, LV_PART_MAIN | LV_STATE_PRESSED);
+                lv_obj_set_style_transform_height(obj, grow, LV_PART_MAIN | LV_STATE_PRESSED);
+            } else {
+                lv_obj_set_style_transform_width(obj, 0, LV_PART_MAIN | LV_STATE_PRESSED);
+                lv_obj_set_style_transform_height(obj, 0, LV_PART_MAIN | LV_STATE_PRESSED);
+            }
         }
     } else if (lv_obj_check_type(obj, &lv_label_class)) {
         lv_obj_set_style_text_font(obj, map_font(d.font), LV_PART_MAIN);
