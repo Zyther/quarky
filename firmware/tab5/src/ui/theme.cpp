@@ -240,6 +240,10 @@ static void apply_cb(lv_theme_t *th, lv_obj_t *obj) {
                                       LV_PART_MAIN | LV_STATE_PRESSED);
         }
 
+        if (d.button_border_width > 0) {
+            lv_obj_set_style_text_color(obj, lv_color_hex(d.text), LV_PART_MAIN);
+        }
+
         if (d.button_shadow) {
             lv_obj_set_style_shadow_width(obj, 4, LV_PART_MAIN);
             lv_obj_set_style_shadow_opa(obj, LV_OPA_30, LV_PART_MAIN);
@@ -279,6 +283,10 @@ static void apply_cb(lv_theme_t *th, lv_obj_t *obj) {
         lv_obj_set_style_text_font(obj, map_font(d.font), LV_PART_MAIN);
         lv_obj_set_style_radius(obj, d.button_radius, LV_PART_MAIN);
         lv_obj_set_style_border_width(obj, d.button_border_width, LV_PART_MAIN);
+        if (d.button_border_width > 0) {
+            lv_obj_set_style_border_color(obj, lv_color_hex(d.accent), LV_PART_MAIN);
+            lv_obj_set_style_border_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
+        }
     } else if (lv_obj_check_type(obj, &lv_chart_class)) {
         lv_obj_set_style_bg_color(obj, lv_color_hex(d.surface), LV_PART_MAIN);
     }
