@@ -9,7 +9,7 @@ enum class ThemeId : uint8_t {
     Custom = 255,
 };
 
-enum class FontId : uint8_t { Montserrat14 = 0, Unscii16 = 1 };
+enum class FontId : uint8_t { Montserrat14 = 0, Unscii16 = 1, QuarkyMono12 = 2 };
 
 struct ThemeDesc {
     uint32_t bg;

@@ -55,8 +55,14 @@ void test_button_look() {
 void test_fonts_and_modern_danger() {
     TEST_ASSERT_EQUAL(static_cast<uint8_t>(FontId::Montserrat14),
                       static_cast<uint8_t>(theme_table_lookup(ThemeId::ModernLight)->font));
-    TEST_ASSERT_EQUAL(static_cast<uint8_t>(FontId::Unscii16),
+    TEST_ASSERT_EQUAL(static_cast<uint8_t>(FontId::Montserrat14),
+                      static_cast<uint8_t>(theme_table_lookup(ThemeId::ModernDark)->font));
+    // Console themes use the generated 12px monospace face (merged LVGL
+    // symbols), no longer UNSCII_16.
+    TEST_ASSERT_EQUAL(static_cast<uint8_t>(FontId::QuarkyMono12),
                       static_cast<uint8_t>(theme_table_lookup(ThemeId::ConsoleGreen)->font));
+    TEST_ASSERT_EQUAL(static_cast<uint8_t>(FontId::QuarkyMono12),
+                      static_cast<uint8_t>(theme_table_lookup(ThemeId::ConsoleRed)->font));
     TEST_ASSERT_EQUAL_HEX32(0xF44336u, theme_table_lookup(ThemeId::ModernLight)->danger);
     TEST_ASSERT_EQUAL_HEX32(0x2196F3u, theme_table_lookup(ThemeId::ModernLight)->chart);
 }

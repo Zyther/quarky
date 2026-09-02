@@ -15,7 +15,9 @@ lv_obj_t *build_keyboard_test_screen() {
 
     lv_obj_t *ta = lv_textarea_create(content);
     lv_obj_set_width(ta, LV_PCT(100));
-    lv_textarea_set_one_line(ta, true);
+    // Multi-line so long typed text wraps onto new lines instead of scrolling
+    // off the right edge. Single-field inputs (SSID/password) stay one-line.
+    lv_textarea_set_one_line(ta, false);
 
     // A direct child of the screen, not of `content`: the screen's flex column
     // is menu bar / content / keyboard, so the keyboard takes the bottom band

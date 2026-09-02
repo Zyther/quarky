@@ -8,10 +8,10 @@ static const ThemeDesc kModernDark = {
     FontId::Montserrat14, 8, 0, true, true};
 static const ThemeDesc kConsoleGreen = {
     0x000000, 0x001100, 0x00FF00, 0x00AA00, 0x00FF00, 0xFF3333, 0x00FF00,
-    FontId::Unscii16, 0, 2, false, false};
+    FontId::QuarkyMono12, 0, 2, false, false};
 static const ThemeDesc kConsoleRed = {
     0x000000, 0x110000, 0xFF3333, 0xAA0000, 0xFF0000, 0xFFCC00, 0xFF0000,
-    FontId::Unscii16, 0, 2, false, false};
+    FontId::QuarkyMono12, 0, 2, false, false};
 
 const ThemeDesc *theme_table_lookup(ThemeId id) {
     switch (id) {

@@ -4,6 +4,10 @@
 #include <Preferences.h>
 #include <Arduino.h>
 
+// Console themes' 12px monospace face with merged LVGL symbol glyphs.
+// Source: src/ui/fonts/lv_font_quarky_mono_12.c (see that file's header).
+LV_FONT_DECLARE(lv_font_quarky_mono_12);
+
 static const char *kNamespace = "quarky-ui";
 static const char *kThemeIdKey = "theme_id";
 static const char *kCustomKey = "theme_custom";
@@ -287,6 +291,14 @@ static void apply_cb(lv_theme_t *th, lv_obj_t *obj) {
         if (!has_local_color && !on_button) {
             lv_obj_set_style_text_color(obj, lv_color_hex(d.text), LV_PART_MAIN);
         }
+        if (on_button) {
+            // Long button labels wrap within the fixed tile instead of
+            // overflowing. Theme-independent: runs for every theme, on object
+            // creation and on live theme change.
+            lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(obj, lv_pct(100));
+            lv_obj_set_style_text_align(obj, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        }
     } else if (lv_obj_check_type(obj, &lv_textarea_class) ||
                lv_obj_check_type(obj, &lv_list_class) ||
                lv_obj_check_type(obj, &lv_keyboard_class)) {
@@ -310,6 +322,8 @@ static const lv_font_t *map_font(FontId font_id) {
             return &lv_font_montserrat_14;
         case FontId::Unscii16:
             return &lv_font_unscii_16;
+        case FontId::QuarkyMono12:
+            return &lv_font_quarky_mono_12;
         default:
             return lv_font_get_default();
     }
