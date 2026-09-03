@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  tab5:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO
+        run: pip install -U platformio
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            firmware/tab5/.pio
+          key: pio-tab5-${{ hashFiles('firmware/tab5/platformio.ini') }}
+          restore-keys: |
+            pio-tab5-
+
+      - name: Test Tab5
+        working-directory: firmware/tab5
+        run: pio test -e native
+
+      - name: Build Tab5
+        working-directory: firmware/tab5
+        run: pio run -e tab5
+
+      - name: Version and release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Already tagged this commit → nothing to do.
+          if git describe --exact-match HEAD >/dev/null 2>&1; then
+            echo "HEAD is already tagged; skipping release."
+            exit 0
+          fi
+
+          last=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [[ -z "${last}" ]]; then
+            next="0.1.0"
+          else
+            ver="${last#v}"
+            IFS=. read -r major minor patch <<<"${ver}"
+            next="${major}.${minor}.$((patch + 1))"
+          fi
+
+          tag="v${next}"
+          echo "Releasing ${tag}"
+
+          mkdir -p dist
+          cp firmware/tab5/.pio/build/tab5/firmware.factory.bin "dist/quarky-tab5-bootable-${tag}.bin"
+          cp firmware/tab5/.pio/build/tab5/firmware.bin "dist/quarky-tab5-launcher-${tag}.bin"
+
+          gh release create "${tag}" \
+            --title "${tag}" \
+            --generate-notes \
+            "dist/quarky-tab5-${tag}.bin"
