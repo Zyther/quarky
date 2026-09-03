@@ -134,10 +134,45 @@ void Theme::remove_listener(void (*fn)()) {
     }
 }
 
+// lv_theme_apply() begins with lv_obj_remove_style_all(), which strips EVERY
+// local style on the object -- not just appearance, but the geometry the app
+// set via lv_obj_set_size/width/flex_* (all of which are local style props).
+// The theme's apply_cb only restores appearance, so a naive live re-theme walk
+// collapses the whole UI to content size. Snapshot the geometry/layout local
+// styles, let the theme wipe + reapply appearance, then restore geometry.
+static const lv_style_prop_t kGeometryProps[] = {
+    LV_STYLE_WIDTH,        LV_STYLE_HEIGHT,
+    LV_STYLE_MIN_WIDTH,    LV_STYLE_MAX_WIDTH,
+    LV_STYLE_MIN_HEIGHT,   LV_STYLE_MAX_HEIGHT,
+    LV_STYLE_X,            LV_STYLE_Y,             LV_STYLE_ALIGN,
+    LV_STYLE_LAYOUT,       LV_STYLE_FLEX_FLOW,     LV_STYLE_FLEX_GROW,
+    LV_STYLE_FLEX_MAIN_PLACE, LV_STYLE_FLEX_CROSS_PLACE, LV_STYLE_FLEX_TRACK_PLACE,
+    LV_STYLE_MARGIN_LEFT,  LV_STYLE_MARGIN_RIGHT,
+    LV_STYLE_MARGIN_TOP,   LV_STYLE_MARGIN_BOTTOM,
+};
+
+static void apply_theme_preserving_geometry(lv_obj_t *obj) {
+    constexpr size_t kCount = sizeof(kGeometryProps) / sizeof(kGeometryProps[0]);
+    lv_style_value_t saved[kCount];
+    bool present[kCount];
+    for (size_t i = 0; i < kCount; i++) {
+        present[i] = lv_obj_get_local_style_prop(obj, kGeometryProps[i], &saved[i],
+                                                  LV_PART_MAIN) != LV_STYLE_RES_NOT_FOUND;
+    }
+
+    lv_theme_apply(obj);
+
+    for (size_t i = 0; i < kCount; i++) {
+        if (present[i]) {
+            lv_obj_set_local_style_prop(obj, kGeometryProps[i], saved[i], LV_PART_MAIN);
+        }
+    }
+}
+
 void Theme::apply_tree(lv_obj_t *root) {
     if (root == nullptr) return;
 
-    lv_theme_apply(root);
+    apply_theme_preserving_geometry(root);
 
     for (uint32_t i = 0; i < lv_obj_get_child_count(root); i++) {
         lv_obj_t *child = lv_obj_get_child(root, i);
@@ -292,12 +327,16 @@ static void apply_cb(lv_theme_t *th, lv_obj_t *obj) {
             lv_obj_set_style_text_color(obj, lv_color_hex(d.text), LV_PART_MAIN);
         }
         if (on_button) {
-            // Long button labels wrap within the fixed tile instead of
-            // overflowing. Theme-independent: runs for every theme, on object
-            // creation and on live theme change.
-            lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
-            lv_obj_set_width(obj, lv_pct(100));
-            lv_obj_set_style_text_align(obj, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+            // Wrap long labels only inside buttons with a bounded width (fixed
+            // px or percent). A content-sized button grows to fit its label, so
+            // forcing the label to pct(100) there is a circular size dependency
+            // that renders the button long and empty -- leave those alone.
+            const int32_t btn_w = lv_obj_get_style_width(parent, LV_PART_MAIN);
+            if (btn_w != LV_SIZE_CONTENT) {
+                lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
+                lv_obj_set_width(obj, lv_pct(100));
+                lv_obj_set_style_text_align(obj, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+            }
         }
     } else if (lv_obj_check_type(obj, &lv_textarea_class) ||
                lv_obj_check_type(obj, &lv_list_class) ||
