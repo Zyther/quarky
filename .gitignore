@@ -2,6 +2,7 @@
 .pio/
 .pioenvs/
 .piolibdeps/
+references/
 
 # SDD execution scratch workspace (briefs, reports, review packages)
 .superpowers/
