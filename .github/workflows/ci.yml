@@ -75,10 +75,11 @@ jobs:
           echo "Releasing ${tag}"
 
           mkdir -p dist
-          cp firmware/tab5/.pio/build/tab5/firmware.factory.bin "dist/quarky-tab5-bootable-${tag}.bin"
+          cp firmware/tab5/.pio/build/tab5/firmware.factory.bin "dist/quarky-tab5-factory-${tag}.bin"
           cp firmware/tab5/.pio/build/tab5/firmware.bin "dist/quarky-tab5-launcher-${tag}.bin"
 
           gh release create "${tag}" \
             --title "${tag}" \
             --generate-notes \
-            "dist/quarky-tab5-${tag}.bin"
+            "dist/quarky-tab5-factory-${tag}.bin" \
+            "dist/quarky-tab5-launcher-${tag}.bin"
